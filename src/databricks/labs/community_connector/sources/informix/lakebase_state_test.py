@@ -1731,6 +1731,62 @@ class LakebaseProjectNamingTests(unittest.TestCase):
                     self.assertEqual(state.collect_unused_projects(90, 24), deleted)
                 self.assertEqual(opened, ["custom", "databricks_postgres"])
 
+    def test_a_project_another_of_whose_databases_holds_state_is_kept(self):
+        # A project is named by the server alone. Its connections moved to a custom
+        # lakebase.database and left the default one's records behind: judged by those,
+        # the project was deleted with the state the custom database still holds. One whose
+        # other databases hold none goes; one that cannot be read keeps it.
+        for others, deleted in (
+            ({"custom": True, "postgres": False}, 0),
+            ({"postgres": False}, 1),
+            ({"custom": None}, 0),
+        ):
+            with self.subTest(others=others):
+                lakebase_state.LakebaseState._project_gc_checked.clear()
+                state = lakebase_state.LakebaseState({}, "current")
+                api = mock.MagicMock()
+                api.request.side_effect = [
+                    {"projects": [{"name": "projects/informix-state-old"}]},
+                    {"name": "operations/delete"},
+                ]
+                state._api_client = mock.Mock(return_value=api)
+                opened = []
+
+                def open_database(facts, user, token, database=None, others=others):
+                    opened.append(database)
+                    connection = mock.MagicMock()
+                    cursor = connection.cursor.return_value.__enter__.return_value
+                    if database == "databricks_postgres":
+                        _answer_sweep_queries(cursor)
+                        cursor.fetchall.return_value = [
+                            ("databricks_postgres",),
+                            *((name,) for name in others),
+                        ]
+                        return connection
+                    if others[database] is None:
+                        raise RuntimeError("permission denied for database")
+                    cursor.fetchone.return_value = (int(others[database]),)
+                    return connection
+
+                state._open = open_database
+                state._admin_user = mock.Mock(return_value="admin")
+                with (
+                    mock.patch.object(
+                        lakebase_state,
+                        "_endpoint_facts",
+                        return_value={"endpoint": "endpoint", "host": "host"},
+                    ),
+                    mock.patch.object(lakebase_state, "generate_credential", return_value="token"),
+                    mock.patch.object(lakebase_state.time, "time", return_value=100_000_000),
+                ):
+                    self.assertEqual(state.collect_unused_projects(90, 24), deleted)
+                self.assertEqual(opened[0], "databricks_postgres")
+                self.assertEqual(
+                    mock.call("DELETE", "/api/2.0/postgres/projects/informix-state-old")
+                    in api.request.call_args_list,
+                    bool(deleted),
+                )
+
     def test_a_project_with_recent_activity_of_another_kind_is_kept(self):
         # Table activity alone said a project was idle while a reader used it: a stream
         # outside a pipeline records none, and a pipeline resumed after a long stop waits

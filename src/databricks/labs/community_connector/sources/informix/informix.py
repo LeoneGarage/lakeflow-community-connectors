@@ -405,6 +405,9 @@ _TABLE_MIGRATION_OPTION = "table.migration"
 _HANDOFF_CHANNEL_UPSERT = 0
 _HANDOFF_CHANNEL_DELETE = 1
 _DEFAULT_SNAPSHOT_MODE = "incremental"
+# The modes whose snapshot a snapshot.source extract serves: the extract is the table's
+# initial snapshot, and no other mode takes one from it.
+_UNL_SNAPSHOT_MODES = frozenset({"initial", "initial_only"})
 _UNSUPPORTED_SNAPSHOT_MODES = frozenset({"configuration_based", "custom"})
 # Opt-in append-only ingestion, for a table Informix can capture but this connector
 # cannot merge -- in practice one without a primary key.
@@ -983,6 +986,10 @@ _REPLAY_INITIAL_END_OPTION = "_informix.replay.initial.end"
 # Set on the read that replays auto_snapshot's resnapshot of an expired checkpoint: like an
 # initial range's, it leaves the delete floor as the logged batch published it.
 _REPLAY_RESNAPSHOT_OPTION = "_informix.replay.resnapshot"
+# Set on the read of auto_snapshot's resnapshot of an expired checkpoint, which leaves the
+# destination as it is: its boundary keeps an earlier floor still in the log
+# (_publish_delete_snapshot_floor). Never persisted.
+_RESNAPSHOT_OPTION = "_informix.resnapshot"
 # The floor_seed of the end a replayed delete range logged, and whether that end is on a
 # transaction, as JSON [seed or null, bool] (see _confirmed_floor_seed).
 _REPLAY_END_SEED_OPTION = "_informix.replay.end.seed"
@@ -7267,6 +7274,23 @@ def _created_since(path: str, cutoff: float) -> bool:
             os.close(descriptor)
 
 
+def _unchanged_directories(cutoff: float, *paths: str) -> list[str]:
+    # Docstring: Those of ``paths`` that no entry was added to or taken from since ``cutoff``.
+    #
+    # The sweeps took the runs, scans and stages out and left the directories that held
+    # them, one scope directory for every update that ever staged, each listed over the
+    # mount again by every later sweep. A sweep removes those it empties that were
+    # unchanged before it began on them: one that changed within the retention window may
+    # be where a reader of that update is staging.
+
+    unchanged = []
+    for path in paths:
+        with contextlib.suppress(OSError):
+            if os.stat(path, follow_symlinks=False).st_mtime < cutoff:
+                unchanged.append(path)
+    return unchanged
+
+
 def _staging_subdirectories(path: str) -> list[str]:
     # Docstring: Immediate subdirectory paths of ``path``; empty if it is absent or unreadable.
     #
@@ -8663,6 +8687,26 @@ def _host_shard_local_poll(
     return shard.poll(identity, table, capture, commit, floor, owner)
 
 
+def _host_shard_own_poll(endpoints, key, reader_factory, config, *poll):
+    # Docstring: _host_shard_local_poll of this process's own shard: within the process
+    # where the host can't share, else as its leader; None, to read directly, once this
+    # process leads it no more.
+    #
+    # The leader takes the shard under the endpoints lock, which an idle shard's retirement
+    # holds while it leaves the registry and gives the lead up (_retire_shared_cdc_shard).
+    # Taken after a check without it, a poll between the two made a new shard and reader
+    # thread in a process that then let its lock go, beside the leader another process
+    # became: two sessions reading one shard's tables.
+
+    if endpoints.unavailable:
+        return _host_shard_local_poll(key, reader_factory, config, *poll)
+    with endpoints.lock:
+        if key not in endpoints.leading:
+            return None
+        shard = _shared_cdc_shard(key, reader_factory=reader_factory, **config)
+    return shard.poll(*poll)
+
+
 def _host_shard_socket_timeouts(sock) -> None:
     # Docstring: Bound each blocking send and receive on ``sock`` by the reply timeout.
     #
@@ -8712,7 +8756,8 @@ def _host_shard_serve(
                 return
             try:
                 leading["remote"].add(request["identity"])
-                view = _host_shard_local_poll(
+                view = _host_shard_own_poll(
+                    endpoints,
                     key,
                     leading["reader_factory"],
                     request["config"],
@@ -8796,13 +8841,16 @@ def _host_shard_accept(
         ).start()
 
 
-def _host_shard_stop_leading(endpoints: _HostShardEndpoints, key: tuple) -> None:
+def _host_shard_stop_leading(
+    endpoints: _HostShardEndpoints, key: tuple, *, locked: bool = False
+) -> None:
     # Docstring: Give up leading a shard nobody reads any more: close its listener, remove
     # its socket and key files, and release its lock. A follower that polls later finds
     # no leader and leads it itself. The lock file stays: removing it could let two
-    # processes lock different files of the same name.
+    # processes lock different files of the same name. ``locked``: the caller holds the
+    # endpoints lock.
 
-    with endpoints.lock:
+    with contextlib.nullcontext() if locked else endpoints.lock:
         leading = endpoints.leading.pop(key, None)
         if leading is None:
             return
@@ -8956,12 +9004,12 @@ def _host_shard_poll(
         (key, identity, owner), (commit, floor, capture, ())
     )
     if key in endpoints.leading or endpoints.unavailable:
-        return _host_shard_local_poll(*local)
+        return _host_shard_own_poll(endpoints, *local)
     if (
         key not in endpoints.clients
         and _host_shard_try_lead(endpoints, key, reader_factory, config)
     ) or endpoints.unavailable:
-        return _host_shard_local_poll(*local)
+        return _host_shard_own_poll(endpoints, *local)
     if held_commit > commit or held_floor > floor or held_capture != capture:
         held = ()
     request = {
@@ -8978,7 +9026,7 @@ def _host_shard_poll(
         status, payload = _host_shard_request(endpoints, key, request)
     except (OSError, EOFError, TimeoutError, ValueError) as error:
         if _host_shard_try_lead(endpoints, key, reader_factory, config) or endpoints.unavailable:
-            return _host_shard_local_poll(*local)
+            return _host_shard_own_poll(endpoints, *local)
         # 149: Host-shared CDC shard {}-{} leader unreachable ({}); reading directly
         logging.getLogger(__name__).debug(
             _m(149, key[-2], key[-1], error),
@@ -9173,14 +9221,19 @@ def _retire_shared_cdc_shard(key: tuple, shard: _SharedCdcShard) -> bool:
     # processes; False when a subscriber has come back. A consumer that asks for the
     # shard afterwards gets a new one, with a new thread.
 
-    with _shared_cdc_registry_lock():
+    # The lead is given up under the locks the shard leaves the registry under, the
+    # endpoints lock first, as _host_shard_own_poll takes it: a poll that found this
+    # process leading between the two made a new shard and thread here, while another
+    # process took the lock and led the shard too.
+    endpoints = _HOST_SHARD_ENDPOINTS
+    with endpoints.lock, _shared_cdc_registry_lock():
         with shard.condition:
             if shard.live_subscribers():
                 return False
         if _SHARED_CDC_SHARDS.get(key) is shard:
             _SHARED_CDC_SHARDS.pop(key, None)
             _SHARED_CDC_THREADS.pop(key, None)
-    _host_shard_stop_leading(_HOST_SHARD_ENDPOINTS, key)
+        _host_shard_stop_leading(endpoints, key, locked=True)
     return True
 
 
@@ -10348,6 +10401,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if migration and not append:
             # A migrating table records and stops whatever its mode (see _read_handoff).
             return
+        if not migration:
+            # A cutover seeds from the parked token and reads no extract.
+            self._check_unl_source_mode(table, table_options, append)
         if append:
             configured = table_options.get("snapshot.mode", self.options.get("snapshot.mode"))
             if configured is not None and mode not in {"initial", "cdc_only"}:
@@ -10365,6 +10421,42 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         elif not _cdc_capable(table) and mode in {"cdc_only", "recovery"}:
             # 170: snapshot.mode={} requires a CDC-capable table; '{}' is snapshot-only
             raise ValueError(_m(170, mode, table.exposed_name))
+
+    def _check_unl_source_mode(
+        self, table: Table, table_options: dict[str, str], append: bool
+    ) -> None:
+        # Docstring: Fail a table's snapshot.source, or snapshot.boundary.lsn, that its reads
+        # would never use.
+        #
+        # Only snapshot.mode initial and initial_only take a snapshot from the extract (an
+        # append-only table, initial). Set with another, the option did nothing: a keyless
+        # table's default cdc_only skipped the extract, a keyed table's default incremental
+        # copied the live table from today's log position instead of loading the extract
+        # from its boundary. Checked on the table's own configuration; one set on the
+        # connection applies only to the tables whose mode reads it.
+
+        source = bool(str(table_options.get(_SNAPSHOT_SOURCE_OPTION) or "").strip())
+        if not source and _SNAPSHOT_BOUNDARY_LSN_OPTION not in table_options:
+            return
+        option = _SNAPSHOT_SOURCE_OPTION if source else _SNAPSHOT_BOUNDARY_LSN_OPTION
+        mode = self._snapshot_mode(table_options)
+        if not source and self._table_snapshot_source(table_options) is None:
+            # 472: Option '{}' of table '{}' is never read: the table has no snapshot.source;
+            # set one, or remove the option
+            raise ValueError(_m(472, option, table.exposed_name))
+        if not append and not _cdc_capable(table):
+            # 473: Option '{}' of table '{}' is never read: the table is snapshot-only, read
+            # whole from Informix; remove the option
+            raise ValueError(_m(473, option, table.exposed_name))
+        unset = "snapshot.mode" not in table_options and "snapshot.mode" not in self.options
+        if append and (mode == "cdc_only" or unset):
+            # 474: Option '{}' of table '{}' is never read: snapshot.mode=cdc_only, an
+            # append-only table's default, reads no snapshot; set snapshot.mode=initial
+            raise ValueError(_m(474, option, table.exposed_name))
+        if not append and mode not in _UNL_SNAPSHOT_MODES:
+            # 475: Option '{}' of table '{}' is never read: snapshot.mode={} takes no snapshot
+            # from it; set snapshot.mode=initial or snapshot.mode=initial_only
+            raise ValueError(_m(475, option, table.exposed_name, mode))
 
     def _refuse_connection_table_options(self, table_options: dict[str, str]) -> None:
         # Docstring: Fail a table option set on the connection rather than in the table's
@@ -10682,10 +10774,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         {
                             _REPLAY_STOP_PK_OPTION: "null",
                             _REPLAY_RESNAPSHOT_OPTION: "1",
+                            _RESNAPSHOT_OPTION: "1",
                             **table_options,
                         }
                         if replaying
-                        else table_options,
+                        else {_RESNAPSHOT_OPTION: "1", **table_options},
                         pipeline_scope_override=self._resnapshot_scope(table, effective_start),
                     )
                     if replaying:
@@ -14173,10 +14266,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # missing or removed by a racing cleanup is skipped. Runs on a background thread.
 
         cutoff = time.time() - retention_seconds
+        emptied = []
         for scope in _staging_subdirectories(root):
-            for schema in _staging_subdirectories(scope):
-                for run in _staging_subdirectories(os.path.join(schema, "runs")):
+            schemas = _staging_subdirectories(scope)
+            runs = [os.path.join(schema, "runs") for schema in schemas]
+            emptied += _unchanged_directories(cutoff, *runs, *schemas, scope)
+            for path in runs:
+                for run in _staging_subdirectories(path):
                     InformixLakeflowConnect._remove_stale_stage_run(run, cutoff)
+        for path in emptied:
+            with contextlib.suppress(OSError):  # not empty
+                os.rmdir(path)
 
     @staticmethod
     def _sweep_stale_scan_progress(root: str, retention_seconds: float) -> None:
@@ -14190,10 +14290,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # enough for a restart to continue from is never selected.
 
         cutoff = time.time() - max(float(retention_seconds), float(_SCAN_RESUME_SECONDS))
+        emptied = []
         for scope in _staging_subdirectories(root):
-            for schema in _staging_subdirectories(scope):
+            schemas = _staging_subdirectories(scope)
+            emptied += _unchanged_directories(cutoff, *schemas, scope)
+            for schema in schemas:
                 for boundary in _staging_subdirectories(schema):
                     InformixLakeflowConnect._remove_stale_stage_run(boundary, cutoff)
+        for path in emptied:
+            with contextlib.suppress(OSError):  # not empty
+                os.rmdir(path)
         try:
             with os.scandir(root) as entries:
                 pointers = [
@@ -14670,6 +14776,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             chunk_exprs,
             _snapshot_filter(options),
             floor=not _replay_keeps_floor(options),
+            resnapshot=_RESNAPSHOT_OPTION in options,
         )
         high_water = int(incremental["boundary_lsn"])
         seed = _offset(
@@ -14697,6 +14804,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         snapshot_filter: str | None,
         *,
         floor: bool = True,
+        resnapshot: bool = False,
     ) -> tuple[Table, str, dict]:
         # Docstring: Capture a fresh, self-describing incremental snapshot block.
         #
@@ -14723,7 +14831,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         schema_id = self._snapshot_schema_ids[(pipeline_scope, table.identity)]
         table = self._refresh_table_schema(table, _schema_fingerprint(table))
         self._publish_snapshot_boundary(
-            table, schema_id, high_water, high_water, pipeline_scope, floor=floor
+            table,
+            schema_id,
+            high_water,
+            high_water,
+            pipeline_scope,
+            floor=floor,
+            resnapshot=resnapshot,
         )
         # Strictly after the boundary above, never before it.
         max_pk = self._snapshot_read_with_reconnect(
@@ -15197,7 +15311,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 checkpoint,
                 stage_scope=stage_scope,
             )
-        elif self._table_snapshot_source(options):
+        elif self._table_snapshot_source(options) and (
+            # The extract is the initial snapshot of the modes that take one from it. Under
+            # another (a connection-scope snapshot.source), a blocking snapshot that
+            # incremental or auto_snapshot falls back to served the extract on the driver,
+            # an auto_snapshot resnapshot an old one, while a chunked copy read the table.
+            self._snapshot_mode(options) in _UNL_SNAPSHOT_MODES
+            or self._replayed_unl_boundary(table, options) is not None
+        ):
             # File source: serve the initial snapshot from Informix UNLOAD (`.unl`) files
             # on a Volume instead of a live scan. Serial driver fallback used when the
             # partitioned reader is off; the partitioned path fans the same splits across
@@ -15492,6 +15613,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 snapshot_lsn,
                 pipeline_scope,
                 floor=not _replay_keeps_floor(options),
+                resnapshot=_RESNAPSHOT_OPTION in options,
             )
             # The rows a scan read again are in the count twice, once for each page that
             # holds them: the manifest counts the rows the pages serve.
@@ -16979,8 +17101,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # Docstring: Whether this read belongs to a file-source initial snapshot's split serve.
         #
         # The single gate the partitioned ``latest_offset``/``get_partitions`` branches
-        # share: a non-delete flow, ``snapshot.source`` set, and ``snapshot.mode=initial``
-        # (the only mode that routes to the file serve, keyed or keyless-append). It fires
+        # share: a non-delete flow, ``snapshot.source`` set, and ``snapshot.mode`` initial or
+        # initial_only (the modes that route to the file serve, keyed or keyless-append;
+        # initial_only stops at the boundary as its live snapshot does). It fires
         # on the first read (no committed offset) and on every continuation microbatch (a
         # snapshot-phase offset), so the serve fans out ``stream.partitioned.snapshot.pages.
         # per.batch`` splits at a time until the boundary offset transitions to the stream
@@ -16994,7 +17117,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if self._table_snapshot_source(table_options) is None:
             return False
         if not effective_start:
-            return self._snapshot_mode(table_options) == "initial"
+            return self._snapshot_mode(table_options) in _UNL_SNAPSHOT_MODES
         # A serve part-way through finishes as a staged one does, whatever snapshot.mode
         # says now: the mode chooses how a snapshot starts.
         return effective_start.get("phase") == "snapshot"
@@ -20118,7 +20241,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return scope.partition("_@_")[0]
 
     def _publish_delete_snapshot_floor(
-        self, table: Table, schema_id: str, snapshot_lsn: int, pipeline_scope: str
+        self,
+        table: Table,
+        schema_id: str,
+        snapshot_lsn: int,
+        pipeline_scope: str,
+        *,
+        resnapshot: bool = False,
     ) -> None:
         # Docstring: Record the snapshot boundary a delete flow should bootstrap from.
         #
@@ -20133,13 +20262,17 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # Ordinary polls leave it untouched. The delete channel is idempotent, so a floor
         # that lags only causes a harmless re-read; one left too high loses deletes.
         #
-        # Only a full refresh empties the destination. Outside one (auto_snapshot's
-        # resnapshot of an expired checkpoint, above all) the rows it holds stay, and the
-        # deletes after an earlier floor still apply to them: a floor of another update
-        # that is still in the log, of this layout and not above this boundary stays.
-        # Replaced, it sent a delete reader past retained deletes of rows the new snapshot
-        # no longer has, which then stayed in the destination.
-        if self._update_request != "full_refresh":
+        # A snapshot from no checkpoint lands in a destination that is new or emptied, and
+        # takes the floor whatever the update was started for: an automatic retry of a full
+        # refresh, an update the pipelines API can't describe, a table selected for a
+        # selective refresh. ``resnapshot`` is auto_snapshot's of an expired checkpoint
+        # (_RESNAPSHOT_OPTION), which leaves the destination's rows where they are,
+        # and the deletes after an earlier floor still apply to them: a floor of another
+        # update that is still in the log, of this layout and not above this boundary
+        # stays, a table's left out of a selective refresh too. Replaced, it sent a delete
+        # reader past retained deletes of rows the new snapshot no longer has, which then
+        # stayed in the destination.
+        if resnapshot:
             kept = self._read_immutable_head(
                 self._immutable_namespace(table, "delete-floor", self._pipeline_id(pipeline_scope))
             )
@@ -20476,8 +20609,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         pipeline_scope: str,
         *,
         floor: bool = True,
+        resnapshot: bool = False,
     ) -> None:
-        # ``floor`` False leaves the delete floor as it is (see _replay_keeps_floor).
+        # ``floor`` False leaves the delete floor as it is (see _replay_keeps_floor);
+        # ``resnapshot`` keeps one still in the log (see _publish_delete_snapshot_floor).
         winner = self._publish_immutable_head(
             self._immutable_namespace(table, "snapshots", pipeline_scope, schema_id),
             {
@@ -20508,7 +20643,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # LSN the current destination rows were captured at -- the correct lower bound for
         # replaying deletes (see the bootstrap path in _read_table_deletes_attempt).
         if floor:
-            self._publish_delete_snapshot_floor(table, schema_id, snapshot_lsn, pipeline_scope)
+            self._publish_delete_snapshot_floor(
+                table, schema_id, snapshot_lsn, pipeline_scope, resnapshot=resnapshot
+            )
         # The floor first: a delete reader that started at an earlier snapshot's floor takes
         # this update's start as the sign that the floor is settled (_confirmed_floor_seed).
         # Publish only once the strategy has finalized its safe handoff:

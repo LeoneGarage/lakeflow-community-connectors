@@ -157,11 +157,21 @@ def make_args(instance_id: str) -> argparse.Namespace:
 
 
 def informix_counts(args: argparse.Namespace) -> dict[str, int]:
-    """One SSM call: run COUNT(*) for every table via dbaccess, parse output."""
+    """One SSM call: run COUNT(*) for every table via dbaccess, parse output.
+
+    A table keyed on the whole row (C.WHOLE_ROW_KEY_TABLES) lands each distinct row
+    once, so its distinct rows are counted: counted whole, a row written twice read as a
+    count mismatch.
+    """
     owner = C.validate_identifier(args.source_owner)
+    whole_row = set(C.WHOLE_ROW_KEY_TABLES)
+
+    def source(table: str) -> str:
+        name = f"{owner}.{C.validate_identifier(table)}"
+        return f"(SELECT DISTINCT * FROM {name})" if table in whole_row else name
+
     stmts = "\n".join(
-        f"SELECT '{C.validate_identifier(t)}' tbl, COUNT(*) cnt FROM {owner}.{C.validate_identifier(t)};"
-        for t in TABLES
+        f"SELECT '{C.validate_identifier(t)}' tbl, COUNT(*) cnt FROM {source(t)};" for t in TABLES
     )
     import base64
 

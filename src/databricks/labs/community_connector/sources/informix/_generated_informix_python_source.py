@@ -2542,12 +2542,9 @@ def register_lakeflow_source(spark):
 
         with connection.cursor() as cursor:
             cursor.execute(
-                """
-                INSERT INTO conn_slots (namespace, slot_id)
-                SELECT %s, generated.slot_id
-                FROM generate_series(0, %s - 1) AS generated(slot_id)
-                ON CONFLICT (namespace, slot_id) DO NOTHING
-                """,
+                "INSERT INTO conn_slots (namespace, slot_id)"
+                " SELECT %s, generated.slot_id FROM generate_series(0, %s - 1) AS generated(slot_id)"
+                " ON CONFLICT (namespace, slot_id) DO NOTHING",
                 (namespace, slot_count),
             )
         connection.commit()
@@ -2852,7 +2849,7 @@ def register_lakeflow_source(spark):
                     # A candidate is read on a live read's path: wait briefly, not for provisioning.
                     facts = _endpoint_facts(api, project_id, deadline=time.monotonic() + 60)
                     token = generate_credential(api, facts["endpoint"])
-                    connection = self._open_state_database(facts, token)
+                    connection, database = self._open_state_database(facts, token)
                     if connection is None:
                         _LOGGER.debug(
                             "Leaving Lakebase project %s: no connector state found in it", project_id
@@ -2885,16 +2882,7 @@ def register_lakeflow_source(spark):
                         )
                         continue
                     with connection.cursor() as cursor:
-                        cursor.execute(
-                            """
-                            SELECT
-                              COUNT(*) FILTER (WHERE record_type = 'state-gc'),
-                              COUNT(*) FILTER (WHERE record_type = 'table-activity'),
-                              MAX((record->>'last_used_at')::double precision)
-                                FILTER (WHERE record_type = 'table-activity')
-                            FROM state_records
-                            """
-                        )
+                        cursor.execute(_PROJECT_ACTIVITY)
                         gc_rows, activity_rows, last_used = cursor.fetchone()
                     if not gc_rows or not activity_rows or last_used is None:
                         continue
@@ -2907,24 +2895,18 @@ def register_lakeflow_source(spark):
                     # a backlog hint, a state record written, a stream's position parked for
                     # a migration.
                     with connection.cursor() as cursor:
-                        cursor.execute(
-                            """
-                            SELECT
-                              EXISTS (SELECT 1 FROM conn_slots
-                                      WHERE renewed_at > now() - %s * interval '1 day'),
-                              EXISTS (SELECT 1 FROM slot_waiters
-                                      WHERE heartbeat_at > now() - %s * interval '1 day'),
-                              EXISTS (SELECT 1 FROM backlog_hints
-                                      WHERE updated_at > now() - %s * interval '1 day'),
-                              EXISTS (SELECT 1 FROM state_records
-                                      WHERE created_at > now() - %s * interval '1 day'),
-                              EXISTS (SELECT 1 FROM cdc_handoff
-                                      WHERE created_at > now() - %s * interval '1 day')
-                            """,
-                            (float(retention_days),) * 5,
-                        )
+                        cursor.execute(_PROJECT_RECENT_USE, (float(retention_days),) * 5)
                         recent = cursor.fetchone()
                     if any(recent):
+                        continue
+                    # The project is named by the server alone, so a connection that moved to
+                    # another lakebase.database kept it, its old database's records left
+                    # behind: judged by that database, the project went, with the state the
+                    # other one holds.
+                    if self._other_state_database(facts, token, connection, database):
+                        _LOGGER.debug(
+                            "Leaving Lakebase project %s: another database's state", project_id
+                        )
                         continue
                     connection.close()
                     connection = None
@@ -2947,10 +2929,11 @@ def register_lakeflow_source(spark):
                 deleted += 1
             return deleted
 
-        def _open_state_database(self, facts: dict[str, Any], token: str) -> Any:
+        def _open_state_database(self, facts: dict[str, Any], token: str) -> tuple[Any, str | None]:
             # Docstring: A connection, as the provisioning identity, to the database of another
-            # connector project that holds its state: this connection's lakebase.database, else
-            # the default one. None when neither does.
+            # connector project that holds its state, and that database's name: this
+            # connection's lakebase.database, else the default one. (None, None) when neither
+            # does.
             #
             # The project was named by another connection, which may have set another
             # lakebase.database: with this connection's alone, a project on the default one
@@ -2959,29 +2942,61 @@ def register_lakeflow_source(spark):
             failure: Exception | None = None
             for database in dict.fromkeys((self._database, _DEFAULT_DATABASE)):
                 try:
-                    connection = self._open(facts, self._admin_user(), token, database=database)
+                    connection = self._state_database(facts, token, database)
                 except Exception as error:  # pylint: disable=broad-except
                     failure = error
                     continue
-                try:
-                    # The catalog, which any role may read; the records are read as the state
-                    # role (see collect_unused_projects).
-                    with connection.cursor() as cursor:
-                        cursor.execute(
-                            "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'state_records'"
-                        )
-                        found = bool(cursor.fetchone()[0])
-                    connection.commit()
-                except Exception:  # pylint: disable=broad-except
-                    # No telling: the state role, taken next, decides as before.
-                    connection.rollback()
-                    return connection
-                if found:
-                    return connection
-                connection.close()
+                if connection is not None:
+                    return connection, database
             if failure is not None:
                 raise failure
+            return None, None
+
+        def _state_database(self, facts: dict[str, Any], token: str, database: str) -> Any:
+            # Docstring: A connection to ``database`` if it holds connector state, or its catalog
+            # does not say (the state role, taken next, decides as before); else None.
+
+            connection = self._open(facts, self._admin_user(), token, database=database)
+            try:
+                # The catalog, which any role may read; the records are read as the state role
+                # (see collect_unused_projects).
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'state_records'"
+                    )
+                    found = bool(cursor.fetchone()[0])
+                connection.commit()
+            except Exception:  # pylint: disable=broad-except
+                connection.rollback()
+                return connection
+            if found:
+                return connection
+            connection.close()
             return None
+
+        def _other_state_database(
+            self, facts: dict[str, Any], token: str, connection: Any, database: str | None
+        ) -> bool:
+            # Docstring: Whether a database of the project other than ``database`` holds
+            # connector state, or can't be told not to.
+
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT datname FROM pg_catalog.pg_database"
+                    " WHERE NOT datistemplate AND datallowconn"
+                )
+                names = [row[0] for row in cursor.fetchall() or ()]
+            connection.commit()
+            for name in names:
+                if name != database:
+                    try:
+                        other = self._state_database(facts, token, name)
+                    except Exception:  # pylint: disable=broad-except
+                        return True
+                    if other is not None:
+                        other.close()
+                        return True
+            return False
 
         def _admin_user(self) -> str:
             # Docstring: Return the role name used for provisioning.
@@ -3052,6 +3067,36 @@ def register_lakeflow_source(spark):
             return psycopg.connect(**parameters)
 
 
+    def _sql(text: str) -> str:
+        # Docstring: ``text`` with each line's indentation dropped: the statements ride in the
+        # pickled source, which Spark ships within a size limit (see the merged source).
+
+        return "\n".join(line.strip() for line in text.strip().splitlines())
+
+
+    # A candidate project's sweep: its connector activity, then anything else recent.
+    _PROJECT_ACTIVITY = _sql(
+        """
+    SELECT
+      COUNT(*) FILTER (WHERE record_type = 'state-gc'),
+      COUNT(*) FILTER (WHERE record_type = 'table-activity'),
+      MAX((record->>'last_used_at')::double precision)
+        FILTER (WHERE record_type = 'table-activity')
+    FROM state_records
+    """
+    )
+    _PROJECT_RECENT_USE = _sql(
+        """
+    SELECT
+      EXISTS (SELECT 1 FROM conn_slots WHERE renewed_at > now() - %s * interval '1 day'),
+      EXISTS (SELECT 1 FROM slot_waiters WHERE heartbeat_at > now() - %s * interval '1 day'),
+      EXISTS (SELECT 1 FROM backlog_hints WHERE updated_at > now() - %s * interval '1 day'),
+      EXISTS (SELECT 1 FROM state_records WHERE created_at > now() - %s * interval '1 day'),
+      EXISTS (SELECT 1 FROM cdc_handoff WHERE created_at > now() - %s * interval '1 day')
+    """
+    )
+
+
     # --- connection slots ------------------------------------------------------
     #
     # The whole Volume fencing protocol -- per-slot reservation directories,
@@ -3094,7 +3139,8 @@ def register_lakeflow_source(spark):
     #
     # ``num_classes`` is the rotation modulus (the count of distinct classes); ``1`` makes rot
     # uniformly 0, so waiters are served strictly by ticket age.
-    _ACQUIRE_SLOT = """
+    _ACQUIRE_SLOT = _sql(
+        """
     WITH cur AS (
         SELECT COALESCE(
             (SELECT last_class FROM slot_rr_cursor WHERE namespace = %(namespace)s), -1
@@ -3131,16 +3177,19 @@ def register_lakeflow_source(spark):
     )
     RETURNING slot_id, epoch
     """
+    )
 
     # Renewal is guarded on (owner, epoch): a zombie's heartbeat is rejected rather
     # than silently extending a lease its successor now owns. A caller that gets no
     # row has provably lost the slot and must stop using its connection.
-    _HEARTBEAT_SLOT = """
+    _HEARTBEAT_SLOT = _sql(
+        """
     UPDATE conn_slots SET renewed_at = now()
     WHERE namespace = %(namespace)s AND slot_id = %(slot_id)s
       AND owner = %(owner)s AND epoch = %(epoch)s
     RETURNING slot_id
     """
+    )
 
     # Release carries the same guard, for a sharper reason: without it a zombie's
     # late release would free a slot its successor legitimately holds, over-issuing
@@ -3150,42 +3199,54 @@ def register_lakeflow_source(spark):
     # alone, and the unused-project sweep reads renewed_at as activity. Set to NULL, every
     # slot of a stream outside a pipeline, which records no table activity, read as unused
     # between its microbatches, and its project could be dropped under it.
-    _RELEASE_SLOT = """
+    _RELEASE_SLOT = _sql(
+        """
     UPDATE conn_slots SET owner = NULL, scope = NULL, renewed_at = now()
     WHERE namespace = %(namespace)s AND slot_id = %(slot_id)s
       AND owner = %(owner)s AND epoch = %(epoch)s
     RETURNING slot_id
     """
+    )
 
     # The winner stamps the cursor with its own class so the next grant rotates to the class
     # after it. Upsert because the row may not exist yet on the first grant in a namespace.
-    _ADVANCE_RR_CURSOR = """
+    _ADVANCE_RR_CURSOR = _sql(
+        """
     INSERT INTO slot_rr_cursor (namespace, last_class) VALUES (%(namespace)s, %(waiter_class)s)
     ON CONFLICT (namespace) DO UPDATE SET last_class = EXCLUDED.last_class
     """
+    )
 
     # A waiter enqueues one ticket for the whole time it blocks, heartbeats it each sweep,
     # and deletes it the instant it wins a slot (or gives up). The heartbeat doubles as the
     # reaper -- it drops any ticket whose owner stopped heartbeating -- so a crashed or
     # timed-out waiter cannot wedge the queue and the table needs no separate GC.
-    _ENQUEUE_WAITER = """
+    _ENQUEUE_WAITER = _sql(
+        """
     INSERT INTO slot_waiters (namespace, owner, floor, ceiling, waiter_class)
     VALUES (%(namespace)s, %(owner)s, %(floor)s, %(ceiling)s, %(waiter_class)s)
     RETURNING ticket_id
     """
-    _HEARTBEAT_WAITER = """
+    )
+    _HEARTBEAT_WAITER = _sql(
+        """
     UPDATE slot_waiters SET heartbeat_at = now()
     WHERE namespace = %(namespace)s AND ticket_id = %(ticket_id)s
     RETURNING ticket_id
     """
-    _REAP_WAITERS = """
+    )
+    _REAP_WAITERS = _sql(
+        """
     DELETE FROM slot_waiters
     WHERE namespace = %(namespace)s
       AND heartbeat_at < now() - make_interval(secs => %(waiter_ttl)s)
     """
-    _DEQUEUE_WAITER = """
+    )
+    _DEQUEUE_WAITER = _sql(
+        """
     DELETE FROM slot_waiters WHERE namespace = %(namespace)s AND ticket_id = %(ticket_id)s
     """
+    )
 
 
     class ConnectionSlot:
@@ -3330,7 +3391,8 @@ def register_lakeflow_source(spark):
         connection.commit()
 
 
-    _PUT_CDC_HANDOFF = """
+    _PUT_CDC_HANDOFF = _sql(
+        """
     INSERT INTO cdc_handoff (namespace, table_key, channel, offset_json, schema_fp)
     VALUES (%(namespace)s, %(table_key)s, %(channel)s, %(offset_json)s, %(schema_fp)s)
     ON CONFLICT (namespace, table_key, channel)
@@ -3338,16 +3400,21 @@ def register_lakeflow_source(spark):
                   schema_fp = EXCLUDED.schema_fp,
                   created_at = now()
     """
+    )
 
-    _GET_CDC_HANDOFF = """
+    _GET_CDC_HANDOFF = _sql(
+        """
     SELECT offset_json, schema_fp FROM cdc_handoff
     WHERE namespace = %(namespace)s AND table_key = %(table_key)s AND channel = %(channel)s
     """
+    )
 
-    _DELETE_CDC_HANDOFF = """
+    _DELETE_CDC_HANDOFF = _sql(
+        """
     DELETE FROM cdc_handoff
     WHERE namespace = %(namespace)s AND table_key = %(table_key)s AND channel = %(channel)s
     """
+    )
 
 
     def put_cdc_handoff(
@@ -3447,9 +3514,11 @@ def register_lakeflow_source(spark):
     # without needing to see which slot moved. A slot merely held (a long read that neither
     # releases nor re-claims) does not advance it: that is deliberate, the token measures
     # forward progress of the pool, not liveness of an individual holder.
-    _POOL_PROGRESS_TOKEN = """
+    _POOL_PROGRESS_TOKEN = _sql(
+        """
     SELECT COALESCE(SUM(epoch), 0) FROM conn_slots WHERE namespace = %(namespace)s
     """
+    )
 
 
     def pool_progress_token(connection: Any, namespace: str) -> int:
@@ -3471,18 +3540,22 @@ def register_lakeflow_source(spark):
     # last-writer-wins on a filesystem with no atomic update. A single upsert is
     # exact, and one query returns every table's hint instead of walking a directory
     # per table.
-    _WRITE_HINT = """
+    _WRITE_HINT = _sql(
+        """
     INSERT INTO backlog_hints (namespace, table_name, lsn, updated_at)
     VALUES (%(namespace)s, %(table_name)s, %(lsn)s, now())
     ON CONFLICT (namespace, table_name) DO UPDATE
        SET lsn = GREATEST(backlog_hints.lsn, EXCLUDED.lsn), updated_at = now()
     """
+    )
 
-    _READ_HINTS = """
+    _READ_HINTS = _sql(
+        """
     SELECT table_name, lsn FROM backlog_hints
     WHERE namespace = %(namespace)s
       AND updated_at > now() - make_interval(secs => %(max_age)s)
     """
+    )
 
 
     def publish_backlog_hint(connection: Any, namespace: str, table_name: str, lsn: int) -> None:
@@ -3513,7 +3586,8 @@ def register_lakeflow_source(spark):
 
     # --- connection limit configuration ---------------------------------------
 
-    _WRITE_LIMIT = """
+    _WRITE_LIMIT = _sql(
+        """
     INSERT INTO conn_limits (namespace, max_connections, reserved_deletes, version, updated_at)
     VALUES (%(namespace)s, %(max_connections)s, 0, %(version)s, now())
     ON CONFLICT (namespace) DO UPDATE
@@ -3522,6 +3596,7 @@ def register_lakeflow_source(spark):
            version = EXCLUDED.version,
            updated_at = now()
     """
+    )
 
 
     def publish_connection_limit(
@@ -3573,19 +3648,24 @@ def register_lakeflow_source(spark):
     # winner. That single statement replaces writing a candidate file, fsyncing it,
     # and renaming it into an exclusive ``head`` -- along with the candidate sweeper
     # that had to clean up whichever candidates lost.
-    _INSERT_RECORD = """
+    _INSERT_RECORD = _sql(
+        """
     INSERT INTO state_records (namespace, record_key, record, record_type)
     VALUES (%(namespace)s, %(record_key)s, %(record)s::jsonb, %(record_type)s)
     ON CONFLICT (namespace, record_key) DO NOTHING
     RETURNING record
     """
+    )
 
-    _SELECT_RECORD = """
+    _SELECT_RECORD = _sql(
+        """
     SELECT record FROM state_records
     WHERE namespace = %(namespace)s AND record_key = %(record_key)s
     """
+    )
 
-    _DELETE_OBSOLETE_SCOPED_RECORDS = """
+    _DELETE_OBSOLETE_SCOPED_RECORDS = _sql(
+        """
     DELETE FROM state_records
     WHERE namespace = %(namespace)s
       AND record_key LIKE %(record_key_pattern)s
@@ -3597,8 +3677,10 @@ def register_lakeflow_source(spark):
       AND (%(retained_scope)s::text IS NULL OR record->>'scope' <> %(retained_scope)s::text)
     RETURNING record_key
     """
+    )
 
-    _TOUCH_TABLE_ACTIVITY = """
+    _TOUCH_TABLE_ACTIVITY = _sql(
+        """
     INSERT INTO state_records (namespace, record_key, record, record_type)
     VALUES (
       %(namespace)s, %(record_key)s,
@@ -3619,8 +3701,10 @@ def register_lakeflow_source(spark):
           <= extract(epoch FROM clock_timestamp()) - %(touch_interval_seconds)s
     RETURNING record
     """
+    )
 
-    _CLAIM_STATE_GC = """
+    _CLAIM_STATE_GC = _sql(
+        """
     INSERT INTO state_records (namespace, record_key, record, record_type)
     VALUES (
       %(namespace)s, %(record_key)s,
@@ -3638,8 +3722,10 @@ def register_lakeflow_source(spark):
           <= extract(epoch FROM clock_timestamp())
     RETURNING record
     """
+    )
 
-    _DELETE_STALE_PIPELINE_STATE = """
+    _DELETE_STALE_PIPELINE_STATE = _sql(
+        """
     DELETE FROM state_records AS target
     USING state_records AS activity
     WHERE target.namespace = %(namespace)s
@@ -3650,8 +3736,10 @@ def register_lakeflow_source(spark):
       AND target.record->>'scope' LIKE activity.record->>'pipeline_id' || '_@_%%'
     RETURNING target.record_key
     """
+    )
 
-    _DELETE_UNUSED_TABLE_STATE = """
+    _DELETE_UNUSED_TABLE_STATE = _sql(
+        """
     DELETE FROM state_records AS target
     WHERE target.namespace = %(namespace)s
       AND target.record_type NOT IN ('table-activity', 'state-gc')
@@ -3671,16 +3759,20 @@ def register_lakeflow_source(spark):
       )
     RETURNING target.record_key
     """
+    )
 
-    _DELETE_STALE_ACTIVITY = """
+    _DELETE_STALE_ACTIVITY = _sql(
+        """
     DELETE FROM state_records
     WHERE namespace = %(namespace)s
       AND record_type = 'table-activity'
       AND (record->>'last_used_at')::double precision < %(cutoff_epoch)s
     RETURNING record_key
     """
+    )
 
-    _PUBLISH_MINIMUM_LSN_RECORD = """
+    _PUBLISH_MINIMUM_LSN_RECORD = _sql(
+        """
     INSERT INTO state_records (namespace, record_key, record, record_type)
     VALUES (%(namespace)s, %(record_key)s, %(record)s::jsonb, %(record_type)s)
     ON CONFLICT (namespace, record_key) DO UPDATE
@@ -3693,6 +3785,7 @@ def register_lakeflow_source(spark):
           > (EXCLUDED.record->>'start_lsn')::numeric
     RETURNING record
     """
+    )
 
 
     # Counterpart of the minimum publisher, for a record shared across every update scope
@@ -3704,7 +3797,8 @@ def register_lakeflow_source(spark):
     # older floor, a delete flow bootstrapping later started past deletes it had to apply. A
     # record without a snapshot_scope keeps the highest only. Not "scope": records carrying
     # that are a finished update's, and its cleanup deletes them.
-    _PUBLISH_MAXIMUM_LSN_RECORD = """
+    _PUBLISH_MAXIMUM_LSN_RECORD = _sql(
+        """
     INSERT INTO state_records (namespace, record_key, record, record_type)
     VALUES (%(namespace)s, %(record_key)s, %(record)s::jsonb, %(record_type)s)
     ON CONFLICT (namespace, record_key) DO UPDATE
@@ -3719,6 +3813,7 @@ def register_lakeflow_source(spark):
                    IS DISTINCT FROM EXCLUDED.record->>'snapshot_scope'))
     RETURNING record
     """
+    )
 
 
     # Resolved once and cached, but in a dict mutated in place -- never a bare module
@@ -3924,7 +4019,8 @@ def register_lakeflow_source(spark):
     # exactly one sees the set complete (Postgres serializes the conflicting update on the
     # row) and deletes the pages. The record has no ``scope`` field, so the obsolete-update
     # cleanup leaves it alone; the table-state GC removes it with the table.
-    _MERGE_SPILL_RUN = """
+    _MERGE_SPILL_RUN = _sql(
+        """
     INSERT INTO state_records (namespace, record_key, record, record_type)
     VALUES (%(namespace)s, %(record_key)s, %(record)s::jsonb, 'cdc-spill-run')
     ON CONFLICT (namespace, record_key) DO UPDATE
@@ -3935,14 +4031,18 @@ def register_lakeflow_source(spark):
     WHERE state_records.record_type = 'cdc-spill-run'
     RETURNING record
     """
+    )
 
-    _DELETE_SPILL_RUN = """
+    _DELETE_SPILL_RUN = _sql(
+        """
     DELETE FROM state_records
     WHERE namespace = %(namespace)s AND record_key = %(record_key)s
       AND record_type = 'cdc-spill-run'
     """
+    )
 
-    _DELETE_EXPIRED_SPILL_RUNS = """
+    _DELETE_EXPIRED_SPILL_RUNS = _sql(
+        """
     DELETE FROM state_records
     WHERE namespace = %(namespace)s
       AND record_type = 'cdc-spill-run'
@@ -3950,14 +4050,17 @@ def register_lakeflow_source(spark):
       AND created_at < now() - make_interval(secs => %(retention_seconds)s)
     RETURNING record
     """
+    )
 
-    _SELECT_SPILL_RUNS = """
+    _SELECT_SPILL_RUNS = _sql(
+        """
     SELECT record FROM state_records
     WHERE namespace = %(namespace)s
       AND record_type = 'cdc-spill-run'
       AND record_key LIKE %(record_key_pattern)s
       AND NOT (COALESCE(record->'done', '{}'::jsonb) ? %(channel)s)
     """
+    )
 
 
     def merge_spill_run(
@@ -4033,7 +4136,8 @@ def register_lakeflow_source(spark):
     # One row per staging root: when its next sweep of every table staged there is due. A
     # reader takes it once the time has passed, so of the readers staging there one sweeps
     # per interval.
-    _CLAIM_STAGING_SWEEP = """
+    _CLAIM_STAGING_SWEEP = _sql(
+        """
     INSERT INTO state_records (namespace, record_key, record, record_type)
     VALUES (
       %(namespace)s, %(record_key)s,
@@ -4050,6 +4154,7 @@ def register_lakeflow_source(spark):
           <= extract(epoch FROM clock_timestamp())
     RETURNING record
     """
+    )
 
 
     def claim_staging_sweep(
@@ -6652,6 +6757,9 @@ def register_lakeflow_source(spark):
     _HANDOFF_CHANNEL_UPSERT = 0
     _HANDOFF_CHANNEL_DELETE = 1
     _DEFAULT_SNAPSHOT_MODE = "incremental"
+    # The modes whose snapshot a snapshot.source extract serves: the extract is the table's
+    # initial snapshot, and no other mode takes one from it.
+    _UNL_SNAPSHOT_MODES = frozenset({"initial", "initial_only"})
     _UNSUPPORTED_SNAPSHOT_MODES = frozenset({"configuration_based", "custom"})
     # Opt-in append-only ingestion, for a table Informix can capture but this connector
     # cannot merge -- in practice one without a primary key.
@@ -7230,6 +7338,10 @@ def register_lakeflow_source(spark):
     # Set on the read that replays auto_snapshot's resnapshot of an expired checkpoint: like an
     # initial range's, it leaves the delete floor as the logged batch published it.
     _REPLAY_RESNAPSHOT_OPTION = "_informix.replay.resnapshot"
+    # Set on the read of auto_snapshot's resnapshot of an expired checkpoint, which leaves the
+    # destination as it is: its boundary keeps an earlier floor still in the log
+    # (_publish_delete_snapshot_floor). Never persisted.
+    _RESNAPSHOT_OPTION = "_informix.resnapshot"
     # The floor_seed of the end a replayed delete range logged, and whether that end is on a
     # transaction, as JSON [seed or null, bool] (see _confirmed_floor_seed).
     _REPLAY_END_SEED_OPTION = "_informix.replay.end.seed"
@@ -13514,6 +13626,23 @@ def register_lakeflow_source(spark):
                 os.close(descriptor)
 
 
+    def _unchanged_directories(cutoff: float, *paths: str) -> list[str]:
+        # Docstring: Those of ``paths`` that no entry was added to or taken from since ``cutoff``.
+        #
+        # The sweeps took the runs, scans and stages out and left the directories that held
+        # them, one scope directory for every update that ever staged, each listed over the
+        # mount again by every later sweep. A sweep removes those it empties that were
+        # unchanged before it began on them: one that changed within the retention window may
+        # be where a reader of that update is staging.
+
+        unchanged = []
+        for path in paths:
+            with contextlib.suppress(OSError):
+                if os.stat(path, follow_symlinks=False).st_mtime < cutoff:
+                    unchanged.append(path)
+        return unchanged
+
+
     def _staging_subdirectories(path: str) -> list[str]:
         # Docstring: Immediate subdirectory paths of ``path``; empty if it is absent or unreadable.
         #
@@ -14910,6 +15039,26 @@ def register_lakeflow_source(spark):
         return shard.poll(identity, table, capture, commit, floor, owner)
 
 
+    def _host_shard_own_poll(endpoints, key, reader_factory, config, *poll):
+        # Docstring: _host_shard_local_poll of this process's own shard: within the process
+        # where the host can't share, else as its leader; None, to read directly, once this
+        # process leads it no more.
+        #
+        # The leader takes the shard under the endpoints lock, which an idle shard's retirement
+        # holds while it leaves the registry and gives the lead up (_retire_shared_cdc_shard).
+        # Taken after a check without it, a poll between the two made a new shard and reader
+        # thread in a process that then let its lock go, beside the leader another process
+        # became: two sessions reading one shard's tables.
+
+        if endpoints.unavailable:
+            return _host_shard_local_poll(key, reader_factory, config, *poll)
+        with endpoints.lock:
+            if key not in endpoints.leading:
+                return None
+            shard = _shared_cdc_shard(key, reader_factory=reader_factory, **config)
+        return shard.poll(*poll)
+
+
     def _host_shard_socket_timeouts(sock) -> None:
         # Docstring: Bound each blocking send and receive on ``sock`` by the reply timeout.
         #
@@ -14959,7 +15108,8 @@ def register_lakeflow_source(spark):
                     return
                 try:
                     leading["remote"].add(request["identity"])
-                    view = _host_shard_local_poll(
+                    view = _host_shard_own_poll(
+                        endpoints,
                         key,
                         leading["reader_factory"],
                         request["config"],
@@ -15043,13 +15193,16 @@ def register_lakeflow_source(spark):
             ).start()
 
 
-    def _host_shard_stop_leading(endpoints: _HostShardEndpoints, key: tuple) -> None:
+    def _host_shard_stop_leading(
+        endpoints: _HostShardEndpoints, key: tuple, *, locked: bool = False
+    ) -> None:
         # Docstring: Give up leading a shard nobody reads any more: close its listener, remove
         # its socket and key files, and release its lock. A follower that polls later finds
         # no leader and leads it itself. The lock file stays: removing it could let two
-        # processes lock different files of the same name.
+        # processes lock different files of the same name. ``locked``: the caller holds the
+        # endpoints lock.
 
-        with endpoints.lock:
+        with contextlib.nullcontext() if locked else endpoints.lock:
             leading = endpoints.leading.pop(key, None)
             if leading is None:
                 return
@@ -15203,12 +15356,12 @@ def register_lakeflow_source(spark):
             (key, identity, owner), (commit, floor, capture, ())
         )
         if key in endpoints.leading or endpoints.unavailable:
-            return _host_shard_local_poll(*local)
+            return _host_shard_own_poll(endpoints, *local)
         if (
             key not in endpoints.clients
             and _host_shard_try_lead(endpoints, key, reader_factory, config)
         ) or endpoints.unavailable:
-            return _host_shard_local_poll(*local)
+            return _host_shard_own_poll(endpoints, *local)
         if held_commit > commit or held_floor > floor or held_capture != capture:
             held = ()
         request = {
@@ -15225,7 +15378,7 @@ def register_lakeflow_source(spark):
             status, payload = _host_shard_request(endpoints, key, request)
         except (OSError, EOFError, TimeoutError, ValueError) as error:
             if _host_shard_try_lead(endpoints, key, reader_factory, config) or endpoints.unavailable:
-                return _host_shard_local_poll(*local)
+                return _host_shard_own_poll(endpoints, *local)
             # 149: Host-shared CDC shard {}-{} leader unreachable ({}); reading directly
             logging.getLogger(__name__).debug(
                 _m(149, key[-2], key[-1], error),
@@ -15420,14 +15573,19 @@ def register_lakeflow_source(spark):
         # processes; False when a subscriber has come back. A consumer that asks for the
         # shard afterwards gets a new one, with a new thread.
 
-        with _shared_cdc_registry_lock():
+        # The lead is given up under the locks the shard leaves the registry under, the
+        # endpoints lock first, as _host_shard_own_poll takes it: a poll that found this
+        # process leading between the two made a new shard and thread here, while another
+        # process took the lock and led the shard too.
+        endpoints = _HOST_SHARD_ENDPOINTS
+        with endpoints.lock, _shared_cdc_registry_lock():
             with shard.condition:
                 if shard.live_subscribers():
                     return False
             if _SHARED_CDC_SHARDS.get(key) is shard:
                 _SHARED_CDC_SHARDS.pop(key, None)
                 _SHARED_CDC_THREADS.pop(key, None)
-        _host_shard_stop_leading(_HOST_SHARD_ENDPOINTS, key)
+            _host_shard_stop_leading(endpoints, key, locked=True)
         return True
 
 
@@ -16595,6 +16753,9 @@ def register_lakeflow_source(spark):
             if migration and not append:
                 # A migrating table records and stops whatever its mode (see _read_handoff).
                 return
+            if not migration:
+                # A cutover seeds from the parked token and reads no extract.
+                self._check_unl_source_mode(table, table_options, append)
             if append:
                 configured = table_options.get("snapshot.mode", self.options.get("snapshot.mode"))
                 if configured is not None and mode not in {"initial", "cdc_only"}:
@@ -16612,6 +16773,42 @@ def register_lakeflow_source(spark):
             elif not _cdc_capable(table) and mode in {"cdc_only", "recovery"}:
                 # 170: snapshot.mode={} requires a CDC-capable table; '{}' is snapshot-only
                 raise ValueError(_m(170, mode, table.exposed_name))
+
+        def _check_unl_source_mode(
+            self, table: Table, table_options: dict[str, str], append: bool
+        ) -> None:
+            # Docstring: Fail a table's snapshot.source, or snapshot.boundary.lsn, that its reads
+            # would never use.
+            #
+            # Only snapshot.mode initial and initial_only take a snapshot from the extract (an
+            # append-only table, initial). Set with another, the option did nothing: a keyless
+            # table's default cdc_only skipped the extract, a keyed table's default incremental
+            # copied the live table from today's log position instead of loading the extract
+            # from its boundary. Checked on the table's own configuration; one set on the
+            # connection applies only to the tables whose mode reads it.
+
+            source = bool(str(table_options.get(_SNAPSHOT_SOURCE_OPTION) or "").strip())
+            if not source and _SNAPSHOT_BOUNDARY_LSN_OPTION not in table_options:
+                return
+            option = _SNAPSHOT_SOURCE_OPTION if source else _SNAPSHOT_BOUNDARY_LSN_OPTION
+            mode = self._snapshot_mode(table_options)
+            if not source and self._table_snapshot_source(table_options) is None:
+                # 472: Option '{}' of table '{}' is never read: the table has no snapshot.source;
+                # set one, or remove the option
+                raise ValueError(_m(472, option, table.exposed_name))
+            if not append and not _cdc_capable(table):
+                # 473: Option '{}' of table '{}' is never read: the table is snapshot-only, read
+                # whole from Informix; remove the option
+                raise ValueError(_m(473, option, table.exposed_name))
+            unset = "snapshot.mode" not in table_options and "snapshot.mode" not in self.options
+            if append and (mode == "cdc_only" or unset):
+                # 474: Option '{}' of table '{}' is never read: snapshot.mode=cdc_only, an
+                # append-only table's default, reads no snapshot; set snapshot.mode=initial
+                raise ValueError(_m(474, option, table.exposed_name))
+            if not append and mode not in _UNL_SNAPSHOT_MODES:
+                # 475: Option '{}' of table '{}' is never read: snapshot.mode={} takes no snapshot
+                # from it; set snapshot.mode=initial or snapshot.mode=initial_only
+                raise ValueError(_m(475, option, table.exposed_name, mode))
 
         def _refuse_connection_table_options(self, table_options: dict[str, str]) -> None:
             # Docstring: Fail a table option set on the connection rather than in the table's
@@ -16929,10 +17126,11 @@ def register_lakeflow_source(spark):
                             {
                                 _REPLAY_STOP_PK_OPTION: "null",
                                 _REPLAY_RESNAPSHOT_OPTION: "1",
+                                _RESNAPSHOT_OPTION: "1",
                                 **table_options,
                             }
                             if replaying
-                            else table_options,
+                            else {_RESNAPSHOT_OPTION: "1", **table_options},
                             pipeline_scope_override=self._resnapshot_scope(table, effective_start),
                         )
                         if replaying:
@@ -20420,10 +20618,17 @@ def register_lakeflow_source(spark):
             # missing or removed by a racing cleanup is skipped. Runs on a background thread.
 
             cutoff = time.time() - retention_seconds
+            emptied = []
             for scope in _staging_subdirectories(root):
-                for schema in _staging_subdirectories(scope):
-                    for run in _staging_subdirectories(os.path.join(schema, "runs")):
+                schemas = _staging_subdirectories(scope)
+                runs = [os.path.join(schema, "runs") for schema in schemas]
+                emptied += _unchanged_directories(cutoff, *runs, *schemas, scope)
+                for path in runs:
+                    for run in _staging_subdirectories(path):
                         InformixLakeflowConnect._remove_stale_stage_run(run, cutoff)
+            for path in emptied:
+                with contextlib.suppress(OSError):  # not empty
+                    os.rmdir(path)
 
         @staticmethod
         def _sweep_stale_scan_progress(root: str, retention_seconds: float) -> None:
@@ -20437,10 +20642,16 @@ def register_lakeflow_source(spark):
             # enough for a restart to continue from is never selected.
 
             cutoff = time.time() - max(float(retention_seconds), float(_SCAN_RESUME_SECONDS))
+            emptied = []
             for scope in _staging_subdirectories(root):
-                for schema in _staging_subdirectories(scope):
+                schemas = _staging_subdirectories(scope)
+                emptied += _unchanged_directories(cutoff, *schemas, scope)
+                for schema in schemas:
                     for boundary in _staging_subdirectories(schema):
                         InformixLakeflowConnect._remove_stale_stage_run(boundary, cutoff)
+            for path in emptied:
+                with contextlib.suppress(OSError):  # not empty
+                    os.rmdir(path)
             try:
                 with os.scandir(root) as entries:
                     pointers = [
@@ -20917,6 +21128,7 @@ def register_lakeflow_source(spark):
                 chunk_exprs,
                 _snapshot_filter(options),
                 floor=not _replay_keeps_floor(options),
+                resnapshot=_RESNAPSHOT_OPTION in options,
             )
             high_water = int(incremental["boundary_lsn"])
             seed = _offset(
@@ -20944,6 +21156,7 @@ def register_lakeflow_source(spark):
             snapshot_filter: str | None,
             *,
             floor: bool = True,
+            resnapshot: bool = False,
         ) -> tuple[Table, str, dict]:
             # Docstring: Capture a fresh, self-describing incremental snapshot block.
             #
@@ -20970,7 +21183,13 @@ def register_lakeflow_source(spark):
             schema_id = self._snapshot_schema_ids[(pipeline_scope, table.identity)]
             table = self._refresh_table_schema(table, _schema_fingerprint(table))
             self._publish_snapshot_boundary(
-                table, schema_id, high_water, high_water, pipeline_scope, floor=floor
+                table,
+                schema_id,
+                high_water,
+                high_water,
+                pipeline_scope,
+                floor=floor,
+                resnapshot=resnapshot,
             )
             # Strictly after the boundary above, never before it.
             max_pk = self._snapshot_read_with_reconnect(
@@ -21444,7 +21663,14 @@ def register_lakeflow_source(spark):
                     checkpoint,
                     stage_scope=stage_scope,
                 )
-            elif self._table_snapshot_source(options):
+            elif self._table_snapshot_source(options) and (
+                # The extract is the initial snapshot of the modes that take one from it. Under
+                # another (a connection-scope snapshot.source), a blocking snapshot that
+                # incremental or auto_snapshot falls back to served the extract on the driver,
+                # an auto_snapshot resnapshot an old one, while a chunked copy read the table.
+                self._snapshot_mode(options) in _UNL_SNAPSHOT_MODES
+                or self._replayed_unl_boundary(table, options) is not None
+            ):
                 # File source: serve the initial snapshot from Informix UNLOAD (`.unl`) files
                 # on a Volume instead of a live scan. Serial driver fallback used when the
                 # partitioned reader is off; the partitioned path fans the same splits across
@@ -21739,6 +21965,7 @@ def register_lakeflow_source(spark):
                     snapshot_lsn,
                     pipeline_scope,
                     floor=not _replay_keeps_floor(options),
+                    resnapshot=_RESNAPSHOT_OPTION in options,
                 )
                 # The rows a scan read again are in the count twice, once for each page that
                 # holds them: the manifest counts the rows the pages serve.
@@ -23226,8 +23453,9 @@ def register_lakeflow_source(spark):
             # Docstring: Whether this read belongs to a file-source initial snapshot's split serve.
             #
             # The single gate the partitioned ``latest_offset``/``get_partitions`` branches
-            # share: a non-delete flow, ``snapshot.source`` set, and ``snapshot.mode=initial``
-            # (the only mode that routes to the file serve, keyed or keyless-append). It fires
+            # share: a non-delete flow, ``snapshot.source`` set, and ``snapshot.mode`` initial or
+            # initial_only (the modes that route to the file serve, keyed or keyless-append;
+            # initial_only stops at the boundary as its live snapshot does). It fires
             # on the first read (no committed offset) and on every continuation microbatch (a
             # snapshot-phase offset), so the serve fans out ``stream.partitioned.snapshot.pages.
             # per.batch`` splits at a time until the boundary offset transitions to the stream
@@ -23241,7 +23469,7 @@ def register_lakeflow_source(spark):
             if self._table_snapshot_source(table_options) is None:
                 return False
             if not effective_start:
-                return self._snapshot_mode(table_options) == "initial"
+                return self._snapshot_mode(table_options) in _UNL_SNAPSHOT_MODES
             # A serve part-way through finishes as a staged one does, whatever snapshot.mode
             # says now: the mode chooses how a snapshot starts.
             return effective_start.get("phase") == "snapshot"
@@ -26365,7 +26593,13 @@ def register_lakeflow_source(spark):
             return scope.partition("_@_")[0]
 
         def _publish_delete_snapshot_floor(
-            self, table: Table, schema_id: str, snapshot_lsn: int, pipeline_scope: str
+            self,
+            table: Table,
+            schema_id: str,
+            snapshot_lsn: int,
+            pipeline_scope: str,
+            *,
+            resnapshot: bool = False,
         ) -> None:
             # Docstring: Record the snapshot boundary a delete flow should bootstrap from.
             #
@@ -26380,13 +26614,17 @@ def register_lakeflow_source(spark):
             # Ordinary polls leave it untouched. The delete channel is idempotent, so a floor
             # that lags only causes a harmless re-read; one left too high loses deletes.
             #
-            # Only a full refresh empties the destination. Outside one (auto_snapshot's
-            # resnapshot of an expired checkpoint, above all) the rows it holds stay, and the
-            # deletes after an earlier floor still apply to them: a floor of another update
-            # that is still in the log, of this layout and not above this boundary stays.
-            # Replaced, it sent a delete reader past retained deletes of rows the new snapshot
-            # no longer has, which then stayed in the destination.
-            if self._update_request != "full_refresh":
+            # A snapshot from no checkpoint lands in a destination that is new or emptied, and
+            # takes the floor whatever the update was started for: an automatic retry of a full
+            # refresh, an update the pipelines API can't describe, a table selected for a
+            # selective refresh. ``resnapshot`` is auto_snapshot's of an expired checkpoint
+            # (_RESNAPSHOT_OPTION), which leaves the destination's rows where they are,
+            # and the deletes after an earlier floor still apply to them: a floor of another
+            # update that is still in the log, of this layout and not above this boundary
+            # stays, a table's left out of a selective refresh too. Replaced, it sent a delete
+            # reader past retained deletes of rows the new snapshot no longer has, which then
+            # stayed in the destination.
+            if resnapshot:
                 kept = self._read_immutable_head(
                     self._immutable_namespace(table, "delete-floor", self._pipeline_id(pipeline_scope))
                 )
@@ -26723,8 +26961,10 @@ def register_lakeflow_source(spark):
             pipeline_scope: str,
             *,
             floor: bool = True,
+            resnapshot: bool = False,
         ) -> None:
-            # ``floor`` False leaves the delete floor as it is (see _replay_keeps_floor).
+            # ``floor`` False leaves the delete floor as it is (see _replay_keeps_floor);
+            # ``resnapshot`` keeps one still in the log (see _publish_delete_snapshot_floor).
             winner = self._publish_immutable_head(
                 self._immutable_namespace(table, "snapshots", pipeline_scope, schema_id),
                 {
@@ -26755,7 +26995,9 @@ def register_lakeflow_source(spark):
             # LSN the current destination rows were captured at -- the correct lower bound for
             # replaying deletes (see the bootstrap path in _read_table_deletes_attempt).
             if floor:
-                self._publish_delete_snapshot_floor(table, schema_id, snapshot_lsn, pipeline_scope)
+                self._publish_delete_snapshot_floor(
+                    table, schema_id, snapshot_lsn, pipeline_scope, resnapshot=resnapshot
+                )
             # The floor first: a delete reader that started at an earlier snapshot's floor takes
             # this update's start as the sign that the floor is settled (_confirmed_floor_seed).
             # Publish only once the strategy has finalized its safe handoff:

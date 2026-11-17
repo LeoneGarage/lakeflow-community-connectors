@@ -470,5 +470,9 @@
 "Key column {} of '{}' became {} while the table's incremental snapshot was copying, and a float key cannot page the copy; run a full refresh",
 "Informix offset has an invalid floor_seed; run a full refresh with this connector version",
 "UNLOAD value {!r} in snapshot.source is not a finite number, which no Informix {} column holds",
-"table.migration cuts '{}' over to append-only, which accepts only snapshot.mode=initial or snapshot.mode=cdc_only, and its restore would fail on the snapshot.mode in force: set one of them in the table's configuration (an incremental copy in progress still finishes)"
+"table.migration cuts '{}' over to append-only, which accepts only snapshot.mode=initial or snapshot.mode=cdc_only, and its restore would fail on the snapshot.mode in force: set one of them in the table's configuration (an incremental copy in progress still finishes)",
+"Option '{}' of table '{}' is never read: the table has no snapshot.source; set one, or remove the option",
+"Option '{}' of table '{}' is never read: the table is snapshot-only, read whole from Informix; remove the option",
+"Option '{}' of table '{}' is never read: snapshot.mode=cdc_only, an append-only table's default, reads no snapshot; set snapshot.mode=initial",
+"Option '{}' of table '{}' is never read: snapshot.mode={} takes no snapshot from it; set snapshot.mode=initial or snapshot.mode=initial_only"
 ]

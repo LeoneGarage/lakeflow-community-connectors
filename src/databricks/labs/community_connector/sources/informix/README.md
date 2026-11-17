@@ -77,11 +77,15 @@ checkpoint — its resume position, which it republishes in every update so the 
 bounded. A resume position can sit well past the snapshot the destination rows were
 captured at, and bootstrapping there would skip every delete committed in between
 (including the old-key delete of a primary-key change). The upsert reader therefore
-also records a durable, per-pipeline **delete floor** — the snapshot boundary, keyed by
-table and pipeline id so it survives update-scope cleanup; within an update the highest
+also records a durable, per-pipeline **delete floor**: the snapshot boundary, keyed by
+table and pipeline id so it survives update-scope cleanup. Within an update the highest
 of its snapshots wins, and a later update's snapshot replaces it whatever its LSN (a log
-reinitialized, an older extract) — and a bootstrapping delete reader anchors at the lower of the two,
-re-reading a range no delete checkpoint has consumed (idempotent for the target). A
+reinitialized, an older extract) and whatever the update was started for (a full refresh,
+its automatic retry, a selective refresh). The exception is `auto_snapshot`'s resnapshot of
+an expired checkpoint: the destination keeps its rows, so a floor still in the log, of the
+same layout and not above the new boundary, stays. A bootstrapping delete reader anchors at
+the lower of the two, re-reading a range no delete checkpoint has consumed (idempotent for
+the target). A
 floor that has aged out of the retained logical log, or that was captured under an
 earlier schema generation, is reported in the event log and the resume position is used
 instead; the deletes between the two can then no longer be replicated — run a full
@@ -126,7 +130,7 @@ sets the position the update reads up to, so neither waits for the other.
 | `password` | Yes | | Password for `user`; store it as a secret. |
 | `server` | Yes | | Exact `INFORMIXSERVER` name sent during SQLI authentication. |
 | `snapshot.staging.location` | Yes | | Writable Unity Catalog Volume directory for gzip-compressed immutable initial-snapshot pages, for example `/Volumes/main/informix_cdc/staging`. This is the only Volume the connector uses; everything else lives in Lakebase. Restrict `READ VOLUME`: staged files contain source row values. Pages older than the checkpoint start page are removed incrementally; remaining staging is removed after the checkpoint reaches CDC. Abandoned scopes use `snapshot.staging.retention.days`. |
-| `snapshot.staging.retention.days` | No | `4` | Age threshold for the **background retention sweep** that reclaims abandoned snapshot staging; minimum `1`. Normal cleanup removes consumed pages incrementally and the whole stage at the snapshot→CDC transition — this sweep is the safety net for a `runs/<snapshot_lsn>` subtree left behind by a crash, an abandoned resnapshot, or a superseded schema/scope. It runs **asynchronously** (off the read path, on the same background pool as page deletion), at most once per table per reader, and once per `state.gc.interval.hours` over every table staged under the location by whichever reader claims it in Lakebase, and deletes only runs whose newest page file is older than this window, so an active run (recent writes) is never touched. Best-effort: a leftover only wastes Volume space, never affects correctness. It also removes spilled CDC pages left behind (see [Large transactions](#large-transactions)), whose Lakebase records expire after the same window. The location-wide sweep applies the claiming reader's retention, so connections sharing a staging location should set the same value. |
+| `snapshot.staging.retention.days` | No | `4` | Age threshold for the **background retention sweep** that reclaims abandoned snapshot staging; minimum `1`. Normal cleanup removes consumed pages incrementally and the whole stage at the snapshot→CDC transition — this sweep is the safety net for a `runs/<snapshot_lsn>` subtree left behind by a crash, an abandoned resnapshot, or a superseded schema/scope. It runs **asynchronously** (off the read path, on the same background pool as page deletion), at most once per table per reader, and once per `state.gc.interval.hours` over every table staged under the location by whichever reader claims it in Lakebase, and deletes only runs whose newest page file is older than this window, so an active run (recent writes) is never touched. The scope and schema directories it leaves empty go too, where they had not changed within the window. Best-effort: a leftover only wastes Volume space, never affects correctness. It also removes spilled CDC pages left behind (see [Large transactions](#large-transactions)), whose Lakebase records expire after the same window. The location-wide sweep applies the claiming reader's retention, so connections sharing a staging location should set the same value. |
 | `DB_LOCALE` | No | `en_US.819` | The database's locale. Informix sends text as the database holds it, in its codeset, whatever the client's locale (it converts nothing on the wire, for queries or change records), so the connector decodes and sends all text in this locale's codeset. It must name the database's codeset: a connection whose `DB_LOCALE` names another fails with an error giving the database's locale. |
 | `CLIENT_LOCALE` | No | `en_US.utf8` | The codeset of `snapshot.source` extract files (`.unl`, HPL), which `dbaccess` writes in its own `CLIENT_LOCALE`; give it the one the extract ran under. Also sent at login. It does not change how text read from Informix is decoded. |
 | `port` | No | `9088` | Informix SQLI port; range `1`–`65535`. |
@@ -171,7 +175,7 @@ sets the position the update reads up to, so neither waits for the other.
 | `tables` | No | | Alias for `table.include.list`; ignored when that option is set. |
 | `table.exclude.list` | No | none | Comma-separated shell-style patterns excluded after inclusion filtering. |
 | `snapshot.mode` | No | `incremental` | Per-table snapshot policy: `incremental`, `initial`, `initial_only`, `cdc_only`, `auto_snapshot`, or `recovery`. See [Snapshot modes](#snapshot-modes). |
-| `snapshot.source` | No | none | Per-table (also connection-scope) UC Volume directory of Informix UNLOAD (`.unl` or gzip `.unl.gz`) extract files. With `snapshot.mode=initial`, the initial snapshot is served from those files instead of a live scan, then transitions to CDC at the boundary. Files must be newline-terminated delimited text — UNLOAD (`\|` delimiter, backslash escaping, empty field = NULL) or **HPL DELIMITED** output (set `snapshot.unl.delimiter`/`snapshot.unl.escape` when its job uses a different pair; HPL fixed-position/COBOL/binary formats are not supported). Parallel executor reads use ranged GETs over the Files REST API, splitting each plain file into ~`snapshot.split.bytes` (default 50 MiB) pieces at record boundaries. A gzip file (detected by magic bytes, not name) is not seekable, so it is one non-splittable unit — for compressed extracts, parallelism comes from using **multiple `.unl.gz` files**, and mid-snapshot resume from multiple files or `snapshot.gzip.records.per.batch`. The operator must ensure the extract reflects the table at ingest time (quiesce, or extract-then-ingest); the connector does not verify alignment. Once the snapshot starts, the connector pins each file's name, size, modification time and a sampled content fingerprint, and fails with a full-refresh error if a later read finds any file added, removed or changed. Producing the `.unl` files via UNLOAD/HPL is out of scope. See [File-sourced initial snapshot](#file-sourced-initial-snapshot). |
+| `snapshot.source` | No | none | Per-table (also connection-scope) UC Volume directory of Informix UNLOAD (`.unl` or gzip `.unl.gz`) extract files. With `snapshot.mode=initial` or `initial_only` (an append-only table: `initial`), the initial snapshot is served from those files instead of a live scan, then transitions to CDC at the boundary (`initial_only` stops there). Set in a table's configuration with another mode, which takes no snapshot from it, the table fails when the pipeline starts, as does a table's `snapshot.boundary.lsn` without an extract; set on the connection, it applies to the tables whose mode reads it, and the others snapshot from Informix. Files must be newline-terminated delimited text — UNLOAD (`\|` delimiter, backslash escaping, empty field = NULL) or **HPL DELIMITED** output (set `snapshot.unl.delimiter`/`snapshot.unl.escape` when its job uses a different pair; HPL fixed-position/COBOL/binary formats are not supported). Parallel executor reads use ranged GETs over the Files REST API, splitting each plain file into ~`snapshot.split.bytes` (default 50 MiB) pieces at record boundaries. A gzip file (detected by magic bytes, not name) is not seekable, so it is one non-splittable unit — for compressed extracts, parallelism comes from using **multiple `.unl.gz` files**, and mid-snapshot resume from multiple files or `snapshot.gzip.records.per.batch`. The operator must ensure the extract reflects the table at ingest time (quiesce, or extract-then-ingest); the connector does not verify alignment. Once the snapshot starts, the connector pins each file's name, size, modification time and a sampled content fingerprint, and fails with a full-refresh error if a later read finds any file added, removed or changed. Producing the `.unl` files via UNLOAD/HPL is out of scope. See [File-sourced initial snapshot](#file-sourced-initial-snapshot). |
 | `snapshot.boundary.lsn` | No | self-pin | Per-table (also connection-scope) operator-supplied CDC boundary LSN for a `snapshot.source` extract — the LSN the extract was captured at, so the CDC stream resumes at exactly that position. **Resolution per table, first hit wins:** this option; else a `_manifest.json` file in the `snapshot.source` directory containing `{"boundary_lsn": "<X>"}` (other keys ignored); else the connector self-pins its own registration LSN. A supplied boundary is validated against the source's retained/current log range and **fails closed** if below the minimum retained LSN (the logical log recycled past it → gap) or above current. Non-negative integer. |
 | `snapshot.split.bytes` | No | `52428800` | Per-table (also connection-scope) target byte size for each parallel `.unl` split — each executor reads roughly this many bytes, snapped up to the next record boundary. Splitting by bytes rather than rows lets the connector plan splits with a few small reads instead of scanning the whole file. Positive integer; default 50 MiB. Only meaningful with `snapshot.source`. |
 | `snapshot.gzip.records.per.batch` | No | `0` | Per-table (also connection-scope) number of records of a gzip `.unl.gz` file to serve per microbatch, so a gzip file resumes mid-file after a failure instead of being re-read whole. `0` (default) keeps today's behaviour: each gzip file is one split, read whole on an executor in one microbatch. With a positive value, each gzip file is served on the driver that many records per microbatch, and the checkpoint records how many of its records are done. The driver keeps the file's decompressor open between microbatches, so normal progress is still one pass over the file; after a restart it reopens the file and skips the records already ingested, which re-decompresses that prefix but never re-ingests it. Each microbatch's rows pass through the driver, and a gzip file is no longer read in parallel with other splits, so this suits a few large gzip files rather than many small ones; keep the value moderate, for example tens of thousands to a few hundred thousand records. Plain `.unl` files still fan out to executors. Clearing the option while a file is part-served finishes that file in one microbatch. A file replaced while part-served fails the read with a full-refresh error rather than resuming into different content. Applies to the partitioned reader (the default). Only meaningful with `snapshot.source`. |
@@ -661,11 +665,14 @@ Requirements and limits:
   keys is used, in its own column directions. That count comes from the catalog and is
   zero until `UPDATE STATISTICS` has run; among equals the index with more columns is
   used. Name the columns with `keyset(...)` to choose yourself.
-- The snapshot relies on index values sorting for the connector as they do for Informix.
-  It checks that each page arrives in that order and fails if one does not. Informix
-  orders CHAR, VARCHAR and LVARCHAR by their bytes and the connector by character, which
-  agree in UTF-8 and ISO 8859-1 databases; in another codeset a character index column
-  can fail the check. NCHAR and NVARCHAR columns, which collate by locale (and ignore case
+- Following the table's changes (steps 2 to 4: a table with no key, or one on the
+  append path), the snapshot relies on index values sorting for the connector as they do
+  for Informix, which places each change in its page. It checks that each page arrives in
+  that order and fails if one does not. Informix orders CHAR, VARCHAR and LVARCHAR by
+  their bytes and the connector by character, which agree in UTF-8 and ISO 8859-1
+  databases; in another codeset a character index column can fail the check. A table
+  keyed by `primary.keys` and merged by it pages in Informix's own order, each key whole
+  within one read, and follows no changes, so it needs no such check. NCHAR and NVARCHAR columns, which collate by locale (and ignore case
   in an `NLSCASE INSENSITIVE` database), are not used as index-scan columns.
 - An index value the connector reads as NULL while Informix does not fails the snapshot:
   a character value holding a NUL byte, under the default `string.null.byte=null`.
@@ -1783,7 +1790,7 @@ rows, use `snapshot.mode=initial` for that table.
 
 #### File-sourced initial snapshot
 
-Set `snapshot.source=<Volume path>` (with `snapshot.mode=initial`) to serve a
+Set `snapshot.source=<Volume path>` (with `snapshot.mode=initial`, or `initial_only`) to serve a
 table's initial snapshot from Informix **UNLOAD (`.unl`) files** you extracted to a
 Unity Catalog Volume, instead of a live repeatable-read scan of the source. The
 connector reads and shapes those files (`_informix_op="r"`), then transitions to the
@@ -2227,7 +2234,10 @@ Also:
 - Use an id that doesn't start with `informix-state-`. With
   `state.gc.drop.unused.projects` on, a connection deletes unused projects with
   that prefix other than its own. A project named otherwise is never deleted, and
-  connections that set `lakebase.project.id` never delete projects.
+  connections that set `lakebase.project.id` never delete projects. A project is judged
+  unused by the database its state is in (the sweeping connection's `lakebase.database`,
+  else `databricks_postgres`), and is kept while any other of its databases holds
+  connector state or can't be read.
 
 ## Operational guidance
 

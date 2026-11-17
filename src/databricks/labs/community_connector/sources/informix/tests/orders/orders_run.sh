@@ -10,8 +10,17 @@
 # Usage: orders_run.sh <bronze pipeline id> <silver pipeline id> <workload end, UTC HHMMSS> [profile]
 B=$1; SV=$2; END=$3; PROFILE=${4:-DEFAULT}
 update() {  # pipeline, extra flag, label
-  local u s
-  u=$(databricks pipelines start-update $1 $2 --profile "$PROFILE" -o json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["update_id"])')
+  local u s err
+  # A refused start (auth, a wrong id, an update still settling) gave no id, and the loop
+  # below then polled an empty one for half an hour: say why and stop.
+  err=$(mktemp)
+  u=$(databricks pipelines start-update $1 $2 --profile "$PROFILE" -o json 2>"$err" | python3 -c 'import json,sys; print(json.load(sys.stdin)["update_id"])' 2>/dev/null)
+  if [ -z "$u" ]; then
+    echo "$(date -u +%T) ${3} start-update failed: $(head -c 500 "$err")"
+    rm -f "$err"
+    return 1
+  fi
+  rm -f "$err"
   for i in $(seq 1 180); do
     s=$(databricks pipelines get-update $1 $u --profile "$PROFILE" -o json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["update"]["state"])')
     case $s in COMPLETED|FAILED|CANCELED) break;; esac; sleep 10

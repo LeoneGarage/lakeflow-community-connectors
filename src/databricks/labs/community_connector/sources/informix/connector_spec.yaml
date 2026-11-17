@@ -466,10 +466,14 @@ connection:
       description: >
         Per-table UC Volume directory of Informix UNLOAD (`.unl` or gzip `.unl.gz`)
         extract files, also accepted at connection scope. When set (with
-        `snapshot.mode=initial`) the table's initial snapshot is served from those files
-        instead of a live repeatable-read scan of the source, then transitions to the CDC
-        stream at the boundary the connector pins itself -- no operator-supplied LSN and no
-        schema fingerprint. The files must be newline-terminated, escaped, delimited text
+        `snapshot.mode=initial`, or `initial_only`, which stops at the boundary) the table's
+        initial snapshot is served from those files instead of a live repeatable-read scan
+        of the source, then transitions to the CDC stream at the boundary the connector pins
+        itself -- no operator-supplied LSN and no schema fingerprint. Set in a table's
+        configuration with another mode (an append-only table's default `cdc_only`
+        included), or a table's `snapshot.boundary.lsn` without an extract, fails when the
+        pipeline starts; set on the connection, it applies to the tables whose mode reads
+        it. The files must be newline-terminated, escaped, delimited text
         -- Informix UNLOAD (`|` delimiter, backslash escaping, empty field = NULL) or
         High-Performance Loader (onpload/ipload) DELIMITED output, whose job-configured
         delimiter/escape are set with `snapshot.unl.delimiter`/`snapshot.unl.escape` (HPL's

@@ -1265,12 +1265,9 @@ def seed_slots(connection: Any, namespace: str, slot_count: int) -> None:
 
     with connection.cursor() as cursor:
         cursor.execute(
-            """
-            INSERT INTO conn_slots (namespace, slot_id)
-            SELECT %s, generated.slot_id
-            FROM generate_series(0, %s - 1) AS generated(slot_id)
-            ON CONFLICT (namespace, slot_id) DO NOTHING
-            """,
+            "INSERT INTO conn_slots (namespace, slot_id)"
+            " SELECT %s, generated.slot_id FROM generate_series(0, %s - 1) AS generated(slot_id)"
+            " ON CONFLICT (namespace, slot_id) DO NOTHING",
             (namespace, slot_count),
         )
     connection.commit()
@@ -1575,7 +1572,7 @@ class LakebaseState:
                 # A candidate is read on a live read's path: wait briefly, not for provisioning.
                 facts = _endpoint_facts(api, project_id, deadline=time.monotonic() + 60)
                 token = generate_credential(api, facts["endpoint"])
-                connection = self._open_state_database(facts, token)
+                connection, database = self._open_state_database(facts, token)
                 if connection is None:
                     _LOGGER.debug(
                         "Leaving Lakebase project %s: no connector state found in it", project_id
@@ -1608,16 +1605,7 @@ class LakebaseState:
                     )
                     continue
                 with connection.cursor() as cursor:
-                    cursor.execute(
-                        """
-                        SELECT
-                          COUNT(*) FILTER (WHERE record_type = 'state-gc'),
-                          COUNT(*) FILTER (WHERE record_type = 'table-activity'),
-                          MAX((record->>'last_used_at')::double precision)
-                            FILTER (WHERE record_type = 'table-activity')
-                        FROM state_records
-                        """
-                    )
+                    cursor.execute(_PROJECT_ACTIVITY)
                     gc_rows, activity_rows, last_used = cursor.fetchone()
                 if not gc_rows or not activity_rows or last_used is None:
                     continue
@@ -1630,24 +1618,18 @@ class LakebaseState:
                 # a backlog hint, a state record written, a stream's position parked for
                 # a migration.
                 with connection.cursor() as cursor:
-                    cursor.execute(
-                        """
-                        SELECT
-                          EXISTS (SELECT 1 FROM conn_slots
-                                  WHERE renewed_at > now() - %s * interval '1 day'),
-                          EXISTS (SELECT 1 FROM slot_waiters
-                                  WHERE heartbeat_at > now() - %s * interval '1 day'),
-                          EXISTS (SELECT 1 FROM backlog_hints
-                                  WHERE updated_at > now() - %s * interval '1 day'),
-                          EXISTS (SELECT 1 FROM state_records
-                                  WHERE created_at > now() - %s * interval '1 day'),
-                          EXISTS (SELECT 1 FROM cdc_handoff
-                                  WHERE created_at > now() - %s * interval '1 day')
-                        """,
-                        (float(retention_days),) * 5,
-                    )
+                    cursor.execute(_PROJECT_RECENT_USE, (float(retention_days),) * 5)
                     recent = cursor.fetchone()
                 if any(recent):
+                    continue
+                # The project is named by the server alone, so a connection that moved to
+                # another lakebase.database kept it, its old database's records left
+                # behind: judged by that database, the project went, with the state the
+                # other one holds.
+                if self._other_state_database(facts, token, connection, database):
+                    _LOGGER.debug(
+                        "Leaving Lakebase project %s: another database's state", project_id
+                    )
                     continue
                 connection.close()
                 connection = None
@@ -1670,10 +1652,11 @@ class LakebaseState:
             deleted += 1
         return deleted
 
-    def _open_state_database(self, facts: dict[str, Any], token: str) -> Any:
+    def _open_state_database(self, facts: dict[str, Any], token: str) -> tuple[Any, str | None]:
         # Docstring: A connection, as the provisioning identity, to the database of another
-        # connector project that holds its state: this connection's lakebase.database, else
-        # the default one. None when neither does.
+        # connector project that holds its state, and that database's name: this
+        # connection's lakebase.database, else the default one. (None, None) when neither
+        # does.
         #
         # The project was named by another connection, which may have set another
         # lakebase.database: with this connection's alone, a project on the default one
@@ -1682,29 +1665,61 @@ class LakebaseState:
         failure: Exception | None = None
         for database in dict.fromkeys((self._database, _DEFAULT_DATABASE)):
             try:
-                connection = self._open(facts, self._admin_user(), token, database=database)
+                connection = self._state_database(facts, token, database)
             except Exception as error:  # pylint: disable=broad-except
                 failure = error
                 continue
-            try:
-                # The catalog, which any role may read; the records are read as the state
-                # role (see collect_unused_projects).
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'state_records'"
-                    )
-                    found = bool(cursor.fetchone()[0])
-                connection.commit()
-            except Exception:  # pylint: disable=broad-except
-                # No telling: the state role, taken next, decides as before.
-                connection.rollback()
-                return connection
-            if found:
-                return connection
-            connection.close()
+            if connection is not None:
+                return connection, database
         if failure is not None:
             raise failure
+        return None, None
+
+    def _state_database(self, facts: dict[str, Any], token: str, database: str) -> Any:
+        # Docstring: A connection to ``database`` if it holds connector state, or its catalog
+        # does not say (the state role, taken next, decides as before); else None.
+
+        connection = self._open(facts, self._admin_user(), token, database=database)
+        try:
+            # The catalog, which any role may read; the records are read as the state role
+            # (see collect_unused_projects).
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'state_records'"
+                )
+                found = bool(cursor.fetchone()[0])
+            connection.commit()
+        except Exception:  # pylint: disable=broad-except
+            connection.rollback()
+            return connection
+        if found:
+            return connection
+        connection.close()
         return None
+
+    def _other_state_database(
+        self, facts: dict[str, Any], token: str, connection: Any, database: str | None
+    ) -> bool:
+        # Docstring: Whether a database of the project other than ``database`` holds
+        # connector state, or can't be told not to.
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT datname FROM pg_catalog.pg_database"
+                " WHERE NOT datistemplate AND datallowconn"
+            )
+            names = [row[0] for row in cursor.fetchall() or ()]
+        connection.commit()
+        for name in names:
+            if name != database:
+                try:
+                    other = self._state_database(facts, token, name)
+                except Exception:  # pylint: disable=broad-except
+                    return True
+                if other is not None:
+                    other.close()
+                    return True
+        return False
 
     def _admin_user(self) -> str:
         # Docstring: Return the role name used for provisioning.
@@ -1775,6 +1790,36 @@ class LakebaseState:
         return psycopg.connect(**parameters)
 
 
+def _sql(text: str) -> str:
+    # Docstring: ``text`` with each line's indentation dropped: the statements ride in the
+    # pickled source, which Spark ships within a size limit (see the merged source).
+
+    return "\n".join(line.strip() for line in text.strip().splitlines())
+
+
+# A candidate project's sweep: its connector activity, then anything else recent.
+_PROJECT_ACTIVITY = _sql(
+    """
+SELECT
+  COUNT(*) FILTER (WHERE record_type = 'state-gc'),
+  COUNT(*) FILTER (WHERE record_type = 'table-activity'),
+  MAX((record->>'last_used_at')::double precision)
+    FILTER (WHERE record_type = 'table-activity')
+FROM state_records
+"""
+)
+_PROJECT_RECENT_USE = _sql(
+    """
+SELECT
+  EXISTS (SELECT 1 FROM conn_slots WHERE renewed_at > now() - %s * interval '1 day'),
+  EXISTS (SELECT 1 FROM slot_waiters WHERE heartbeat_at > now() - %s * interval '1 day'),
+  EXISTS (SELECT 1 FROM backlog_hints WHERE updated_at > now() - %s * interval '1 day'),
+  EXISTS (SELECT 1 FROM state_records WHERE created_at > now() - %s * interval '1 day'),
+  EXISTS (SELECT 1 FROM cdc_handoff WHERE created_at > now() - %s * interval '1 day')
+"""
+)
+
+
 # --- connection slots ------------------------------------------------------
 #
 # The whole Volume fencing protocol -- per-slot reservation directories,
@@ -1817,7 +1862,8 @@ class LakebaseState:
 #
 # ``num_classes`` is the rotation modulus (the count of distinct classes); ``1`` makes rot
 # uniformly 0, so waiters are served strictly by ticket age.
-_ACQUIRE_SLOT = """
+_ACQUIRE_SLOT = _sql(
+    """
 WITH cur AS (
     SELECT COALESCE(
         (SELECT last_class FROM slot_rr_cursor WHERE namespace = %(namespace)s), -1
@@ -1854,16 +1900,19 @@ WHERE (namespace, slot_id) = (
 )
 RETURNING slot_id, epoch
 """
+)
 
 # Renewal is guarded on (owner, epoch): a zombie's heartbeat is rejected rather
 # than silently extending a lease its successor now owns. A caller that gets no
 # row has provably lost the slot and must stop using its connection.
-_HEARTBEAT_SLOT = """
+_HEARTBEAT_SLOT = _sql(
+    """
 UPDATE conn_slots SET renewed_at = now()
 WHERE namespace = %(namespace)s AND slot_id = %(slot_id)s
   AND owner = %(owner)s AND epoch = %(epoch)s
 RETURNING slot_id
 """
+)
 
 # Release carries the same guard, for a sharper reason: without it a zombie's
 # late release would free a slot its successor legitimately holds, over-issuing
@@ -1873,42 +1922,54 @@ RETURNING slot_id
 # alone, and the unused-project sweep reads renewed_at as activity. Set to NULL, every
 # slot of a stream outside a pipeline, which records no table activity, read as unused
 # between its microbatches, and its project could be dropped under it.
-_RELEASE_SLOT = """
+_RELEASE_SLOT = _sql(
+    """
 UPDATE conn_slots SET owner = NULL, scope = NULL, renewed_at = now()
 WHERE namespace = %(namespace)s AND slot_id = %(slot_id)s
   AND owner = %(owner)s AND epoch = %(epoch)s
 RETURNING slot_id
 """
+)
 
 # The winner stamps the cursor with its own class so the next grant rotates to the class
 # after it. Upsert because the row may not exist yet on the first grant in a namespace.
-_ADVANCE_RR_CURSOR = """
+_ADVANCE_RR_CURSOR = _sql(
+    """
 INSERT INTO slot_rr_cursor (namespace, last_class) VALUES (%(namespace)s, %(waiter_class)s)
 ON CONFLICT (namespace) DO UPDATE SET last_class = EXCLUDED.last_class
 """
+)
 
 # A waiter enqueues one ticket for the whole time it blocks, heartbeats it each sweep,
 # and deletes it the instant it wins a slot (or gives up). The heartbeat doubles as the
 # reaper -- it drops any ticket whose owner stopped heartbeating -- so a crashed or
 # timed-out waiter cannot wedge the queue and the table needs no separate GC.
-_ENQUEUE_WAITER = """
+_ENQUEUE_WAITER = _sql(
+    """
 INSERT INTO slot_waiters (namespace, owner, floor, ceiling, waiter_class)
 VALUES (%(namespace)s, %(owner)s, %(floor)s, %(ceiling)s, %(waiter_class)s)
 RETURNING ticket_id
 """
-_HEARTBEAT_WAITER = """
+)
+_HEARTBEAT_WAITER = _sql(
+    """
 UPDATE slot_waiters SET heartbeat_at = now()
 WHERE namespace = %(namespace)s AND ticket_id = %(ticket_id)s
 RETURNING ticket_id
 """
-_REAP_WAITERS = """
+)
+_REAP_WAITERS = _sql(
+    """
 DELETE FROM slot_waiters
 WHERE namespace = %(namespace)s
   AND heartbeat_at < now() - make_interval(secs => %(waiter_ttl)s)
 """
-_DEQUEUE_WAITER = """
+)
+_DEQUEUE_WAITER = _sql(
+    """
 DELETE FROM slot_waiters WHERE namespace = %(namespace)s AND ticket_id = %(ticket_id)s
 """
+)
 
 
 class ConnectionSlot:
@@ -2053,7 +2114,8 @@ def dequeue_waiter(connection: Any, namespace: str, ticket_id: int) -> None:
     connection.commit()
 
 
-_PUT_CDC_HANDOFF = """
+_PUT_CDC_HANDOFF = _sql(
+    """
 INSERT INTO cdc_handoff (namespace, table_key, channel, offset_json, schema_fp)
 VALUES (%(namespace)s, %(table_key)s, %(channel)s, %(offset_json)s, %(schema_fp)s)
 ON CONFLICT (namespace, table_key, channel)
@@ -2061,16 +2123,21 @@ DO UPDATE SET offset_json = EXCLUDED.offset_json,
               schema_fp = EXCLUDED.schema_fp,
               created_at = now()
 """
+)
 
-_GET_CDC_HANDOFF = """
+_GET_CDC_HANDOFF = _sql(
+    """
 SELECT offset_json, schema_fp FROM cdc_handoff
 WHERE namespace = %(namespace)s AND table_key = %(table_key)s AND channel = %(channel)s
 """
+)
 
-_DELETE_CDC_HANDOFF = """
+_DELETE_CDC_HANDOFF = _sql(
+    """
 DELETE FROM cdc_handoff
 WHERE namespace = %(namespace)s AND table_key = %(table_key)s AND channel = %(channel)s
 """
+)
 
 
 def put_cdc_handoff(
@@ -2170,9 +2237,11 @@ def release_slot(connection: Any, slot: ConnectionSlot) -> bool:
 # without needing to see which slot moved. A slot merely held (a long read that neither
 # releases nor re-claims) does not advance it: that is deliberate, the token measures
 # forward progress of the pool, not liveness of an individual holder.
-_POOL_PROGRESS_TOKEN = """
+_POOL_PROGRESS_TOKEN = _sql(
+    """
 SELECT COALESCE(SUM(epoch), 0) FROM conn_slots WHERE namespace = %(namespace)s
 """
+)
 
 
 def pool_progress_token(connection: Any, namespace: str) -> int:
@@ -2194,18 +2263,22 @@ def pool_progress_token(connection: Any, namespace: str) -> int:
 # last-writer-wins on a filesystem with no atomic update. A single upsert is
 # exact, and one query returns every table's hint instead of walking a directory
 # per table.
-_WRITE_HINT = """
+_WRITE_HINT = _sql(
+    """
 INSERT INTO backlog_hints (namespace, table_name, lsn, updated_at)
 VALUES (%(namespace)s, %(table_name)s, %(lsn)s, now())
 ON CONFLICT (namespace, table_name) DO UPDATE
    SET lsn = GREATEST(backlog_hints.lsn, EXCLUDED.lsn), updated_at = now()
 """
+)
 
-_READ_HINTS = """
+_READ_HINTS = _sql(
+    """
 SELECT table_name, lsn FROM backlog_hints
 WHERE namespace = %(namespace)s
   AND updated_at > now() - make_interval(secs => %(max_age)s)
 """
+)
 
 
 def publish_backlog_hint(connection: Any, namespace: str, table_name: str, lsn: int) -> None:
@@ -2236,7 +2309,8 @@ def read_backlog_hints(
 
 # --- connection limit configuration ---------------------------------------
 
-_WRITE_LIMIT = """
+_WRITE_LIMIT = _sql(
+    """
 INSERT INTO conn_limits (namespace, max_connections, reserved_deletes, version, updated_at)
 VALUES (%(namespace)s, %(max_connections)s, 0, %(version)s, now())
 ON CONFLICT (namespace) DO UPDATE
@@ -2245,6 +2319,7 @@ ON CONFLICT (namespace) DO UPDATE
        version = EXCLUDED.version,
        updated_at = now()
 """
+)
 
 
 def publish_connection_limit(
@@ -2296,19 +2371,24 @@ def read_connection_limit(connection: Any, namespace: str) -> dict[str, int] | N
 # winner. That single statement replaces writing a candidate file, fsyncing it,
 # and renaming it into an exclusive ``head`` -- along with the candidate sweeper
 # that had to clean up whichever candidates lost.
-_INSERT_RECORD = """
+_INSERT_RECORD = _sql(
+    """
 INSERT INTO state_records (namespace, record_key, record, record_type)
 VALUES (%(namespace)s, %(record_key)s, %(record)s::jsonb, %(record_type)s)
 ON CONFLICT (namespace, record_key) DO NOTHING
 RETURNING record
 """
+)
 
-_SELECT_RECORD = """
+_SELECT_RECORD = _sql(
+    """
 SELECT record FROM state_records
 WHERE namespace = %(namespace)s AND record_key = %(record_key)s
 """
+)
 
-_DELETE_OBSOLETE_SCOPED_RECORDS = """
+_DELETE_OBSOLETE_SCOPED_RECORDS = _sql(
+    """
 DELETE FROM state_records
 WHERE namespace = %(namespace)s
   AND record_key LIKE %(record_key_pattern)s
@@ -2320,8 +2400,10 @@ WHERE namespace = %(namespace)s
   AND (%(retained_scope)s::text IS NULL OR record->>'scope' <> %(retained_scope)s::text)
 RETURNING record_key
 """
+)
 
-_TOUCH_TABLE_ACTIVITY = """
+_TOUCH_TABLE_ACTIVITY = _sql(
+    """
 INSERT INTO state_records (namespace, record_key, record, record_type)
 VALUES (
   %(namespace)s, %(record_key)s,
@@ -2342,8 +2424,10 @@ WHERE state_records.record_type = 'table-activity'
       <= extract(epoch FROM clock_timestamp()) - %(touch_interval_seconds)s
 RETURNING record
 """
+)
 
-_CLAIM_STATE_GC = """
+_CLAIM_STATE_GC = _sql(
+    """
 INSERT INTO state_records (namespace, record_key, record, record_type)
 VALUES (
   %(namespace)s, %(record_key)s,
@@ -2361,8 +2445,10 @@ WHERE state_records.record_type = 'state-gc'
       <= extract(epoch FROM clock_timestamp())
 RETURNING record
 """
+)
 
-_DELETE_STALE_PIPELINE_STATE = """
+_DELETE_STALE_PIPELINE_STATE = _sql(
+    """
 DELETE FROM state_records AS target
 USING state_records AS activity
 WHERE target.namespace = %(namespace)s
@@ -2373,8 +2459,10 @@ WHERE target.namespace = %(namespace)s
   AND target.record->>'scope' LIKE activity.record->>'pipeline_id' || '_@_%%'
 RETURNING target.record_key
 """
+)
 
-_DELETE_UNUSED_TABLE_STATE = """
+_DELETE_UNUSED_TABLE_STATE = _sql(
+    """
 DELETE FROM state_records AS target
 WHERE target.namespace = %(namespace)s
   AND target.record_type NOT IN ('table-activity', 'state-gc')
@@ -2394,16 +2482,20 @@ WHERE target.namespace = %(namespace)s
   )
 RETURNING target.record_key
 """
+)
 
-_DELETE_STALE_ACTIVITY = """
+_DELETE_STALE_ACTIVITY = _sql(
+    """
 DELETE FROM state_records
 WHERE namespace = %(namespace)s
   AND record_type = 'table-activity'
   AND (record->>'last_used_at')::double precision < %(cutoff_epoch)s
 RETURNING record_key
 """
+)
 
-_PUBLISH_MINIMUM_LSN_RECORD = """
+_PUBLISH_MINIMUM_LSN_RECORD = _sql(
+    """
 INSERT INTO state_records (namespace, record_key, record, record_type)
 VALUES (%(namespace)s, %(record_key)s, %(record)s::jsonb, %(record_type)s)
 ON CONFLICT (namespace, record_key) DO UPDATE
@@ -2416,6 +2508,7 @@ WHERE state_records.record_type = EXCLUDED.record_type
       > (EXCLUDED.record->>'start_lsn')::numeric
 RETURNING record
 """
+)
 
 
 # Counterpart of the minimum publisher, for a record shared across every update scope
@@ -2427,7 +2520,8 @@ RETURNING record
 # older floor, a delete flow bootstrapping later started past deletes it had to apply. A
 # record without a snapshot_scope keeps the highest only. Not "scope": records carrying
 # that are a finished update's, and its cleanup deletes them.
-_PUBLISH_MAXIMUM_LSN_RECORD = """
+_PUBLISH_MAXIMUM_LSN_RECORD = _sql(
+    """
 INSERT INTO state_records (namespace, record_key, record, record_type)
 VALUES (%(namespace)s, %(record_key)s, %(record)s::jsonb, %(record_type)s)
 ON CONFLICT (namespace, record_key) DO UPDATE
@@ -2442,6 +2536,7 @@ WHERE state_records.record_type = EXCLUDED.record_type
                IS DISTINCT FROM EXCLUDED.record->>'snapshot_scope'))
 RETURNING record
 """
+)
 
 
 # Resolved once and cached, but in a dict mutated in place -- never a bare module
@@ -2647,7 +2742,8 @@ def delete_obsolete_scoped_state_records(
 # exactly one sees the set complete (Postgres serializes the conflicting update on the
 # row) and deletes the pages. The record has no ``scope`` field, so the obsolete-update
 # cleanup leaves it alone; the table-state GC removes it with the table.
-_MERGE_SPILL_RUN = """
+_MERGE_SPILL_RUN = _sql(
+    """
 INSERT INTO state_records (namespace, record_key, record, record_type)
 VALUES (%(namespace)s, %(record_key)s, %(record)s::jsonb, 'cdc-spill-run')
 ON CONFLICT (namespace, record_key) DO UPDATE
@@ -2658,14 +2754,18 @@ SET record = state_records.record || (EXCLUDED.record - 'done') || jsonb_build_o
 WHERE state_records.record_type = 'cdc-spill-run'
 RETURNING record
 """
+)
 
-_DELETE_SPILL_RUN = """
+_DELETE_SPILL_RUN = _sql(
+    """
 DELETE FROM state_records
 WHERE namespace = %(namespace)s AND record_key = %(record_key)s
   AND record_type = 'cdc-spill-run'
 """
+)
 
-_DELETE_EXPIRED_SPILL_RUNS = """
+_DELETE_EXPIRED_SPILL_RUNS = _sql(
+    """
 DELETE FROM state_records
 WHERE namespace = %(namespace)s
   AND record_type = 'cdc-spill-run'
@@ -2673,14 +2773,17 @@ WHERE namespace = %(namespace)s
   AND created_at < now() - make_interval(secs => %(retention_seconds)s)
 RETURNING record
 """
+)
 
-_SELECT_SPILL_RUNS = """
+_SELECT_SPILL_RUNS = _sql(
+    """
 SELECT record FROM state_records
 WHERE namespace = %(namespace)s
   AND record_type = 'cdc-spill-run'
   AND record_key LIKE %(record_key_pattern)s
   AND NOT (COALESCE(record->'done', '{}'::jsonb) ? %(channel)s)
 """
+)
 
 
 def merge_spill_run(
@@ -2756,7 +2859,8 @@ def list_spill_runs(
 # One row per staging root: when its next sweep of every table staged there is due. A
 # reader takes it once the time has passed, so of the readers staging there one sweeps
 # per interval.
-_CLAIM_STAGING_SWEEP = """
+_CLAIM_STAGING_SWEEP = _sql(
+    """
 INSERT INTO state_records (namespace, record_key, record, record_type)
 VALUES (
   %(namespace)s, %(record_key)s,
@@ -2773,6 +2877,7 @@ WHERE state_records.record_type = 'staging-sweep'
       <= extract(epoch FROM clock_timestamp())
 RETURNING record
 """
+)
 
 
 def claim_staging_sweep(

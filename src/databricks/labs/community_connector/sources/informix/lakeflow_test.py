@@ -12677,6 +12677,60 @@ class LakeflowContractTests(unittest.TestCase):
             self.assertFalse(os.path.exists(stale))
             self.assertTrue(os.path.isdir(fresh))
 
+    def test_retention_sweeps_prune_the_directories_they_empty(self):
+        # The sweeps took out runs, stages and scans and left the directories that held
+        # them: one scope directory per update that ever staged, listed over the mount by
+        # every later sweep, for good. An emptied directory that had not changed within the
+        # window goes; one that had (an update may be staging there) stays, as does one
+        # still holding something.
+        now = time.time()
+        old = now - 10_000
+
+        def age(*paths):
+            for path in sorted(paths, key=len, reverse=True):
+                os.utime(path, (old, old))
+
+        with tempfile.TemporaryDirectory() as root:
+            pages = os.path.join(root, "snapshot-page-data")
+            dead_run = os.path.join(pages, "dead", "schema", "runs", "1000")
+            os.makedirs(dead_run)
+            open(os.path.join(dead_run, "page-00000000"), "wb").close()
+            emptied = os.path.join(pages, "emptied", "schema")
+            os.makedirs(emptied)
+            young = os.path.join(pages, "young")
+            os.makedirs(young)
+            live_run = os.path.join(pages, "live", "schema", "runs", "2000")
+            os.makedirs(live_run)
+            open(os.path.join(live_run, "page-00000000"), "wb").close()
+            age(
+                os.path.join(dead_run, "page-00000000"),
+                dead_run,
+                os.path.dirname(dead_run),
+                os.path.dirname(os.path.dirname(dead_run)),
+                os.path.join(pages, "dead"),
+                emptied,
+                os.path.dirname(emptied),
+                os.path.join(pages, "live"),
+            )
+            scans = os.path.join(root, "snapshot-scan")
+            dead_scan = os.path.join(scans, "scope", "schema", "900")
+            os.makedirs(dead_scan)
+            open(os.path.join(dead_scan, "head.json"), "w").close()
+            day_ago = now - 2 * informix_module._SCAN_RESUME_SECONDS
+            for path in (
+                os.path.join(dead_scan, "head.json"),
+                dead_scan,
+                os.path.dirname(dead_scan),
+                os.path.join(scans, "scope"),
+            ):
+                os.utime(path, (day_ago, day_ago))
+
+            InformixLakeflowConnect._sweep_table_staging(root, retention_seconds=100.0)
+
+            self.assertEqual(sorted(os.listdir(pages)), ["live", "young"])
+            self.assertTrue(os.path.isdir(live_run))
+            self.assertEqual(os.listdir(scans), [])
+
     def test_retention_sweep_tolerates_missing_root(self):
         # A table that never staged has no root; the sweep must be a quiet no-op.
         InformixLakeflowConnect._sweep_stale_snapshot_stages(
@@ -19960,13 +20014,15 @@ class LakeflowContractTests(unittest.TestCase):
         # auto_snapshot resnapshots into a destination it does not empty: the first
         # snapshot's rows stay, and the deletes after its floor still apply to them. Its
         # boundary replaced the floor, which sent a delete reader past retained deletes of
-        # rows the new snapshot no longer had. The floor stays while it is in the log; a
-        # full refresh, or a floor that has left the log, takes the new boundary.
+        # rows the new snapshot no longer had. The floor stays while it is in the log, also
+        # in a selective refresh of other tables (the update reads as a full refresh, but
+        # this table's checkpoint and rows are left); a floor that has left the log takes
+        # the new boundary.
         options = {"snapshot.mode": "auto_snapshot", "snapshot.page.size": "1"}
         for number, (case, request, minimum, expected) in enumerate(
             (
                 ("retained", "continue", 85, "90"),
-                ("full refresh", "full_refresh", 85, "150"),
+                ("selective refresh of another table", "full_refresh", 85, "90"),
                 ("aged out", "continue", 95, "150"),
             )
         ):
@@ -19992,6 +20048,34 @@ class LakeflowContractTests(unittest.TestCase):
                 _, seed = reader(4, "continue").read_table_deletes("app.orders", {}, dict(options))
 
                 self.assertEqual(seed["commit_lsn"], expected)
+
+    def test_a_snapshot_from_no_checkpoint_replaces_a_retained_floor(self):
+        # A snapshot from no checkpoint lands in a destination that is new or emptied. The
+        # floor was kept unless the pipelines API said "full refresh": an automatic retry
+        # of a failed full refresh (cause RETRY_ON_FAILURE, read as "continue") and an
+        # update the API could not describe (None) kept the floor of the emptied rows, and
+        # a delete reader seeded at it read deletes from before the new snapshot, on a
+        # rebuilt source from a log the table was not yet logged in.
+        for number, request in enumerate(("continue", None, "full_refresh")):
+            with self.subTest(request=request):
+                bridge = FakeBridge()
+                pipeline = uuid.UUID(int=170 + number)
+
+                def reader(update, request, bridge=bridge, pipeline=pipeline):
+                    connector = self.connector(bridge)
+                    connector.set_registration_scope(f"{pipeline}_@_{uuid.UUID(int=update)}")
+                    connector.set_update_request(request)
+                    return connector
+
+                _, first = reader(2, "full_refresh").read_table("app.orders", {}, {})
+                self.assertEqual(first["commit_lsn"], "90")
+                bridge.minimum, bridge.now = 85, 150
+                _, again = reader(3, request).read_table("app.orders", {}, {})
+                self.assertEqual(again["commit_lsn"], "150")
+
+                _, seed = reader(4, "continue").read_table_deletes("app.orders", {}, {})
+
+                self.assertEqual(seed["commit_lsn"], "150")
 
     def test_a_replayed_delete_move_below_the_expired_commit_lands(self):
         # An open transaction's begin expired while the checkpoint's commit, 140, is still
@@ -22995,6 +23079,78 @@ class KeyIndexDirectionsTests(unittest.TestCase):
         with self.assertRaises(informix_module.ConnectionCapacityUnavailable):
             bridge.key_index_directions("demo.app.orders", ["id"])
         bridge.transport.execute.assert_not_called()
+
+
+class HostShardRetireRaceTests(unittest.TestCase):
+    KEY = ("namespace", "retire-race-scope", "upsert", 0)
+    CONFIG = {"timeout_seconds": 5, "max_records": 256, "buffer_cap": 10, "subscriber_ttl": 300.0}
+
+    def test_a_poll_while_an_idle_shard_retires_leaves_no_shard_it_does_not_lead(self):
+        # An idle shard left the registry under the registry lock and gave its lead up after
+        # it. A poll in between still found this process leading, made a new shard and
+        # reader thread, and the lead went: another process could then lock and lead the
+        # shard too, two sessions reading its tables.
+        directory = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(shutil.rmtree, directory, True)
+        endpoints = informix_module._HostShardEndpoints(directory)
+        table = Table.parse(_table(), "demo")
+        real_lock = informix_module._shared_cdc_registry_lock()
+        armed, threads = [], []
+
+        def poll():
+            informix_module._host_shard_poll(
+                self.KEY,
+                lambda: None,
+                self.CONFIG,
+                table.native_identity,
+                table,
+                _capture_descriptor(table),
+                0,
+                0,
+                endpoints,
+            )
+
+        class Hooked:
+            def __enter__(self):
+                real_lock.acquire()
+                return self
+
+            def __exit__(self, *exc):
+                real_lock.release()
+                if armed and len(threads) < 1:
+                    thread = threading.Thread(target=poll, daemon=True)
+                    threads.append(thread)
+                    thread.start()
+                    thread.join(0.5)
+                return False
+
+        hooked = Hooked()
+
+        def cleanup():
+            informix_module._SHARED_CDC_SHARDS.pop(self.KEY, None)
+            informix_module._SHARED_CDC_THREADS.pop(self.KEY, None)
+            informix_module._host_shard_stop_leading(endpoints, self.KEY)
+
+        self.addCleanup(cleanup)
+        with (
+            mock.patch.object(informix_module, "_HOST_SHARD_ENDPOINTS", endpoints),
+            mock.patch.object(informix_module, "_shared_cdc_registry_lock", lambda: hooked),
+            mock.patch.object(informix_module, "_run_shared_cdc_shard", lambda *_: None),
+        ):
+            self.assertTrue(
+                informix_module._host_shard_try_lead(endpoints, self.KEY, lambda: None, self.CONFIG)
+            )
+            shard = informix_module._SHARED_CDC_SHARDS[self.KEY]
+            armed.append(True)
+            self.assertTrue(informix_module._retire_shared_cdc_shard(self.KEY, shard))
+            armed.clear()
+            for thread in threads:
+                thread.join(5)
+
+            self.assertEqual(len(threads), 1)
+            self.assertEqual(
+                self.KEY in informix_module._SHARED_CDC_SHARDS, self.KEY in endpoints.leading
+            )
 
 
 class HostSharedCdcTests(unittest.TestCase):
@@ -26242,6 +26398,47 @@ class UnloadHelperTests(unittest.TestCase):
                     )
                     self.assertEqual((result["missing_rows"], result["extra_rows"]), (missing, 0))
 
+    def test_the_count_compare_counts_a_whole_row_keyed_table_by_distinct_rows(self):
+        # The cycles' count compare counted every row of a table keyed on the whole row,
+        # whose destination holds each distinct row once: a row written twice at the source
+        # read as a count mismatch, an extra run and a MISMATCH cycle while the data
+        # compare matched.
+        import argparse
+        import base64
+        import importlib.util
+        import re
+
+        from databricks.labs.community_connector.sources.informix import (
+            compare_live_data_test_tool as compare,
+        )
+
+        path = (
+            pathlib.Path(informix_module.__file__).parent / "tests" / "count_compare_test_tool.py"
+        )
+        spec = importlib.util.spec_from_file_location("count_compare_under_test", path)
+        tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tool)
+        sent = []
+        args = argparse.Namespace(
+            source_owner="informix", informix_server="informix", container="c", database="db"
+        )
+        with (
+            mock.patch.object(compare, "send_ssm", lambda _args, command: sent.append(command)),
+            mock.patch.object(
+                compare, "wait_ssm", lambda *_: "tbl cnt\ntw221d 3\ntw060 7\ntw900_member_tag 2\n"
+            ),
+        ):
+            counts = tool.informix_counts(args)
+
+        encoded = re.search(r"printf %s (\S+) \| base64 -d", sent[0]).group(1)
+        statements = base64.b64decode(encoded).decode().splitlines()
+        by_table = {line.split("'")[1]: line for line in statements if line.strip()}
+        for table in compare.WHOLE_ROW_KEY_TABLES:
+            self.assertIn(f"FROM (SELECT DISTINCT * FROM informix.{table});", by_table[table])
+        self.assertIn("FROM informix.tw060;", by_table["tw060"])
+        self.assertNotIn("DISTINCT", by_table["tw060"])
+        self.assertEqual(counts, {"tw221d": 3, "tw060": 7, "tw900_member_tag": 2})
+
     def test_a_hashed_key_column_may_have_a_name_that_needs_quoting(self):
         # HASH("date") on a key named date was refused: its canonical text quotes the name,
         # and was compared with HASH(date).
@@ -27983,6 +28180,64 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
         # The delete channel never serves the file snapshot.
         deletes = self.connector(FakeBridge(), **{"isDeleteFlow": "true"})
         self.assertFalse(deletes._unl_snapshot_serve(options, {}))
+
+    def test_initial_only_serves_its_extract_through_the_partitioned_reader(self):
+        # Only snapshot.mode=initial took the partitioned file serve. initial_only fell
+        # through to the embedded driver read, which holds a whole extract on the driver.
+        options = {"snapshot.source": "/vol/x"}
+        for mode, served in (("initial", True), ("initial_only", True), ("incremental", False)):
+            with self.subTest(mode=mode):
+                connector = self.connector(FakeBridge(), **{"snapshot.mode": mode})
+                self.assertIs(connector._unl_snapshot_serve(options, {}), served)
+
+    def test_a_table_snapshot_source_its_mode_never_reads_is_refused(self):
+        # Set with a mode that takes no snapshot from it, the extract was ignored: a keyed
+        # table's incremental copied the live table from today's position, a keyless
+        # table's default cdc_only skipped it, and a boundary with no extract did nothing.
+        source = self._source("1|a|\n")
+        keyless = FakeBridge()
+        keyless.tables = [_table(primary_keys=())]
+        cases = (
+            ("incremental", FakeBridge(), {"snapshot.source": source}, "snapshot.mode=incremental"),
+            ("auto_snapshot", FakeBridge(), {"snapshot.source": source}, "auto_snapshot takes"),
+            ("cdc_only", FakeBridge(), {"snapshot.source": source}, "cdc_only takes no"),
+            (None, keyless, {"snapshot.source": source}, "cdc_only, an append-only table.s default"),
+            ("cdc_only", keyless, {"snapshot.source": source}, "cdc_only, an append-only"),
+            ("initial", FakeBridge(), {"snapshot.boundary.lsn": "50"}, "has no snapshot.source"),
+        )
+        for mode, bridge, table_options, reason in cases:
+            with self.subTest(mode=mode, options=sorted(table_options)):
+                connector = self.connector(bridge)
+                connector.options.pop("snapshot.mode")
+                if mode is not None:
+                    connector.options["snapshot.mode"] = mode
+                with self.assertRaisesRegex(ValueError, f"is never read: .*{reason}"):
+                    connector.read_table_metadata("app.orders", dict(table_options))
+        accepted = (
+            ("initial", FakeBridge(), {"snapshot.source": source}),
+            ("initial_only", FakeBridge(), {"snapshot.source": source}),
+            ("initial", keyless, {"snapshot.source": source}),
+        )
+        for mode, bridge, table_options in accepted:
+            with self.subTest(mode=mode, accepted=True):
+                connector = self.connector(bridge, **{"snapshot.mode": mode})
+                connector.read_table_metadata("app.orders", dict(table_options))
+        # A boundary for the connection's extract.
+        connector = self.connector(FakeBridge(), **{"snapshot.source": source})
+        connector.read_table_metadata("app.orders", {"snapshot.boundary.lsn": "50"})
+
+    def test_a_fallback_snapshot_of_another_mode_reads_the_table_not_the_extract(self):
+        # With snapshot.source on the connection, incremental's blocking fallback (a cursor
+        # scan, a DATETIME key) served the extract on the driver, an auto_snapshot
+        # resnapshot an old one, while a chunked copy read the live table.
+        source = self._source("7|from-the-extract|\n")
+        connector = self.connector(
+            FakeBridge(), **{"snapshot.source": source, "snapshot.mode": "incremental"}
+        )
+
+        rows, _ = connector.read_table("app.orders", {}, {"snapshot.scan": "cursor"})
+
+        self.assertEqual(sorted(row["id"] for row in rows), [1, 2])
 
     def _manifest(self, source: str, boundary) -> None:
         with open(os.path.join(source, "_manifest.json"), "w") as handle:
