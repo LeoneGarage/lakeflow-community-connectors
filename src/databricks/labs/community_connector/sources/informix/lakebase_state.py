@@ -220,7 +220,7 @@ class _WorkspaceApi:
     # four verbs against JSON endpoints.
 
     def __init__(self, host: str, token: str) -> None:
-        self._host = host.rstrip("/")
+        self._host = _https_host(host)
         self._token = token
 
     def request(
@@ -314,7 +314,8 @@ class _WorkspaceApi:
                 )
                 or {}
             )
-        if "error" in operation:
+        # An operation that succeeded can name the field with no error in it.
+        if operation.get("error"):
             raise LakebaseStateError(f"operation failed: {operation['error']}")
         return operation.get("response") or {}
 
@@ -396,6 +397,19 @@ def pipeline_update(pipeline_id: str, update_id: str) -> dict[str, Any] | None:
         return None
     update = (answer or {}).get("update")
     return update if isinstance(update, dict) else None
+
+
+def _https_host(host: str) -> str:
+    # Docstring: ``host`` for a REST call that carries a bearer token: refused unless HTTPS.
+    #
+    # lakebase.workspace.host given as http://... sent the workspace token, and the staging
+    # tokens minted with it, in clear text.
+
+    if not host.lower().startswith("https://"):
+        raise LakebaseStateError(
+            f"Workspace host {host!r} must be an https:// URL: it is sent bearer tokens"
+        )
+    return host.rstrip("/")
 
 
 def _workspace_credentials(options: dict[str, str]) -> tuple[str, str]:
@@ -855,7 +869,7 @@ class WorkspaceFilesApi:
     # provider on every attempt, so a token refreshed between attempts is picked up.
 
     def __init__(self, host: str, credential: StagingCredentialProvider) -> None:
-        self._host = host.rstrip("/")
+        self._host = _https_host(host)
         self._credential = credential
 
     def put(self, volume_path: str, data: bytes) -> None:
@@ -1344,7 +1358,6 @@ class LakebaseState:
         self._user_id = STATE_ROLE
         self._password = options.get("lakebase.password", "").strip()
         self._admin_password = options.get("lakebase.admin_password", "").strip()
-        self._api: _WorkspaceApi | None = None
         self._facts: dict[str, Any] | None = None
         self._token: str | None = None
         self._token_minted_at = 0.0
@@ -1364,10 +1377,10 @@ class LakebaseState:
         return (self._project_id, self._database, digest)
 
     def _api_client(self) -> _WorkspaceApi:
-        if self._api is None:
-            host, token = _workspace_credentials(self._options)
-            self._api = _WorkspaceApi(host, token)
-        return self._api
+        # Made for each use: the workspace token lasts about an hour, and the one taken up
+        # here is captured again (_driver_registration) or renewed by the SDK. Kept, an
+        # instance's credential rotation, re-provisioning and project GC failed with it.
+        return _WorkspaceApi(*_workspace_credentials(self._options))
 
     def provision(self) -> dict[str, Any]:
         # Docstring: Idempotently ensure the project, endpoint, and schema all exist.

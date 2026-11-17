@@ -3159,6 +3159,36 @@ class _FakeHttpResponse:
         return self._body
 
 
+class WorkspaceApiClientTests(unittest.TestCase):
+    def test_a_state_takes_the_current_workspace_token_each_time(self):
+        # The client was kept with the token it was made with, which lasts about an hour:
+        # credential rotation, re-provisioning and project GC then failed with it.
+        state = lakebase_state.LakebaseState({}, "conn")
+        with mock.patch.dict(lakebase_state._CAPTURED_WORKSPACE, {"host": "ws", "token": "a"}):
+            self.assertEqual(state._api_client()._token, "a")
+            lakebase_state._CAPTURED_WORKSPACE["token"] = "b"
+            self.assertEqual(state._api_client()._token, "b")
+
+    def test_a_client_refuses_a_host_that_is_not_https(self):
+        # A bearer token went to an http:// host in clear text.
+        provider = mock.Mock()
+        for make in (
+            lambda host: lakebase_state._WorkspaceApi(host, "t"),
+            lambda host: lakebase_state.WorkspaceFilesApi(host, provider),
+        ):
+            with self.assertRaisesRegex(lakebase_state.LakebaseStateError, "https"):
+                make("http://ws.example.com")
+            self.assertEqual(make("https://ws.example.com/")._host, "https://ws.example.com")
+
+    def test_an_operation_done_with_a_null_error_succeeded(self):
+        api = lakebase_state._WorkspaceApi("https://ws", "t")
+        envelope = {"name": "projects/p/operations/1", "done": True, "error": None}
+        envelope["response"] = {"name": "projects/p"}
+        self.assertEqual(api.await_operation(envelope), {"name": "projects/p"})
+        with self.assertRaises(lakebase_state.LakebaseStateError):
+            api.await_operation({**envelope, "error": {"message": "quota"}})
+
+
 class WorkspaceFilesApiTests(unittest.TestCase):
     def _client(self):
         provider = mock.Mock()

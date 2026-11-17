@@ -53,7 +53,7 @@ The CDC session is established with these calls, in this order:
    )
    ```
 
-   The `*` projection is resolved through `SELECT FIRST 1 * FROM database:owner.table` and result metadata before registration. BYTE, TEXT, fixed/variable UDT, unknown, and complex columns are excluded from the CDC column descriptor and left out of the table's schema, with a warning; a key column of such a type fails the table instead, since rows can't be matched without it. The label-to-table mapping is connector state. A TRUNCATE record is anomalous: its table label is read from `userId`, not the normal `label` field.
+   The `*` projection is resolved from the system catalog (`systables`, `syscolumns`, `sysxtdtypes`) before registration. BYTE, TEXT, fixed/variable UDT, unknown, and complex columns are excluded from the CDC column descriptor and left out of the table's schema, with a warning; a key column of such a type fails the table instead, since rows can't be matched without it. The label-to-table mapping is connector state. A TRUNCATE record is anomalous: its table label is read from `userId`, not the normal `label` field.
 
 5. Activate from a 64-bit sequence position:
 
@@ -117,10 +117,8 @@ On restart, activate the CDC session at `begin_lsn` when available, otherwise `c
 
 1. If restart/begin is less than the checkpointed commit LSN, enter recovery mode.
 2. Rebuild transaction holders by replaying from that earlier BEGIN.
-3. Skip transactions whose commit LSN is below the checkpointed commit LSN.
-4. If commit equals the checkpointed commit and checkpointed change equals commit, skip the whole transaction.
-5. Within a recovered transaction, skip operation records with sequence `<= checkpointed change_lsn`.
-6. Leave recovery once a transaction commits after the checkpointed commit LSN, then continue normally.
+3. Skip whole transactions whose commit LSN is at or below the checkpointed commit LSN. Offsets are transaction-atomic: the records of a transaction that commits after it are never filtered.
+4. Leave recovery once a transaction commits after the checkpointed commit LSN, then continue normally.
 
 This yields at-least-once delivery around a Lakeflow checkpoint boundary. Only return an `end_offset` after a complete committed transaction has been decoded and all returned rows are materialized. If a call fails, return nothing/raise and leave the prior offset unchanged. Native and projected batch caps are soft while transactions already observed remain open; reading through commit/rollback prevents a transaction larger than `cdc.max.records` from replaying the same prefix forever. METADATA and TIMEOUT control frames do not consume that native record target. `cdc.max.poll.records` is the default hard poll bound; `cdc.max.poll.bytes` optionally adds recursive retained-byte accounting when set above zero. Recovery skips only whole transactions whose commit LSN is already checkpointed; it never filters records inside a newly committed transaction using another transaction's LSN. Informix TIMEOUT remains a hard terminal condition, and an incomplete transaction is then replayed from the retained checkpoint. When Spark calls `prepareForTriggerAvailableNow()`, the Informix-owned generated base wrapper freezes a current LSN independently for that reader without modifying the shared adapter. Lakeflow checkpoints upsert and delete flows independently, so their AvailableNow boundaries may differ and converge on the next triggered update. Spark does not make that callback in continuous mode, so continuous execution follows new commits without a mode-specific option.
 
@@ -353,10 +351,11 @@ The per-table `snapshot.mode` option supports `incremental` (default), `initial`
 takes a snapshot only when the table has no checkpoint yet. `initial_only` completes snapshot pages but
 does not subsequently poll CDC. `cdc_only` publishes the current schema and LSN
 as a completed zero-row snapshot so both channels begin at the same future-only
-boundary. `auto_snapshot` uses the incremental PK-chunked strategy, derives a
-deterministic replacement pipeline scope from the expired checkpoint identity,
-lets the upsert reader publish a new CDC/copy boundary, and makes the delete
-reader adopt that boundary while the upsert channel copies existing rows. `recovery` requires a
+boundary. `auto_snapshot` uses the incremental PK-chunked strategy under the
+current update's pipeline scope, lets the upsert reader publish a new CDC/copy
+boundary, and makes the delete reader adopt that boundary, or the pipeline's
+snapshot floor where that is lower or the update publishes none, while the upsert
+channel copies existing rows. `recovery` requires a
 retained stream checkpoint and an exactly matching schema fingerprint; it may
 rebuild a missing schema node but never snapshots data or treats changed schema
 as recoverable. To force a fresh snapshot of a table that already has a

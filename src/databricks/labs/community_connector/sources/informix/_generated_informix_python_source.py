@@ -1497,7 +1497,7 @@ def register_lakeflow_source(spark):
         # four verbs against JSON endpoints.
 
         def __init__(self, host: str, token: str) -> None:
-            self._host = host.rstrip("/")
+            self._host = _https_host(host)
             self._token = token
 
         def request(
@@ -1591,7 +1591,8 @@ def register_lakeflow_source(spark):
                     )
                     or {}
                 )
-            if "error" in operation:
+            # An operation that succeeded can name the field with no error in it.
+            if operation.get("error"):
                 raise LakebaseStateError(f"operation failed: {operation['error']}")
             return operation.get("response") or {}
 
@@ -1673,6 +1674,19 @@ def register_lakeflow_source(spark):
             return None
         update = (answer or {}).get("update")
         return update if isinstance(update, dict) else None
+
+
+    def _https_host(host: str) -> str:
+        # Docstring: ``host`` for a REST call that carries a bearer token: refused unless HTTPS.
+        #
+        # lakebase.workspace.host given as http://... sent the workspace token, and the staging
+        # tokens minted with it, in clear text.
+
+        if not host.lower().startswith("https://"):
+            raise LakebaseStateError(
+                f"Workspace host {host!r} must be an https:// URL: it is sent bearer tokens"
+            )
+        return host.rstrip("/")
 
 
     def _workspace_credentials(options: dict[str, str]) -> tuple[str, str]:
@@ -2132,7 +2146,7 @@ def register_lakeflow_source(spark):
         # provider on every attempt, so a token refreshed between attempts is picked up.
 
         def __init__(self, host: str, credential: StagingCredentialProvider) -> None:
-            self._host = host.rstrip("/")
+            self._host = _https_host(host)
             self._credential = credential
 
         def put(self, volume_path: str, data: bytes) -> None:
@@ -2621,7 +2635,6 @@ def register_lakeflow_source(spark):
             self._user_id = STATE_ROLE
             self._password = options.get("lakebase.password", "").strip()
             self._admin_password = options.get("lakebase.admin_password", "").strip()
-            self._api: _WorkspaceApi | None = None
             self._facts: dict[str, Any] | None = None
             self._token: str | None = None
             self._token_minted_at = 0.0
@@ -2641,10 +2654,10 @@ def register_lakeflow_source(spark):
             return (self._project_id, self._database, digest)
 
         def _api_client(self) -> _WorkspaceApi:
-            if self._api is None:
-                host, token = _workspace_credentials(self._options)
-                self._api = _WorkspaceApi(host, token)
-            return self._api
+            # Made for each use: the workspace token lasts about an hour, and the one taken up
+            # here is captured again (_driver_registration) or renewed by the SDK. Kept, an
+            # instance's credential rotation, re-provisioning and project GC failed with it.
+            return _WorkspaceApi(*_workspace_credentials(self._options))
 
         def provision(self) -> dict[str, Any]:
             # Docstring: Idempotently ensure the project, endpoint, and schema all exist.
@@ -7197,7 +7210,8 @@ def register_lakeflow_source(spark):
     # Set on the read that replays auto_snapshot's resnapshot of an expired checkpoint: like an
     # initial range's, it leaves the delete floor as the logged batch published it.
     _REPLAY_RESNAPSHOT_OPTION = "_informix.replay.resnapshot"
-    # The floor_seed of the end a replayed delete range logged (see _confirmed_floor_seed).
+    # The floor_seed of the end a replayed delete range logged, and whether that end is on a
+    # transaction, as JSON [seed or null, bool] (see _confirmed_floor_seed).
     _REPLAY_END_SEED_OPTION = "_informix.replay.end.seed"
     # Distinguish JSON null (replay the copy-completing range through max_pk) from
     # an absent option (ordinary one-page incremental read).
@@ -7502,12 +7516,14 @@ def register_lakeflow_source(spark):
         # was taken for the committed seed and dropped the token, then fell short of the
         # position; after Restore it served the pages or extract the position names.
 
+        # So is a floor-seeded delete position's wait, the floor replaced: it starts again with
+        # no checkpoint (_confirmed_floor_seed), and its end had no position to replay to (1).
         positional = {"commit_lsn", "change_lsn", "begin_lsn", "tx_id", "incremental"}
         if (
             isinstance(end, dict)
             and end
             and set(end) <= _OFFSET_ADVISORY_FIELDS
-            and not positional.intersection(start or {})
+            and (not positional.intersection(start or {}) or bool((start or {}).get("floor_seed")))
         ):
             return True
         return bool((end or {}).get("handoff_seeded")) and not (start or {}).get("handoff_seeded")
@@ -7623,7 +7639,9 @@ def register_lakeflow_source(spark):
         previous_end = options.get(_REPLAY_INITIAL_END_OPTION)
         previous_seed = options.get(_REPLAY_END_SEED_OPTION)
         options[_REPLAY_STOP_LSN_OPTION] = str(stop)
-        options[_REPLAY_END_SEED_OPTION] = str((end or {}).get("floor_seed") or "")
+        options[_REPLAY_END_SEED_OPTION] = json.dumps(
+            [(end or {}).get("floor_seed"), (end or {}).get("tx_id") is not None]
+        )
         if initial_range:
             options[_REPLAY_INITIAL_END_OPTION] = json.dumps(end, sort_keys=True)
         if replaying_chunk:
@@ -16815,7 +16833,10 @@ def register_lakeflow_source(spark):
                         else:
                             result = self._read_append_only(table, effective_start, table_options)
                     elif migration:
-                        result = self._read_handoff(table, effective_start)
+                        # Records an offset and stops at it, the same offset back: decayed batch
+                        # by batch (_reset_retry_counts), a busy flow's pressure made each an
+                        # extra batch that rewrote the token.
+                        return self._read_handoff(table, effective_start)
                     elif not _cdc_capable(table):
                         if snapshot_mode in {"cdc_only", "recovery"}:
                             # 170: snapshot.mode={} requires a CDC-capable table; '{}' is snapshot-only
@@ -17434,8 +17455,9 @@ def register_lakeflow_source(spark):
                 # the extract is checked against its pinned manifest here as well.
                 end_checkpoint = _validated_offset(end_offset or {})
                 window_paths = (
+                    # Within the splits: files removed since make the check below fail (269).
                     {splits[start_split][0]}
-                    if driver_window
+                    if driver_window and start_split < len(splits)
                     else {split[0] for split in splits[start_split:end_split]}
                 )
                 self._verify_unl_extract(
@@ -17845,7 +17867,7 @@ def register_lakeflow_source(spark):
                         # Capture parks the delete position and freezes; cutover seeds from it
                         # (keyed relocation keeps the delete channel) or, for the SCD1->append
                         # switch, there is no delete flow so this is never reached.
-                        result = self._read_handoff_deletes(
+                        return self._read_handoff_deletes(
                             table_name, effective_start, table_options, start_offset
                         )
                     elif snapshot_mode == "initial_only":
@@ -18839,6 +18861,14 @@ def register_lakeflow_source(spark):
 
             table = self._refresh_table_schema(table, None)
             high_water = self._initial_lsn(table, owner=False, wait=False, scope=scope)
+            # The pipeline's floor, where it is below this update's boundary or this update has
+            # none: a replay of a resnapshot batch took it again here, while Spark goes on from
+            # the batch's end at the floor; or the upsert reader committed its resnapshot in an
+            # earlier update and resumes from it, and this one never publishes a boundary (427
+            # on every update). Started above the floor, the reader skipped the deletes between.
+            floor = self._delete_floor_seed(table)
+            if floor is not None and (high_water is None or int(floor["commit_lsn"]) < high_water):
+                return floor
             if high_water is None:
                 return None
             self._schema_transition_waits.pop((table.identity, "resnapshot"), None)
@@ -19035,8 +19065,9 @@ def register_lakeflow_source(spark):
             # position could fail on a log that no longer holds it.
             #
             # A replay repeats the batch Spark logged, told by the end it logged: one that read
-            # on from the seed carries it, or, the floor confirmed, ends below a floor replaced
-            # since without it; one that started again carries another floor's seed or none.
+            # on from the seed carries it, or, the floor confirmed, ends on a transaction or below
+            # a floor replaced since without it; one that started again carries another floor's
+            # seed or none, on its seed.
             # A seed from another pipeline (a table.migration checkpoint) is one that pipeline's
             # floor confirmed: this pipeline's floor says nothing of it, and the position stands.
 
@@ -19053,13 +19084,20 @@ def register_lakeflow_source(spark):
                 return start_offset, seeded
             if current != seeded:
                 stop = self._replay_stop_lsn(table_options)
-                logged = table_options.get(_REPLAY_END_SEED_OPTION) or None
+                logged, on_transaction = json.loads(
+                    table_options.get(_REPLAY_END_SEED_OPTION) or "[null, false]"
+                )
                 if stop is not None and logged == seeded:
                     return start_offset, seeded
                 if (
                     stop is not None
                     and logged is None
-                    and stop < self._immutable_lsn(record, "start_lsn", table.exposed_name)
+                    # A batch that started again ends on its seed, which holds no transaction;
+                    # the new floor's page-start boundary can lie at or below its end.
+                    and (
+                        on_transaction
+                        or stop < self._immutable_lsn(record, "start_lsn", table.exposed_name)
+                    )
                 ):
                     return unmarked, None
                 # 291: Informix delete channel for '{}' started at a snapshot floor that update {}
@@ -19276,7 +19314,10 @@ def register_lakeflow_source(spark):
 
             _, table_key = self._table_state_keys(table)
             namespace = self._lakebase_state_namespace()
-            offset_json = json.dumps(_validated_offset(offset))
+            # The position alone: a busy flow's retry counters went on into the new flow's seed.
+            offset_json = json.dumps(
+                _validated_offset({k: v for k, v in offset.items() if k not in _OFFSET_ADVISORY_FIELDS})
+            )
             schema_fp = str(offset.get("schema_fingerprint") or _schema_fingerprint(table))
             self._state_op_with_reconnect(
                 lambda: put_cdc_handoff(
@@ -25619,7 +25660,13 @@ def register_lakeflow_source(spark):
                 delay = _sleep_with_backoff(deadline, delay)
 
         def _ensure_recorded_path_to_live(
-            self, table: Table, node_table: Table, node_id: str, rules: dict[str, Any]
+            self,
+            table: Table,
+            node_table: Table,
+            node_id: str,
+            rules: dict[str, Any],
+            *,
+            copying: bool = False,
         ) -> None:
             # Docstring: Check the steps a reader takes from a step's target on to the live layout.
             #
@@ -25668,6 +25715,9 @@ def register_lakeflow_source(spark):
                 _ensure_compatible_schema_change(
                     node_table, following or table, wildcard_except=table.key_wildcard_except, **rules
                 )
+                if copying:
+                    # Each step: one to a float key taken later failed only on the next batch.
+                    _refuse_float_key_mid_copy(node_table, following or table)
                 if following is None:
                     if set(table.primary_keys) - set(node_table.primary_keys):
                         self._ensure_added_key_columns_have_no_default(node_table, table)
@@ -25678,6 +25728,8 @@ def register_lakeflow_source(spark):
             _ensure_compatible_schema_change(
                 node_table, table, wildcard_except=table.key_wildcard_except, **rules
             )
+            if copying:
+                _refuse_float_key_mid_copy(node_table, table)
             if set(table.primary_keys) - set(node_table.primary_keys):
                 self._ensure_added_key_columns_have_no_default(node_table, table)
 
@@ -25797,22 +25849,32 @@ def register_lakeflow_source(spark):
                     ):
                         # 302: Invalid immutable schema identity for '{}'
                         raise InformixError(_m(302, table.exposed_name))
-                    _ensure_compatible_schema_change(
-                        previous_table,
-                        target_table,
-                        extend_wildcard_key=extend_key,
-                        shrink_wildcard_key=shrink_key,
-                        wildcard_except=table.key_wildcard_except,
-                    )
-                    if copying:
-                        # A step recorded before the copy's reader checked it, or by another.
-                        _refuse_float_key_mid_copy(previous_table, target_table)
-                    self._ensure_recorded_path_to_live(
-                        table,
-                        target_table,
-                        str(current["id"]),
-                        {"extend_wildcard_key": extend_key, "shrink_wildcard_key": shrink_key},
-                    )
+                    try:
+                        _ensure_compatible_schema_change(
+                            previous_table,
+                            target_table,
+                            extend_wildcard_key=extend_key,
+                            shrink_wildcard_key=shrink_key,
+                            wildcard_except=table.key_wildcard_except,
+                        )
+                        if copying:
+                            # A step recorded before the copy's reader checked it, or by another.
+                            _refuse_float_key_mid_copy(previous_table, target_table)
+                        self._ensure_recorded_path_to_live(
+                            table,
+                            target_table,
+                            str(current["id"]),
+                            {"extend_wildcard_key": extend_key, "shrink_wildcard_key": shrink_key},
+                            copying=copying,
+                        )
+                    except InformixError as error:
+                        if owner:
+                            # As before a step is recorded: the delete reader, whose own checks
+                            # this one can pass, takes the step and waits for the next one, then
+                            # failed only at its deadline. Under both steps it may be waiting at.
+                            for waited_at in (checkpoint_schema_id, str(current["id"])):
+                                self._publish_schema_rejection(table, waited_at, error)
+                        raise
                     schema_winner = self._publish_immutable_head(
                         self._immutable_namespace(table, "schema-nodes", str(current["id"])),
                         transition_record,
