@@ -1095,6 +1095,17 @@ class LakeflowContractTests(unittest.TestCase):
                         connector._state_op_with_reconnect(thunk, operation="test")
                     self.assertEqual(connection.rollbacks, 1)
 
+    def test_a_new_update_forgets_the_source_names_of_the_last(self):
+        # Two tables of one pipeline naming one Informix table are refused (462), by the
+        # source names this connector has read. A later update's spec can rename one: the
+        # names of the update before are not held against it.
+        connector = self.connector(FakeBridge())
+        connector.read_table_metadata("app.orders", {})
+        with self.assertRaisesRegex(InformixError, "both read Informix table"):
+            connector.read_table_metadata("orders_alias", {"qualified_source_table": "app.orders"})
+        connector.set_registration_scope(f"{uuid.UUID(int=7)}_@_{uuid.UUID(int=8)}")
+        connector.read_table_metadata("orders_alias", {"qualified_source_table": "app.orders"})
+
     def test_close_releases_bridge_connection_and_capacity_slot(self):
         bridge = FakeBridge()
         connector = self.connector(bridge)
@@ -3882,6 +3893,29 @@ class LakeflowContractTests(unittest.TestCase):
         rows = informix_module._project_transaction(transaction, table, True, options=options)
         self.assertEqual([row[informix_module.OP] for row in rows], ["d"])
 
+    def test_an_update_of_a_nan_key_lands_no_delete(self):
+        # A FLOAT key column (primary.keys) left NaN: NaN equals nothing, itself included,
+        # so the UPDATE read as a key change, and its delete tied with its upsert.
+        connector = self.connector(FakeBridge())
+        keyed = connector._table("app.orders", {})
+        table = dataclasses.replace(
+            keyed,
+            columns=tuple(
+                dataclasses.replace(c, type_name="FLOAT") if c.name == "id" else c
+                for c in keyed.columns
+            ),
+        )
+        record = {
+            "op": "UPDATE",
+            "lsn": 141,
+            "before": {"id": float("nan"), "value": "a"},
+            "after": {"id": float("nan"), "value": "b"},
+            "table": "demo:app.orders",
+            "tx_id": 7,
+        }
+        transaction = informix_module.CommittedTransaction(7, 100, 150, 100, (record,))
+        self.assertEqual(informix_module._project_transaction(transaction, table, True), [])
+
     def test_half_of_an_index_update_lands_as_the_delete_or_insert_it_is(self):
         # What the stream passes on for a keyless table when the scan holds one half of
         # an UPDATE that changed an index value: a DELETE of the old row or an INSERT of
@@ -3909,6 +3943,15 @@ class LakeflowContractTests(unittest.TestCase):
         # The filter keeps the row that is in it and drops the one that is not.
         self.assertEqual(landed(filtered, gone), [])
         self.assertEqual(landed(filtered, come), [(8, "c")])
+
+    def test_rows_read_again_are_looked_up_once_as_informix_compares_them(self):
+        # Informix compares strings without their trailing spaces: lookups for 'abc' and
+        # 'abc ' were two SELECTs of one statement, each returning both rows, and every row
+        # came back twice (444). One lookup reads both, each under its own key.
+        lookups = informix_module._index_scan_lookups(
+            [(7, "abc"), (7, "abc "), (7, "abd"), (8, "abc")]
+        )
+        self.assertEqual(lookups, [(7, "abc"), (7, "abd"), (8, "abc")])
 
     def test_an_index_scan_refuses_too_many_moved_rows_of_a_keyed_table(self):
         source = _KeyedIndexScanSource(random_module.Random(9001), transactions=200)
@@ -4426,6 +4469,52 @@ class LakeflowContractTests(unittest.TestCase):
                     )
                 )
                 self.assertEqual(glob.glob(pointers, recursive=True), [])
+
+    def test_a_dropped_mount_removing_a_stray_scan_page_reaches_the_retry(self):
+        # A resumed scan removes the pages staged after its last record. Ignoring errors, a
+        # dropped mount left such a page, and staging it again conflicted with it (218). The
+        # mount retry takes the drop instead.
+        pipeline = uuid.UUID(int=140)
+        scopes = [f"{pipeline}_@_{uuid.UUID(int=update)}" for update in (2, 3)]
+        bridge, options, _ = self._failed_index_scan(scopes[0])
+        (runs,) = glob.glob(
+            os.path.join(self._shared_state.name, "**", scopes[0], "**", "runs", "*"),
+            recursive=True,
+        )
+        os.makedirs(os.path.join(runs, "page-00000099"))
+        later = self.connector(bridge)
+        later.set_registration_scope(scopes[1])
+        later.set_update_request("continue")
+        dropped = OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+        sleep, _ = _sleeps_of_this_thread()
+        with (
+            mock.patch.object(
+                PurePythonInformixBridge, "_remove_connection_slot_tree", side_effect=dropped
+            ),
+            mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0),
+            mock.patch.object(informix_module.time, "sleep", side_effect=sleep),
+        ):
+            try:
+                _, offset = later.read_table("app.orders", {}, options)
+            except OSError as error:
+                self.assertIsNotNone(informix_module._dropped_mount_error(error))
+            else:
+                self.assertIn("dropped_mount_retry_count", offset)
+
+    def test_tree_helpers_count_a_dropped_mount_as_no_answer(self):
+        # A directory opened for a walk is closed when listing it fails, and a path the
+        # mount cannot answer for is not taken for gone.
+        dropped = OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+        descriptor = os.open(self._shared_state.name, os.O_RDONLY)
+        with mock.patch.object(informix_module.os, "scandir", side_effect=dropped):
+            with self.assertRaises(OSError):
+                informix_module._scandir(descriptor)
+        with self.assertRaises(OSError):
+            os.fstat(descriptor)
+        self.assertFalse(informix_module._path_present(os.path.join(self._shared_state.name, "x")))
+        self.assertTrue(informix_module._path_present(self._shared_state.name))
+        with mock.patch.object(informix_module.os, "lstat", side_effect=dropped):
+            self.assertTrue(informix_module._path_present("/Volumes/a/b/c/gone"))
 
     def test_an_index_scan_is_taken_up_only_where_it_can_go_on_from_its_record(self):
         # A failed index-ordered scan was taken up under its update's scope whatever had
@@ -19602,6 +19691,46 @@ class LakeflowContractTests(unittest.TestCase):
 
                 self.assertEqual([(row["id"], row["_informix_op"]) for row in replayed], [(1, "d")])
 
+    def test_a_reset_delete_position_waits_with_no_position(self):
+        # The floor the position was seeded at was replaced, and the new one has left the
+        # log: the reader starts again with no checkpoint and waits for this update's
+        # upsert start. Its waits counted on the old offset, which brought back the
+        # replaced position, and a replay stopped at it. They ride advisory fields alone.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        reader(2, "full_refresh").read_table("app.orders", {}, {})
+        _, seeded = reader(3).read_table_deletes("app.orders", {}, {})
+        bridge.now = 120
+        reader(4, "full_refresh").read_table("app.orders", {}, {})
+        bridge.minimum, bridge.now = 125, 130
+
+        _, waiting = reader(5).read_table_deletes("app.orders", seeded, {})
+
+        self.assertTrue(waiting)
+        self.assertLessEqual(set(waiting), informix_module._OFFSET_ADVISORY_FIELDS)
+        # An invalid seed is refused as one (469), not taken apart first.
+        for bad in (123, "not a scope"):
+            with self.subTest(floor_seed=bad):
+                with self.assertRaisesRegex(ValueError, "invalid floor_seed"):
+                    reader(5).read_table_deletes("app.orders", {**seeded, "floor_seed": bad}, {})
+
+    def test_a_replay_of_a_reset_delete_position_waits_for_its_start(self):
+        # Replayed, a floor-seeded position whose floor was replaced starts again and may
+        # wait for the upsert start before it reaches the end Spark logged. A wait with no
+        # position was taken for a replay that had lost its own.
+        start = dict(_stream_offset(100), floor_seed=f"{uuid.UUID(int=1)}_@_{uuid.UUID(int=2)}")
+        end = _stream_offset(130)
+        reads = [({}, {"schema_node_fallback_retry_count": 1}), ({}, _stream_offset(130))]
+
+        def read(offset):
+            rows, reached = reads.pop(0)
+            return iter([rows] if rows else []), dict(reached)
+
+        self.assertEqual(
+            list(informix_module._replay_between_offsets(start, end, read, {}, {})), []
+        )
+        self.assertEqual(reads, [])
+
     def test_a_replayed_delete_batch_is_told_by_the_end_it_logged(self):
         # Whether the batch read on from its seed or started again at a floor that replaced
         # it, from the end Spark logged: read on, it carried the seed, or ended below the
@@ -26917,6 +27046,20 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
             self.assertEqual(release.call_count, 1)
             connector.get_partitions("app.orders", options, {}, end)
         self.assertEqual(release.call_count, 2)
+
+    def test_a_range_that_emitted_nothing_plans_no_partitions(self):
+        # A re-plan of an advisory-only yield from no position, or of a table.migration
+        # cutover seed, went to the .unl serve before the replay that emits nothing for
+        # them: the first failed on its missing commit_lsn, and the seed, planned after
+        # Restore, served the extract for a batch that held no rows.
+        connector = self.connector(FakeBridge())
+        options = {"snapshot.source": self._source("1|alpha|\n2|beta|\n")}
+        advisory = {"dropped_mount_retry_count": 1}
+        self.assertEqual(connector.get_partitions("app.orders", options, {}, advisory), [])
+        end = connector.latest_offset("app.orders", options, {})
+        seed = dict(end, handoff_seeded=True)
+        self.assertEqual(connector.get_partitions("app.orders", options, {}, seed), [])
+        self.assertTrue(connector.get_partitions("app.orders", options, {}, end))
 
     def test_a_dropped_mount_under_a_unl_partition_plan_is_retried_in_place(self):
         # get_partitions lists and splits the extract off the Volume mount. Spark has logged

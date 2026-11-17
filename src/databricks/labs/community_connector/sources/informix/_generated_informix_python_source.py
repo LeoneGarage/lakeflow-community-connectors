@@ -1372,6 +1372,13 @@ def register_lakeflow_source(spark):
     # src/databricks/labs/community_connector/sources/informix/lakebase_state.py
     ########################################################
 
+    _HTTP_TRANSIENT_ERRORS = (
+        urllib.error.URLError,
+        TimeoutError,
+        ConnectionError,
+        ssl.SSLError,
+        http.client.HTTPException,
+    )
     _LOGGER = logging.getLogger(__name__)
 
     # Autoscaling bounds. 0.5 is the smallest compute unit the API accepts; the
@@ -1542,7 +1549,7 @@ def register_lakeflow_source(spark):
                             error.code,
                         ) from error
                     last_error = error
-                except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+                except (*_HTTP_TRANSIENT_ERRORS, json.JSONDecodeError) as error:
                     last_error = error
                 if attempt + 1 < _API_ATTEMPTS:
                     delay = min(1.5 * (2**attempt), 8.0)
@@ -2216,7 +2223,7 @@ def register_lakeflow_source(spark):
                             error.code,
                         ) from error
                     last_error = error
-                except (urllib.error.URLError, TimeoutError, http.client.IncompleteRead) as error:
+                except _HTTP_TRANSIENT_ERRORS as error:
                     # IncompleteRead: the server sent a valid response (for a ranged GET,
                     # a 206 with the full Content-Length) but the body transfer was cut
                     # short mid-stream. It is not a URLError/HTTPError, so without this it
@@ -7484,6 +7491,28 @@ def register_lakeflow_source(spark):
         return connection
 
 
+    def _range_emits_nothing(start: Any, end: Any) -> bool:
+        # Docstring: Whether ``[start, end)`` is a range that emitted no rows by what it is, so
+        # that replayed or planned again it emits none either.
+        #
+        # Spark may persist bootstrap coordination progress as a range of its own: an end of
+        # advisory fields alone, from a start with no Informix position, advances none and holds
+        # no records. A table.migration cutover seed (``handoff_seeded`` on the end and not the
+        # start) adopted a parked position and emitted no rows: replayed as a read from it, it
+        # was taken for the committed seed and dropped the token, then fell short of the
+        # position; after Restore it served the pages or extract the position names.
+
+        positional = {"commit_lsn", "change_lsn", "begin_lsn", "tx_id", "incremental"}
+        if (
+            isinstance(end, dict)
+            and end
+            and set(end) <= _OFFSET_ADVISORY_FIELDS
+            and not positional.intersection(start or {})
+        ):
+            return True
+        return bool((end or {}).get("handoff_seeded")) and not (start or {}).get("handoff_seeded")
+
+
     def _resnapshot_range(start: Any, end: Any) -> bool:
         # Docstring: Whether ``start`` is a stream position below ``end``'s LSN, as auto_snapshot's
         # resnapshot of an expired checkpoint starts: where ``end`` is a staged snapshot's, that
@@ -7557,14 +7586,7 @@ def register_lakeflow_source(spark):
         # Such a range advances no Informix position and contains no records to
         # replay. Treat it as empty, while continuing to fail closed if either side
         # identifies a positional CDC range.
-        advisory_only_end = isinstance(end, dict) and bool(end) and set(end) <= _OFFSET_ADVISORY_FIELDS
-        if advisory_only_end and not positional_keys.intersection(start or {}):
-            return iter(())
-        if (end or {}).get("handoff_seeded") and not (start or {}).get("handoff_seeded"):
-            # A table.migration cutover seed: it adopted a parked position and emitted no rows.
-            # Replayed as a read from that position, it was taken for the committed seed and
-            # dropped the token, then fell short of the position; after Restore it served the
-            # pages the position names.
+        if _range_emits_nothing(start, end):
             return iter(())
 
         stop = (end or {}).get("commit_lsn")
@@ -7697,7 +7719,9 @@ def register_lakeflow_source(spark):
                         continue
                     break
                 advisory_yield = (
-                    initial_range
+                    # Or a floor-seeded delete position whose floor was replaced: it starts
+                    # again as a reader with no checkpoint (_confirmed_floor_seed).
+                    (initial_range or bool((start or {}).get("floor_seed")))
                     and isinstance(reached, dict)
                     and bool(reached)
                     and set(reached) <= _OFFSET_ADVISORY_FIELDS
@@ -11158,6 +11182,21 @@ def register_lakeflow_source(spark):
         return _index_scan_key_text([shaped[name] for name in names])
 
 
+    def _index_scan_lookups(value_sets: Iterable[tuple]) -> list[tuple]:
+        # Docstring: The sets of values to read rows again by, each once as Informix compares
+        # them: a string without its trailing spaces.
+        #
+        # Two sets that differ only in those ('abc' and 'abc ') were two SELECTs of one
+        # statement, each of which returned the other's row too: every row came back twice, and
+        # the scan never settled them (444).
+
+        unique: dict[tuple, tuple] = {}
+        for values in value_sets:
+            key = tuple(value.rstrip(" ") if isinstance(value, str) else value for value in values)
+            unique.setdefault(key, values)
+        return list(unique.values())
+
+
     def _index_scan_staged_key(row: dict[str, Any], names: Sequence[str]) -> str:
         # Docstring: The same of a staged row: _index_scan_row_key of the row it was shaped from.
         return _index_scan_key_text([row[name] for name in names])
@@ -13456,7 +13495,7 @@ def register_lakeflow_source(spark):
     def _remove_candidate_tree_at(parent_descriptor: int, name: str) -> None:
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         root = os.open(name, flags, dir_fd=parent_descriptor)
-        stack: list[tuple[int, os.ScandirIterator, str | None]] = [(root, os.scandir(root), None)]
+        stack: list[tuple[int, os.ScandirIterator, str | None]] = [(root, _scandir(root), None)]
         try:
             while stack:
                 descriptor, entries, child_name = stack[-1]
@@ -13472,7 +13511,7 @@ def register_lakeflow_source(spark):
                 metadata = entry.stat(follow_symlinks=False)
                 if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
                     child = os.open(entry.name, flags, dir_fd=descriptor)
-                    stack.append((child, os.scandir(child), entry.name))
+                    stack.append((child, _scandir(child), entry.name))
                 else:
                     os.unlink(entry.name, dir_fd=descriptor)
         finally:
@@ -13480,6 +13519,32 @@ def register_lakeflow_source(spark):
                 descriptor, entries, _ = stack.pop()
                 entries.close()
                 os.close(descriptor)
+
+
+    def _scandir(descriptor: int) -> os.ScandirIterator:
+        # Docstring: os.scandir of an open directory, which it closes if that fails (a dropped
+        # mount): it is on no stack yet, which would close it.
+
+        try:
+            return os.scandir(descriptor)
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+
+    def _path_present(path: str) -> bool:
+        # Docstring: Whether something may still be at ``path``: anything but its absence counts.
+        #
+        # Not os.path.lexists, which reads a dropped mount as nothing there: a stage was then
+        # recorded as cleaned with its pages left.
+
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return True
 
 
     def _is_path(path: str, *, directory: bool = False) -> bool:
@@ -16197,6 +16262,8 @@ def register_lakeflow_source(spark):
                 self._partition_page_batches.clear()
                 self._unl_gzip_reader = None
                 self._unl_gzip_window_memo = None
+                # The tables' source names are the update's pipeline spec, which can rename one.
+                self.__dict__.pop("_metadata_sources", None)
                 self._retention_swept.clear()
                 self._spill_runs.clear()
                 self._spill_runs_listed.clear()
@@ -17472,7 +17539,9 @@ def register_lakeflow_source(spark):
                 # 175: Informix does not support partitioned batch reads
                 raise NotImplementedError(_m(175))
             self._scope_from_checkpoint(start_offset)
-            if start_offset == end_offset:
+            if start_offset == end_offset or _range_emits_nothing(start_offset, end_offset):
+                # The staged pages and .unl splits a plan serves come before the replay below,
+                # which would emit nothing for such a range too.
                 return []
             # A metadata lookup, as in latest_offset: no capacity wait if the table is not cached
             # (a re-plan after a restart), and the session it opened is given back even when it
@@ -18836,9 +18905,21 @@ def register_lakeflow_source(spark):
             # update until the upsert reader's start shows which snapshot the target holds.
             seeded = (start_offset or {}).get("floor_seed")
             if seeded is not None:
-                start_offset, seeded = self._confirmed_floor_seed(
+                # Validated first: the check takes the seed apart (469 on an invalid one).
+                _validated_offset(start_offset)
+                confirmed, seeded = self._confirmed_floor_seed(
                     self._table(table_name, table_options), start_offset, table_options
                 )
+                if not confirmed:
+                    # Started again, as a reader with no checkpoint, whose waits count on an
+                    # offset of advisory fields alone: on the old offset they brought back the
+                    # position the floor replaced, and a replay stopped at it.
+                    bootstrap_offset = {
+                        k: v
+                        for k, v in (bootstrap_offset or start_offset).items()
+                        if k in _OFFSET_ADVISORY_FIELDS
+                    }
+                start_offset = confirmed
             rows, end = self._read_table_deletes_from(
                 table_name,
                 start_offset,
@@ -19578,7 +19659,7 @@ def register_lakeflow_source(spark):
                 try:
                     PurePythonInformixBridge._remove_connection_slot_tree(path)
                 except FileNotFoundError:
-                    if os.path.lexists(path):
+                    if _path_present(path):
                         continue
                 except OSError:
                     # 212: Cannot remove completed Informix snapshot staging data: {}
@@ -19588,7 +19669,7 @@ def register_lakeflow_source(spark):
                     )
                     return
                 break
-            if os.path.lexists(path):
+            if _path_present(path):
                 # 213: Completed Informix snapshot staging data is still changing; leaving {} for a
                 # later read or the retention sweep
                 logging.getLogger(__name__).warning(
@@ -21913,7 +21994,10 @@ def register_lakeflow_source(spark):
                 names = []
             for name in names:
                 if name.startswith("page-") and name[5:].isdigit() and int(name[5:]) >= staged:
-                    shutil.rmtree(os.path.join(runs, name), True)
+                    # Not shutil.rmtree ignoring errors, which left the page on a dropped mount,
+                    # and staging it again then conflicted (218): the mount retry takes it.
+                    with contextlib.suppress(FileNotFoundError):
+                        PurePythonInformixBridge._remove_connection_slot_tree(os.path.join(runs, name))
             # 439: Informix snapshot of '{}' continues the index-ordered scan an earlier
             # update of this pipeline began: {} staged pages with {} rows are kept
             logging.getLogger(__name__).info(_m(439, table.exposed_name, staged, rows))
@@ -22480,12 +22564,10 @@ def register_lakeflow_source(spark):
                     columns = list(dict.fromkeys([*keys, *(table.primary_keys if comparable else ())]))
                     found: dict[str, list] = {name: [] for name in again}
                     # Each set of values once: two rows can share an index value.
-                    lookups = list(
-                        dict.fromkeys(
-                            tuple(relocated[name][0][column] for column in columns)
-                            for name in again
-                            if relocated[name][0] is not None
-                        )
+                    lookups = _index_scan_lookups(
+                        tuple(relocated[name][0][column] for column in columns)
+                        for name in again
+                        if relocated[name][0] is not None
                     )
                     # A query for many rows when each is found by its key; one at a time when
                     # only its index value leads to it, which can hold many rows.
@@ -27601,7 +27683,12 @@ def register_lakeflow_source(spark):
                 row = _coerce_variable_decimal_values(
                     {name: row.get(name) for name in table.primary_keys}, table, options or {}
                 )
-            return _key(row, table)
+            # NaN equals nothing, itself included: a FLOAT key left NaN read as changed, and its
+            # delete tied with its upsert. The target's merge takes NaN for NaN.
+            return tuple(
+                "NaN" if isinstance(value, float) and math.isnan(value) else value
+                for value in _key(row, table)
+            )
 
         output = []
         for record in tx.records:

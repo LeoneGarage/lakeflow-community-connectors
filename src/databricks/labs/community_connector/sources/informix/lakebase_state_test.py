@@ -3190,6 +3190,33 @@ class WorkspaceFilesApiTests(unittest.TestCase):
         self.assertEqual(captured["auth"], "Bearer dapi-token")
         self.assertEqual(captured["ctype"], "application/octet-stream")
 
+    def test_a_connection_lost_reading_the_answer_is_retried(self):
+        # urllib wraps an OSError raised while it sends a request, not one raised while it
+        # reads the answer: a reset or a TLS error mid-body, or a server that closed the
+        # connection, escaped the retries and failed the read at once.
+        import http.client  # noqa: PLC0415
+        import ssl  # noqa: PLC0415
+
+        for error in (
+            ConnectionResetError(104, "Connection reset by peer"),
+            ssl.SSLEOFError(8, "EOF occurred in violation of protocol"),
+            http.client.RemoteDisconnected("Remote end closed connection without response"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                outcomes = [error]
+
+                def fake_urlopen(request, timeout=None, outcomes=outcomes):
+                    if outcomes:
+                        raise outcomes.pop()
+                    return _FakeHttpResponse(b"body")
+
+                client, _ = self._client()
+                with (
+                    mock.patch.object(lakebase_state.urllib.request, "urlopen", fake_urlopen),
+                    mock.patch.object(lakebase_state.time, "sleep"),
+                ):
+                    self.assertEqual(client.get("/Volumes/c/s/v/x"), b"body")
+
     def test_client_error_raises_workspace_http_error(self):
         def fake_urlopen(request, timeout=None):
             raise lakebase_state.urllib.error.HTTPError(

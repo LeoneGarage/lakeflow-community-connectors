@@ -83,6 +83,7 @@ import logging
 import math
 import os
 import re
+import ssl
 import threading
 import time
 import urllib.error
@@ -90,6 +91,17 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+# What a request that may succeed when sent again raises. urllib wraps an OSError raised
+# while it sends the request in URLError, but not one raised while it reads the answer: a
+# connection reset or a TLS error mid-body, or http.client's RemoteDisconnected and
+# IncompleteRead, escaped the retries and failed the read at once.
+_HTTP_TRANSIENT_ERRORS = (
+    urllib.error.URLError,
+    TimeoutError,
+    ConnectionError,
+    ssl.SSLError,
+    http.client.HTTPException,
+)
 _LOGGER = logging.getLogger(__name__)
 
 # Autoscaling bounds. 0.5 is the smallest compute unit the API accepts; the
@@ -260,7 +272,7 @@ class _WorkspaceApi:
                         error.code,
                     ) from error
                 last_error = error
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            except (*_HTTP_TRANSIENT_ERRORS, json.JSONDecodeError) as error:
                 last_error = error
             if attempt + 1 < _API_ATTEMPTS:
                 delay = min(1.5 * (2**attempt), 8.0)
@@ -934,7 +946,7 @@ class WorkspaceFilesApi:
                         error.code,
                     ) from error
                 last_error = error
-            except (urllib.error.URLError, TimeoutError, http.client.IncompleteRead) as error:
+            except _HTTP_TRANSIENT_ERRORS as error:
                 # IncompleteRead: the server sent a valid response (for a ranged GET,
                 # a 206 with the full Content-Length) but the body transfer was cut
                 # short mid-stream. It is not a URLError/HTTPError, so without this it
