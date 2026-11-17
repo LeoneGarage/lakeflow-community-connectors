@@ -468,5 +468,6 @@
 "Transform of column {} gives {}, which has more integer digits than a DECIMAL(38), Spark's largest, holds",
 "Informix offset has an invalid staged_scope; run a full refresh with this connector version",
 "Key column {} of '{}' became {} while the table's incremental snapshot was copying, and a float key cannot page the copy; run a full refresh",
-"Informix offset has an invalid floor_seed; run a full refresh with this connector version"
+"Informix offset has an invalid floor_seed; run a full refresh with this connector version",
+"UNLOAD value {!r} in snapshot.source is not a finite number, which no Informix {} column holds"
 ]

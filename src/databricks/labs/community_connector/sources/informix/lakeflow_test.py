@@ -2062,6 +2062,16 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(informix_module._unload_value("  -5 10:30:00", "INTERVAL"), "-5 10:30:00")
         self.assertEqual(informix_module._unload_value(" .016", "INTERVAL"), ".016")
 
+    def test_an_extract_value_no_informix_decimal_holds_fails_by_name(self):
+        # Decimal parses NaN and infinity, which no DECIMAL, NUMERIC or MONEY column holds;
+        # passed through, they failed later with an error that named nothing.
+        for text in ("NaN", "-Infinity", "sNaN"):
+            for type_name, scale in (("DECIMAL", 2), ("MONEY", None)):
+                with self.subTest(text=text, type_name=type_name):
+                    with self.assertRaisesRegex(InformixError, "not a finite number"):
+                        informix_module._unload_value(text, type_name, 0, scale)
+        self.assertEqual(informix_module._unload_value("1.5", "DECIMAL", 0, 2), Decimal("1.50"))
+
     def test_an_interval_key_is_copied_by_the_blocking_snapshot(self):
         raw = _table()
         raw["columns"][0] = {"name": "id", "type_name": "INTERVAL", "length": 0x084A}
@@ -4500,6 +4510,69 @@ class LakeflowContractTests(unittest.TestCase):
                 self.assertIsNotNone(informix_module._dropped_mount_error(error))
             else:
                 self.assertIn("dropped_mount_retry_count", offset)
+
+    def test_a_dropped_mount_reading_the_scan_record_keeps_the_scan_for_its_resume(self):
+        # The cleanup of earlier updates' records asks which scan is on record. Swallowing
+        # a dropped mount, it read none and deleted the failed update's initialization, and
+        # once the mount was back the scan began again at the first row (440). It deletes
+        # nothing now, and cleans up on a later read.
+        pipeline = uuid.UUID(int=142)
+        scopes = [f"{pipeline}_@_{uuid.UUID(int=update)}" for update in (2, 3)]
+        bridge, options, cursors = self._failed_index_scan(scopes[0])
+        later = self.connector(bridge)
+        later.set_registration_scope(scopes[1])
+        later.set_update_request("continue")
+        table = later._table("app.orders", options)
+        dropped = OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+        with mock.patch.object(later, "_read_progress_file", side_effect=dropped):
+            later._cleanup_previous_update_scopes(table)
+        self.assertNotIn((table.identity, scopes[1]), later._cleaned_update_scopes)
+
+        ids, offset = self._snapshot_ids(later, options)
+
+        self.assertEqual(ids, [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(cursors, [[4], [6]])
+        self.assertEqual(offset["pipeline_scope"], scopes[0])
+
+    def test_a_dropped_mount_removing_scan_records_is_not_taken_for_removed(self):
+        # Removal ignoring errors left a discarded scan's record under a dropped mount, for
+        # a later update to take up, and left an earlier scan's page records beside a new
+        # one's, which a resume took for its own. The discard raises for the read's mount
+        # retry, and the record stays for a later read to discard; a scan that cannot clear
+        # its directory records no progress.
+        pipeline = uuid.UUID(int=143)
+        scopes = [f"{pipeline}_@_{uuid.UUID(int=update)}" for update in (2, 3)]
+        pointers = os.path.join(self._shared_state.name, "**", "snapshot-scan", f"{pipeline}.json")
+        bridge, options, _ = self._failed_index_scan(scopes[0])
+        later = self.connector(bridge)
+        later.set_registration_scope(scopes[1])
+        table = later._table("app.orders", options)
+        dropped = OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+        for target in ("rmtree", "remove"):
+            with self.subTest(target=target):
+                module = informix_module.shutil if target == "rmtree" else informix_module.os
+                with mock.patch.object(module, target, side_effect=dropped):
+                    with self.assertRaises(OSError):
+                        later._discard_scan_progress(table, scopes[1])
+                self.assertEqual(len(glob.glob(pointers, recursive=True)), 1)
+        fresh = self.connector(_KeylessIndexBridge())
+        fresh.set_registration_scope(f"{uuid.UUID(int=144)}_@_{uuid.UUID(int=2)}")
+        with (
+            mock.patch.object(informix_module.shutil, "rmtree", side_effect=dropped),
+            mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0),
+            self.assertLogs(informix_module.__name__, "WARNING") as logs,
+        ):
+            fresh.read_table("app.orders", {}, dict(options))
+        self.assertTrue(any("Cannot record the progress" in line for line in logs.output))
+        self.assertEqual(
+            glob.glob(
+                os.path.join(
+                    self._shared_state.name, "**", "snapshot-scan", f"{uuid.UUID(int=144)}.json"
+                ),
+                recursive=True,
+            ),
+            [],
+        )
 
     def test_tree_helpers_count_a_dropped_mount_as_no_answer(self):
         # A directory opened for a walk is closed when listing it fails, and a path the
@@ -10215,9 +10288,13 @@ class LakeflowContractTests(unittest.TestCase):
     def _partitioned_connector(self, bridge=None, **options):
         """A connector configured for the partitioned reader, with its CDC polls going
         through process-local shards, which leave no files behind (the base connector
-        reads directly)."""
+        reads directly). The shards get no reader to build: the daemon's would connect to
+        no source, and it failed every second for minutes after the test, so polls read
+        directly as they did then."""
         opts = {"stream.partitioned": "true", "cdc.shared.session": "process", **options}
-        return self.connector(bridge, shared_cdc=True, **opts)
+        connector = self.connector(bridge, shared_cdc=True, **opts)
+        connector._shared_cdc_reader_factory = lambda: None
+        return connector
 
     def _drive_partitioned_snapshot(self, connector, table_name="app.orders", options=None):
         """Drive the partitioned reader through the snapshot, mirroring Spark's cycle.
@@ -14065,6 +14142,37 @@ class LakeflowContractTests(unittest.TestCase):
                 self.assertEqual(
                     [key for key in self._lakebase.database.handoff if key[2] == 1], []
                 )
+
+    def test_a_migration_in_one_pipeline_starts_a_delete_flow_without_a_token_at_its_floor(self):
+        # The README's runbook captures and cuts over in one pipeline. A delete flow with no
+        # checkpoint at capture parks no token; the cutover's delete flow then starts at the
+        # pipeline's snapshot floor, below the parked upsert position, also when it reads
+        # before the upsert flow has seeded, so no delete between the two is skipped.
+        migration = {"table.migration": "true"}
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        _, snapshot = reader(2, "full_refresh").read_table("app.orders", {}, {})
+        floor = snapshot["commit_lsn"]
+        bridge.now = 130
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 101},
+            {"op": "INSERT", "tx_id": 7, "lsn": 102, "row": {"id": 9, "value": "i"}},
+            {"op": "COMMIT", "tx_id": 7, "lsn": 125},
+        ]
+        _, upsert = reader(3).read_table("app.orders", snapshot, {})
+        self.assertEqual(upsert["commit_lsn"], "125")
+        capture = reader(4)
+        capture.read_table("app.orders", upsert, migration)
+        capture.read_table_deletes("app.orders", {}, migration)
+        self.assertEqual([key[2] for key in self._lakebase.database.handoff], [0])
+
+        cutover = reader(5)
+        _, delete_seed = cutover.read_table_deletes("app.orders", {}, migration)
+        _, upsert_seed = cutover.read_table("app.orders", {}, migration)
+
+        self.assertEqual(upsert_seed["commit_lsn"], "125")
+        self.assertEqual(delete_seed["commit_lsn"], floor)
+        self.assertLess(int(floor), 125)
 
     def test_a_staged_snapshot_resumed_in_a_new_update_publishes_its_channel_start(self):
         # A staged snapshot's first batch publishes its boundary as the update's upsert
@@ -19790,6 +19898,70 @@ class LakeflowContractTests(unittest.TestCase):
 
                 self.assertEqual(seed["commit_lsn"], "150")
 
+    def test_a_replayed_delete_move_below_the_expired_commit_lands(self):
+        # An open transaction's begin expired while the checkpoint's commit, 140, is still
+        # in the log, and the reader moved to the floor at 120, below it. Replayed, that
+        # move read as a wait, which stays at 140 and so never reached its end (5).
+        bridge = FakeBridge()
+        bridge.minimum, bridge.now = 91, 170
+        start = dict(_stream_offset(140), begin_lsn="90")
+        end = _stream_offset(120)
+        options = {"snapshot.mode": "auto_snapshot"}
+        replaying = self.connector(bridge)
+
+        with self.assertLogs(informix_module.__name__, level="WARNING"):
+            replayed = list(
+                informix_module._replay_between_offsets(
+                    start,
+                    end,
+                    lambda offset: replaying.read_table_deletes("app.orders", offset, options),
+                    options,
+                    replaying.options,
+                )
+            )
+
+        self.assertEqual(replayed, [])
+
+    def test_an_expired_delete_reader_seeds_where_the_floor_alone_did_not(self):
+        # The upsert reader resnapshotted in update 2 at 150 and goes on from the log in
+        # update 3, which publishes no boundary, while the delete flow's checkpoint is still
+        # past the log. The floor alone gave no seed under a selective refresh of another
+        # table, under a column added since, or once it aged out (427 on every update): it
+        # seeds as a delete reader with no checkpoint does, there at the upsert's start.
+        for case in ("selective", "added", "aged"):
+            with self.subTest(case=case):
+                bridge = FakeBridge()
+                bridge.minimum, bridge.now = 91, 150
+                reader = self._floor_updates(bridge)
+                checkpoint = _stream_offset(90)
+                checkpoint["pipeline_scope"] = f"{uuid.UUID(int=21)}_@_{uuid.UUID(int=1)}"
+                options = {"snapshot.mode": "auto_snapshot", "snapshot.page.size": "1"}
+                upsert = dict(checkpoint)
+                for _ in range(6):
+                    _, upsert = reader(2).read_table("app.orders", upsert, dict(options))
+                self.assertNotIn("incremental", upsert)
+                if case == "added":
+                    bridge.tables[0]["columns"].append(
+                        {"name": "added", "type_name": "INTEGER", "nullable": True}
+                    )
+                bridge.now = 170
+                if case == "aged":
+                    bridge.changes = [
+                        {"op": "BEGIN", "tx_id": 7, "lsn": 161},
+                        {"op": "INSERT", "tx_id": 7, "lsn": 162, "row": {"id": 9, "value": "i"}},
+                        {"op": "COMMIT", "tx_id": 7, "lsn": 165},
+                    ]
+                    _, upsert = reader(3).read_table("app.orders", upsert, dict(options))
+                    self.assertEqual(upsert["commit_lsn"], "165")
+                    bridge.minimum, bridge.now, bridge.changes = 160, 180, []
+                later = reader(4, "full_refresh" if case == "selective" else "continue")
+                later.read_table("app.orders", upsert, dict(options))
+
+                _, seed = later.read_table_deletes("app.orders", dict(checkpoint), dict(options))
+
+                self.assertEqual(seed["commit_lsn"], "165" if case == "aged" else "150")
+                self.assertNotIn("trigger_boundary_retry_count", seed)
+
     def test_a_reset_delete_positions_wait_replays_as_nothing(self):
         # The floor replaced, a floor-seeded position starts again and waits on advisory
         # fields alone. Spark logs that range from the positional start; replayed or planned
@@ -24694,6 +24866,37 @@ class FairSlotQueueWiringTests(unittest.TestCase):
             self.addCleanup(bridge._release_connection_slot)
 
         seed.assert_called_once()
+
+    def test_a_ticket_is_dropped_after_a_failed_statement_aborted_the_transaction(self):
+        # A statement timeout during the sweep left the transaction aborted, so dropping the
+        # ticket failed as well (swallowed) and it held younger waiters back until it aged
+        # out. The transaction is rolled back first.
+        bridge = self._bridge()
+        namespace = bridge._lakebase_namespace()
+        real_dequeue = informix_module.dequeue_waiter
+
+        def aborting(connection, *args, **kwargs):
+            connection.info = types.SimpleNamespace(transaction_status=3)
+
+            def rollback():
+                connection.info.transaction_status = 0
+
+            connection.rollback = rollback
+            raise RuntimeError("canceling statement due to statement timeout")
+
+        def dequeue(connection, *args):
+            if connection.info.transaction_status == 3:
+                raise RuntimeError("current transaction is aborted")
+            return real_dequeue(connection, *args)
+
+        with (
+            mock.patch.object(informix_module, "acquire_slot", side_effect=aborting),
+            mock.patch.object(informix_module, "dequeue_waiter", side_effect=dequeue),
+            self.assertRaisesRegex(RuntimeError, "statement timeout"),
+        ):
+            bridge._acquire_connection_slot()
+
+        self.assertEqual(self._waiters(namespace), [])
 
     def test_successful_acquire_dequeues_its_ticket(self):
         bridge = self._bridge()

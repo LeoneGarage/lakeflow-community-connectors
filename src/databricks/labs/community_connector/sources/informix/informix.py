@@ -2701,8 +2701,10 @@ class PurePythonInformixBridge:
             # Drop our ticket whether we won, timed out, or errored -- a lingering ticket
             # would wrongly hold back younger waiters until it aged out. Best-effort: a
             # dequeue failure must never mask a successful acquire or the real timeout.
+            # A statement that failed left the transaction aborted, so the dequeue failed
+            # too and the ticket held younger waiters back until it aged out: roll back.
             try:
-                dequeue_waiter(connection, namespace, ticket_id)
+                dequeue_waiter(_open_state_connection(connection), namespace, ticket_id)
             except Exception:  # noqa: BLE001 - ticket ages out via the reaper anyway
                 # 21: snapshot slot waiter dequeue failed
                 logging.getLogger(__name__).debug(_m(21), exc_info=True)
@@ -7350,6 +7352,15 @@ def _is_path(path: str, *, directory: bool = False) -> bool:
     except (FileNotFoundError, NotADirectoryError):
         return False
     return stat.S_ISDIR(mode) if directory else stat.S_ISREG(mode)
+
+
+def _remove_tree(path: str) -> None:
+    # Docstring: Remove a directory tree, a missing one counting as removed. Any other
+    # failure raises: rmtree's ignore_errors kept the records of a scan under a dropped
+    # mount, for a later read to take up as its own.
+
+    with contextlib.suppress(FileNotFoundError):
+        shutil.rmtree(path)
 
 
 def _dropped_mount_error(error: BaseException) -> OSError | None:
@@ -12640,11 +12651,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # earlier update and resumes from it, and this one never publishes a boundary (427
         # on every update). Started above the floor, the reader skipped the deletes between.
         floor = self._delete_floor_seed(table)
-        if floor is not None and (high_water is None or int(floor["commit_lsn"]) < high_water):
-            return floor
-        if high_water is None:
-            return None
+        if floor is None or (high_water is not None and int(floor["commit_lsn"]) >= high_water):
+            if high_water is None:
+                return None
+            floor = None
         self._schema_transition_waits.pop((table.identity, "resnapshot"), None)
+        if floor is not None:
+            return floor
         schema_id = self._snapshot_schema_ids[(scope, table.identity)]
         return {
             **_offset(high_water, high_water, high_water, None, "stream", table, schema_id, scope),
@@ -12662,10 +12675,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # position: an unchanged offset reads as a drained source, which would end a
         # triggered update with no seed, and a later update's scope never gets one. A
         # replayed wait stays where it was; a replayed move to the boundary lands on it.
+        # A wait's logged end is the checkpoint's own position, so any other end is a move,
+        # one below the checkpoint's commit too: the floor, or a seed whose page-start
+        # boundary is below it, as an open transaction's begin can expire first.
 
         checkpoint = _validated_offset(start_offset)
         replay_stop = self._replay_stop_lsn(table_options)
-        if replay_stop is not None and replay_stop <= int(checkpoint["commit_lsn"]):
+        if replay_stop is not None and replay_stop == int(checkpoint["commit_lsn"]):
             return iter(()), dict(start_offset)
         if replay_stop is not None:
             # From an expired checkpoint this reader only waits in place or moves to the
@@ -12915,7 +12931,20 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             and start_offset.get("phase") == "stream"
             and self._checkpoint_requires_snapshot(start_offset)
         ):
-            return self._read_resnapshotted_deletes(table, start_offset, table_options)
+            channel_start = (
+                None
+                if self._replay_stop_lsn(table_options) is not None
+                else self._read_upsert_channel_start(table, self._pipeline_scope())
+            )
+            if channel_start is None or channel_start[0] < self._bridge.minimum_lsn():
+                return self._read_resnapshotted_deletes(table, start_offset, table_options)
+            # The upsert reader goes on from the retained log this update, so no boundary
+            # replaces the expired checkpoint (a resnapshot, if any, committed earlier): seed
+            # as a delete reader with no checkpoint does, at the floor under any update and
+            # under the floor's own layout, or at the upsert reader's start (200) once the
+            # floor has aged out. The pipeline's floor alone failed those three (427).
+            self._schema_transition_waits.pop((table.identity, "resnapshot"), None)
+            start_offset = {}
         # Lakeflow checkpoints this independently from read_table(). The
         # upsert reader owns initialization and publishes the table boundary
         # through durable shared state; delete readers only consume it.
@@ -15683,9 +15712,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if pointer is None:
             return
         recorded = pointer.get("scope")
+        # Missing alone counts as removed: under a dropped mount the record stayed for a
+        # later update to take up, so the failure goes to the caller.
         if isinstance(recorded, str) and _PIPELINE_SCOPE.fullmatch(recorded) is not None:
-            shutil.rmtree(os.path.join(self._scan_progress_root(table), recorded), True)
-        with contextlib.suppress(OSError):
+            _remove_tree(os.path.join(self._scan_progress_root(table), recorded))
+        with contextlib.suppress(FileNotFoundError):
             os.remove(path)
         if why:
             # 440: Informix snapshot of '{}' discards the index-ordered scan an
@@ -15844,7 +15875,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
         def begin(boundary: int) -> None:
             directory = self._scan_progress_directory(table, scope, schema_id, boundary)
-            shutil.rmtree(directory, True)
+            try:
+                _remove_tree(directory)
+            except OSError as error:
+                # Its pages left beside this scan's, a resume took them for its own.
+                failed.append(error)
+                # 441: Cannot record the progress of the index-ordered snapshot of
+                # '{}' ({}); a restart reads the table from its first row again
+                logging.getLogger(__name__).warning(_m(441, table.exposed_name, error))
+                return
             try:
                 os.makedirs(directory, mode=0o700, exist_ok=True)
             except OSError:
@@ -20562,9 +20601,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # scan that led to it must not send a later update back to its pages.
             forgotten = self.__dict__.setdefault("_scan_progress_forgotten", set())
             if table.identity not in forgotten:
-                forgotten.add(table.identity)
                 with contextlib.suppress(Exception):
                     self._discard_scan_progress(table, self._pipeline_scope())
+                    forgotten.add(table.identity)
         if checkpoint and (checkpoint.get("stage_scope") or checkpoint.get("scan_scope")):
             # A handoff relocation is still serving staged pages that live under the
             # capturing flow's scope (carried on stage_scope). That scope's records --
@@ -20593,17 +20632,20 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # for this read to take up (see _adopted_scan_scope): it runs under that
             # update's scope, from the starting position recorded there. Deleting that
             # record sent the scan to a new starting position, past its own snapshot LSN,
-            # and so back to the table's first row.
-            with contextlib.suppress(Exception):
+            # and so back to the table's first row. The record unreadable (a dropped mount,
+            # which _read_progress_file raises), nothing is deleted: a later read cleans up.
+            try:
                 pointer = self._read_progress_file(self._scan_pointer_path(table, current))
-                candidate = None if pointer is None else pointer.get("scope")
-                if (
-                    isinstance(candidate, str)
-                    and candidate != current
-                    and candidate.startswith(f"{pipeline_id}_@_")
-                    and _PIPELINE_SCOPE.fullmatch(candidate) is not None
-                ):
-                    retained_scope = candidate
+            except Exception:  # pylint: disable=broad-except
+                return
+            candidate = None if pointer is None else pointer.get("scope")
+            if (
+                isinstance(candidate, str)
+                and candidate != current
+                and candidate.startswith(f"{pipeline_id}_@_")
+                and _PIPELINE_SCOPE.fullmatch(candidate) is not None
+            ):
+                retained_scope = candidate
         deleted = self._state_op_with_reconnect(
             lambda: delete_obsolete_scoped_state_records(
                 self._lakebase_connection(),
@@ -21907,7 +21949,11 @@ def _unload_value(
         return int(text)
     if upper.startswith(("DECIMAL", "NUMERIC", "MONEY")):
         value = Decimal(text)
-        if scale is None or scale == 0xFF or not value.is_finite():
+        if not value.is_finite():
+            # 470: UNLOAD value {!r} in snapshot.source is not a finite number, which no
+            # Informix {} column holds
+            raise InformixError(_m(470, text, type_name))
+        if scale is None or scale == 0xFF:
             return value
         with localcontext() as decimal_context:
             # Not the default context's 28 digits, which a DECIMAL(32) passes.

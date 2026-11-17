@@ -90,11 +90,16 @@ def marked(session):
 
 
 def same_columns(session):
-    # Whether the table has the columns a rebuild writes. After a column is added to the
-    # source, and so to bronze, it has not: rewriting a few orders can't fill the column
-    # for the rest, so the table is written whole again, as the views are computed again.
-    rebuilt = session.sql(REBUILD.format(bronze=BRONZE, where="false")).columns
-    return session.table(TARGET).columns == rebuilt
+    # Whether the table has the columns a rebuild writes, by name and type. After a column
+    # is added to the source, and so to bronze, it has not: rewriting a few orders can't
+    # fill the column for the rest, so the table is written whole again, as the views are
+    # computed again. A widened column (INT to BIGINT) is written whole too: a replaceWhere
+    # write, which keeps the table's schema, failed to merge the two types.
+    def columns(schema):
+        return [(field.name, field.dataType) for field in schema]
+
+    rebuilt = session.sql(REBUILD.format(bronze=BRONZE, where="false")).schema
+    return columns(session.table(TARGET).schema) == columns(rebuilt)
 
 
 def holds_rows(session, table):

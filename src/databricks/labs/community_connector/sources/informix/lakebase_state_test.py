@@ -2240,6 +2240,19 @@ class LakebaseConnectionParameterTests(unittest.TestCase):
         self.assertEqual(parameters["password"], "secret")
         self.assertEqual(parameters["dbname"], "databricks_postgres")
 
+    def test_an_open_connection_detects_a_dead_peer_within_the_slot_lease(self):
+        # Without these an open connection on a path dropping packets blocked a slot
+        # heartbeat for the OS retransmission time, past the 120 s lease.
+        parameters = self._open()
+
+        self.assertEqual(parameters["keepalives"], 1)
+        self.assertLessEqual(
+            parameters["keepalives_idle"]
+            + parameters["keepalives_interval"] * parameters["keepalives_count"],
+            60,
+        )
+        self.assertLessEqual(parameters["tcp_user_timeout"], 60000)
+
     def test_connect_timeout_allows_a_suspended_endpoint_to_wake(self):
         # Resuming from IDLE measured ~3.2s; the bound must be well clear of that.
         self.assertGreaterEqual(self._open()["connect_timeout"], 60)
@@ -2545,6 +2558,15 @@ class LakebaseCredentialCaptureTests(unittest.TestCase):
 
         self.assertEqual(host, "https://captured.example")
         self.assertEqual(token, "captured-token")
+
+    def test_a_host_with_an_upper_case_scheme_keeps_it(self):
+        # The scheme check was case-sensitive, so "HTTPS://h" became "https://HTTPS://h".
+        host, _ = lakebase_state._workspace_credentials(
+            {"lakebase.workspace.host": "HTTPS://upper.example", "lakebase.workspace.token": "t"}
+        )
+
+        self.assertEqual(host, "HTTPS://upper.example")
+        self.assertEqual(lakebase_state._https_host(host), host)
 
     def test_explicit_options_still_win_over_a_captured_credential(self):
         lakebase_state._CAPTURED_WORKSPACE.update({"host": "https://c", "token": "ct"})

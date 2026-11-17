@@ -431,7 +431,7 @@ def _workspace_credentials(options: dict[str, str]) -> tuple[str, str]:
         or os.environ.get("DATABRICKS_TOKEN")
         or ""
     ).strip()
-    if host and not host.startswith("http"):
+    if host and not host.lower().startswith("http"):
         host = f"https://{host}"
     if not host or not token:
         # The SDK resolves notebook/job/serverless credentials that are not
@@ -1738,6 +1738,16 @@ class LakebaseState:
             "connect_timeout": max(
                 1, int(min(timeout or _CONNECT_TIMEOUT_SECONDS, _CONNECT_TIMEOUT_SECONDS))
             ),
+            # connect_timeout bounds the connect alone. On an open connection whose path
+            # drops packets, a slot heartbeat blocked for the OS retransmission time (about
+            # 15 minutes), long past its 120 s lease. Unacknowledged data and a silent peer
+            # now end it in about 30 s; a server-side wait is acknowledged, so not cut short.
+            # Where the platform lacks these socket options libpq ignores them.
+            "keepalives": 1,
+            "keepalives_idle": 15,
+            "keepalives_interval": 5,
+            "keepalives_count": 3,
+            "tcp_user_timeout": 30000,
             **_NO_CLIENT_CERTIFICATE,
         }
         try:
