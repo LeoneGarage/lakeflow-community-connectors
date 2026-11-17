@@ -103,14 +103,14 @@ def main() -> int:
             "sum(CASE WHEN _informix_op IN ('r', 'c', 'u') THEN 1 "
             "WHEN _informix_op = 'd' THEN -1 ELSE 0 END) AS copies, "
             "sum(CASE WHEN _informix_op IN ('r', 'c', 'u', 'd') THEN 0 ELSE 1 END) "
-            f"AS other_changes FROM {args.bronze}.order_items "
+            f"AS other_changes FROM {args.bronze}.order_items_log "
             "GROUP BY ALL HAVING copies <> 0 OR other_changes <> 0)"
         ),
     )
     print(
         "bronze order_items rows by operation:",
         query(
-            f"SELECT _informix_op, count(*) FROM {args.bronze}.order_items GROUP BY 1 ORDER BY 1"
+            f"SELECT _informix_op, count(*) FROM {args.bronze}.order_items_log GROUP BY 1 ORDER BY 1"
         ),
     )
     return 0 if matched else 1

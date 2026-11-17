@@ -1,0 +1,20 @@
+{
+  "name": "informix-orders",
+  "catalog": "<catalog>",
+  "schema": "orders_combined",
+  "serverless": true,
+  "continuous": false,
+  "development": true,
+  "channel": "CURRENT",
+  "root_path": "<workspace path of this repository's Git folder>/src",
+  "libraries": [
+    {"file": {"path": "<workspace path of orders_bronze_test_ingest.py>"}},
+    {"file": {"path": "<workspace path of orders_silver.sql>"}},
+    {"file": {"path": "<workspace path of orders_silver_test_delta_sink.py>"}}
+  ],
+  "configuration": {
+    "pipelines.enableTypeWidening": "true",
+    "bronze_schema": "<catalog>.orders_combined",
+    "order_items_delta_table": "<catalog>.orders_combined.order_items_delta"
+  }
+}

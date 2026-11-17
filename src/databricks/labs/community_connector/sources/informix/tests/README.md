@@ -142,10 +142,11 @@ already have. No update changes `order_id`, the column the snapshot pages by.
 | `orders_setup.sh`, `orders_lib.sh` | Create and seed the two tables in `testdb` (300 orders, about a third of the item rows written two or three times). |
 | `orders_workload.sh` | The workload, one transaction a second for the given minutes (default 15). |
 | `orders_fingerprint.sh` | Source side of the comparison: `order_items` summed up in 25 buckets. |
-| `orders_bronze_test_ingest.py` | Bronze pipeline source: both tables append-only; `order_items` with `snapshot.scan: keyset`, under which the connector picks the index on `order_id`. |
+| `orders_bronze_test_ingest.py` | Bronze pipeline source: both tables append-only, as `orders_log` and `order_items_log`, so that they can share a schema with the silver tables; `order_items` with `snapshot.scan: keyset`, under which the connector picks the index on `order_id`. |
 | `orders_silver.sql` | Silver pipeline source: `orders` by AUTO CDC; `order_items` from a count per distinct row (+1 for `r`, `c` and `u` rows, -1 for `d`) expanded back into rows. The counts are a private view, kept out of the catalog. |
 | `orders_silver_test_delta_sink.py` | Second silver example in the same pipeline: the same `order_items` kept in a standard Delta table (the pipeline configuration's `order_items_delta_table`, which must be set; the settings file names it `order_items_delta`) by a foreachBatch sink, so it has history and time travel. Each batch rebuilds the orders it touches from the bronze change log and swaps their rows in with `replaceWhere` writes, 10,000 orders to a write and the whole table above 50,000. The first batch of a stream, `batch_id` 0, comes on the first update and on every full refresh, and replaces the whole table, so a full refresh clears what was there; so does a batch that finds a table this stream did not write, which a table property tells; when bronze is empty, so that no batch would run, the table is emptied as the pipeline starts. |
 | `orders_bronze_pipeline.json`, `orders_silver_pipeline.json` | Pipeline settings to fill in and create the two pipelines with. |
+| `orders_pipeline.json` | Or one pipeline that holds both, bronze and silver tables in one schema: each update runs bronze, then silver. A silver failure then fails the update, bronze included, and a full refresh snapshots bronze again. |
 | `orders_run.sh` | A silver run after every bronze run: bronze full refresh during the workload and a silver full refresh after it, then bronze and silver updates in turn until the workload has ended and two more of each to drain it, so that silver ends incremental. The silver full refresh finds the Delta table holding the previous run's rows. |
 | `orders_compare_test_tool.py` | Compares both silver tables, `order_items` and `order_items_delta`, with the fingerprint; prints `MATCH` or `MISMATCH` for each, `ERROR` for one it cannot read, and exits 1 on either. |
 
@@ -155,13 +156,15 @@ Steps:
    into the Informix container and run `orders_setup.sh` there.
 2. Put `orders_bronze_test_ingest.py`, `orders_silver.sql` and
    `orders_silver_test_delta_sink.py` in the workspace, fill in the two pipeline JSON files
+   (or `orders_pipeline.json` alone)
    and create the pipelines
    (`databricks pipelines create --json @orders_bronze_pipeline.json`).
 3. Start `orders_workload.sh 15` in the container and, while it runs,
-   `orders_run.sh <bronze id> <silver id> <workload end, UTC HHMMSS> [profile]`.
+   `orders_run.sh <bronze id> <silver id> <workload end, UTC HHMMSS> [profile]`; with the
+   single pipeline, its id and `-` for the silver id.
 4. After the workload has ended, save the output of `orders_fingerprint.sh` to a file and
    run `orders_compare_test_tool.py <file> --warehouse-id <id> --silver <catalog>.orders_silver
-   --bronze <catalog>.orders_bronze`.
+   --bronze <catalog>.orders_bronze` (the single pipeline's schema for both).
 
 The tables are captured by CDC once the bronze pipeline has run; a restart of the demo
 container rebuilds `testdb` without them.

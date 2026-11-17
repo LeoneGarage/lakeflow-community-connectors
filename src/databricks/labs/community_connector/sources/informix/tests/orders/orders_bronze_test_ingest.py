@@ -1,5 +1,7 @@
 # Bronze pipeline source for the orders / order_items test: both tables land append-only,
-# as change logs. Named *_test* so the connector's merge and wheel leave it out.
+# as change logs, named orders_log and order_items_log so that they can share a schema with
+# the silver tables (orders_pipeline.json runs both in one pipeline). Named *_test* so the
+# connector's merge and wheel leave it out.
 from databricks.labs.community_connector.pipeline import ingest
 from databricks.labs.community_connector import register
 
@@ -14,6 +16,7 @@ pipeline_spec = {
         {
             "table": {
                 "source_table": "orders",
+                "destination_table": "orders_log",
                 "table_configuration": {
                     "qualified_source_table": "informix.orders",
                     "append.only.ingestion": "true",
@@ -29,6 +32,7 @@ pipeline_spec = {
         {
             "table": {
                 "source_table": "order_items",
+                "destination_table": "order_items_log",
                 "table_configuration": {
                     "qualified_source_table": "informix.order_items",
                     "snapshot.mode": "initial",

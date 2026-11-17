@@ -27,7 +27,7 @@
 # refresh, and Delta would skip those writes as already done.
 from pyspark import pipelines as dp
 
-BRONZE = f"{spark.conf.get('bronze_schema')}.order_items"
+BRONZE = f"{spark.conf.get('bronze_schema')}.order_items_log"
 TARGET = spark.conf.get("order_items_delta_table")
 # How many orders one replaceWhere write lists, and how many such writes a batch may take
 # before it replaces the whole table instead. Each write reads the bronze change log once,
