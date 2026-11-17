@@ -1,7 +1,6 @@
 # Bronze pipeline source for the orders / order_items test: both tables land append-only,
-# as change logs, named orders_log and order_items_log so that they can share a schema with
-# the silver tables (orders_pipeline.json runs both in one pipeline). Named *_test* so the
-# connector's merge and wheel leave it out.
+# as change logs, named orders_log and order_items_log. Named *_test* so the connector's
+# merge and wheel leave it out.
 from databricks.labs.community_connector.pipeline import ingest
 from databricks.labs.community_connector import register
 

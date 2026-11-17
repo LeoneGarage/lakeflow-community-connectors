@@ -1,7 +1,6 @@
 -- Silver for the orders / order_items test. Reads the append-only bronze change logs,
--- orders_log and order_items_log. ${bronze_schema} is their catalog.schema, set in this
--- pipeline's configuration: the bronze pipeline's (see orders_silver_pipeline.json), or this
--- pipeline's own where it runs bronze too (orders_pipeline.json).
+-- orders_log and order_items_log. ${bronze_schema} is the bronze pipeline's catalog.schema,
+-- set in this pipeline's configuration (see orders_silver_pipeline.json).
 
 -- orders has a key, so AUTO CDC rebuilds its current rows from the change log.
 CREATE OR REFRESH STREAMING TABLE orders;

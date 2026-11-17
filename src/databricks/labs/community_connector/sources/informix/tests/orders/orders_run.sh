@@ -7,9 +7,7 @@
 # foreachBatch sink rewrites only the orders each batch touches.
 # The silver full refresh comes while its Delta table still holds the previous run's rows,
 # which the sink's first batch must clear.
-# With one pipeline holding both (orders_pipeline.json), pass - as the silver id: each
-# update of it runs bronze and then silver.
-# Usage: orders_run.sh <bronze pipeline id> <silver pipeline id, or -> <workload end, UTC HHMMSS> [profile]
+# Usage: orders_run.sh <bronze pipeline id> <silver pipeline id> <workload end, UTC HHMMSS> [profile]
 B=$1; SV=$2; END=$3; PROFILE=${4:-DEFAULT}
 update() {  # pipeline, extra flag, label
   local u s
@@ -22,11 +20,7 @@ update() {  # pipeline, extra flag, label
   [ "$s" = COMPLETED ]
 }
 pair() {  # flag for both, bronze label, silver label: a bronze run, then a silver run
-  if [ "$SV" = - ]; then
-    update $B "$1" "${2/bronze/bronze+silver}"
-  else
-    update $B "$1" "$2" && update $SV "$1" "$3"
-  fi
+  update $B "$1" "$2" && update $SV "$1" "$3"
 }
 pair --full-refresh "bronze full refresh" "silver full refresh" || exit 1
 # The end as a moment, not a time of day: the one nearest the clock, so a run that crosses
