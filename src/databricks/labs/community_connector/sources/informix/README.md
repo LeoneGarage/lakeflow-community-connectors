@@ -1470,7 +1470,10 @@ an object from column name to an expression over that column:
 - **Order:** `row_filter`, the column selection, and the key options see source values;
   `rename_columns` applies after, so a renamed column's transform still uses its source
   name. Change images, deletes, and append-path tombstones are transformed like
-  snapshot rows.
+  snapshot rows. A transform reads a variable-scale `DECIMAL` as it lands under the
+  table's decimal options, as its type above says: under `integer`, `ROUND(vcol, 0)` of
+  12.9 rounds the 12 it lands as, and `HASH` gives 12.1 and 12.9 one digest. A value its
+  type can't hold fails before any transform; land such a column as `string`.
 - **Changing the transforms:** on a running table this fails closed, because rows
   already landed hold the old values. Run a full refresh to apply new ones. After
   dropping a transformed column at the source, take its entry out; that edit needs no

@@ -1535,7 +1535,8 @@ def register_lakeflow_source(spark):
                     if error.code == 409:
                         raise LakebaseStateError(f"conflict on {method} {path}") from error
                     if error.code < 500 and error.code != 429:
-                        detail = error.read().decode("utf-8", "replace")[:400]
+                        # A bounded read: a proxy's error page can be any size.
+                        detail = error.read(4096).decode("utf-8", "replace")[:400]
                         raise WorkspaceHttpError(
                             f"{method} {path} failed with HTTP {error.code}: {detail}",
                             error.code,
@@ -2208,7 +2209,8 @@ def register_lakeflow_source(spark):
                         if self._refreshed(bearer):
                             continue
                     if error.code < 500 and error.code != 429:
-                        detail = error.read().decode("utf-8", "replace")[:400]
+                        # A bounded read: a proxy's error page can be any size.
+                        detail = error.read(4096).decode("utf-8", "replace")[:400]
                         raise WorkspaceHttpError(
                             f"{method} files {volume_path} failed with HTTP {error.code}: {detail}",
                             error.code,
@@ -7193,6 +7195,9 @@ def register_lakeflow_source(spark):
     # Distinguish JSON null (replay the copy-completing range through max_pk) from
     # an absent option (ordinary one-page incremental read).
     _REPLAY_DRAIN_TO_MAX_PK = object()
+    # A replayed range whose end is in the copy before its first chunk (a seed, or a retry yield
+    # of one): the replay copies no chunk. Encoded as {"before_first_chunk": true}.
+    _REPLAY_BEFORE_FIRST_CHUNK = object()
     # Row budget for a bounded replay: the LSN bound is what limits the read, so the
     # budget must not truncate it first. Large rather than None to keep the existing
     # integer comparisons intact.
@@ -7555,6 +7560,12 @@ def register_lakeflow_source(spark):
         advisory_only_end = isinstance(end, dict) and bool(end) and set(end) <= _OFFSET_ADVISORY_FIELDS
         if advisory_only_end and not positional_keys.intersection(start or {}):
             return iter(())
+        if (end or {}).get("handoff_seeded") and not (start or {}).get("handoff_seeded"):
+            # A table.migration cutover seed: it adopted a parked position and emitted no rows.
+            # Replayed as a read from that position, it was taken for the committed seed and
+            # dropped the token, then fell short of the position; after Restore it served the
+            # pages the position names.
+            return iter(())
 
         stop = (end or {}).get("commit_lsn")
         if stop is None:
@@ -7578,7 +7589,12 @@ def register_lakeflow_source(spark):
         )
         # ``null`` is meaningful: the copy finished inside this range, so the replay
         # must drain to max_pk instead of stopping at a cursor.
-        stop_pk = json.dumps(((end or {}).get("incremental") or {}).get("last_pk"))
+        end_copy = (end or {}).get("incremental")
+        if isinstance(end_copy, dict) and end_copy.get("last_pk") is None:
+            # In the copy, with no chunk copied yet: null would drain it to max_pk.
+            stop_pk = json.dumps({"before_first_chunk": True})
+        else:
+            stop_pk = json.dumps((end_copy or {}).get("last_pk"))
         previous = options.get(_REPLAY_STOP_LSN_OPTION)
         previous_pk = options.get(_REPLAY_STOP_PK_OPTION)
         previous_wait_budget = options.get(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION)
@@ -13464,6 +13480,20 @@ def register_lakeflow_source(spark):
                 descriptor, entries, _ = stack.pop()
                 entries.close()
                 os.close(descriptor)
+
+
+    def _is_path(path: str, *, directory: bool = False) -> bool:
+        # Docstring: Whether ``path`` is a regular file (a directory with ``directory``).
+        #
+        # Not os.path.isfile or isdir, which read every OSError as False: a dropped Volume mount
+        # (ENOTCONN) passed for a missing file, and a read the mount retry would have carried
+        # failed for good instead (a snapshot.source with "no .unl files").
+
+        try:
+            mode = os.stat(path).st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        return stat.S_ISDIR(mode) if directory else stat.S_ISREG(mode)
 
 
     def _dropped_mount_error(error: BaseException) -> OSError | None:
@@ -19818,7 +19848,7 @@ def register_lakeflow_source(spark):
                     os.close(candidate_descriptor)
                 os.rename(candidate, target)
             except OSError:
-                if not os.path.isdir(target):
+                if not _is_path(target, directory=True):
                     raise
                 existing = self._read_snapshot_stage_page_record(
                     table, pipeline_scope, schema_id, snapshot_lsn, page_index
@@ -20930,6 +20960,8 @@ def register_lakeflow_source(spark):
             # the cursor ``end`` recorded rather than after one page. ``null`` means
             # the copy finished inside that range, which leaves max_pk as the bound.
             replay_stop_pk = self._replay_stop_pk(options, table.primary_keys)
+            if replay_stop_pk is _REPLAY_BEFORE_FIRST_CHUNK:
+                return [], dict(incremental)
             replaying_chunk = replay_stop_pk is not None
             bound = max_pk
             if replay_stop_pk is not None and replay_stop_pk is not _REPLAY_DRAIN_TO_MAX_PK:
@@ -21075,6 +21107,8 @@ def register_lakeflow_source(spark):
                 raise InformixError(_m(240)) from error
             if decoded is None:
                 return _REPLAY_DRAIN_TO_MAX_PK
+            if decoded == {"before_first_chunk": True}:
+                return _REPLAY_BEFORE_FIRST_CHUNK
             if not isinstance(decoded, list):
                 # 241: Informix replay stop cursor must be a list or null
                 raise InformixError(_m(241))
@@ -23012,9 +23046,7 @@ def register_lakeflow_source(spark):
                 # 260: snapshot.source '{}' for '{}' is not readable
                 raise InformixError(_m(260, source, exposed_name)) from error
             files = [
-                os.path.join(source, name)
-                for name in names
-                if os.path.isfile(os.path.join(source, name))
+                os.path.join(source, name) for name in names if _is_path(os.path.join(source, name))
             ]
             if not files:
                 # 261: snapshot.source '{}' for '{}' contains no .unl files
@@ -24208,7 +24240,7 @@ def register_lakeflow_source(spark):
                 # Both are written atomically, so one that exists is whole.
                 namespace = self._snapshot_stage_namespace_for(native, scope, _CDC_SPILL_SCHEMA)
                 page = f"page-{page_index:08d}"
-                if os.path.isfile(os.path.join(namespace, "runs", run, page, "data.json.gz")):
+                if _is_path(os.path.join(namespace, "runs", run, page, "data.json.gz")):
                     return
                 self._publish_snapshot_stage_page(
                     target, scope, _CDC_SPILL_SCHEMA, run, page_index, records, None

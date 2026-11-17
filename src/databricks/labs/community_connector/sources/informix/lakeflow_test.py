@@ -4254,6 +4254,27 @@ class LakeflowContractTests(unittest.TestCase):
                     [row["value"] for row in rows if row["id"] == 3], ["changed since"]
                 )
 
+    def test_a_dropped_mount_listing_unl_files_reaches_the_retry(self):
+        # os.path.isfile reads every OSError as False: the mount dropping after the listing
+        # made every extract a missing file, and the read failed for good with "no .unl
+        # files" instead of going to the mount retry.
+        source = os.path.join(self._shared_state.name, "extract")
+        os.makedirs(source)
+        with open(os.path.join(source, "orders.unl"), "w", encoding="utf-8") as handle:
+            handle.write("1|a|\n")
+        os.makedirs(os.path.join(source, "nested.unl"))
+        connector = self.connector(FakeBridge())
+        self.assertEqual(
+            connector._list_unl_files(source, "app.orders"), [os.path.join(source, "orders.unl")]
+        )
+        dropped = OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+        with mock.patch.object(informix_module.os, "stat", side_effect=dropped):
+            with self.assertRaises(OSError) as raised:
+                connector._list_unl_files(source, "app.orders")
+        self.assertIsNotNone(informix_module._dropped_mount_error(raised.exception))
+        self.assertFalse(informix_module._is_path(os.path.join(source, "missing.unl")))
+        self.assertTrue(informix_module._is_path(source, directory=True))
+
     def test_a_dropped_mount_reaches_the_retry_rather_than_reading_as_no_progress(self):
         # ENOTCONN read as a missing record discarded a scan's progress, or cut its
         # resume short; it goes to the read's dropped-mount retry instead.
@@ -13136,6 +13157,23 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertTrue(informix_module._resnapshot_range(_stream_offset(90), end))
         self.assertFalse(informix_module._resnapshot_range(_stream_offset(160), end))
 
+    def test_a_range_ending_before_the_first_chunk_copies_none_on_replay(self):
+        # The range's end is in the copy with no chunk copied yet (a retry yield of a seed).
+        # Its stop cursor was null, which drains the copy to max_pk: the replay copied the
+        # table and failed short of the cursor Spark logged. It copies no chunk.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": str(i)} for i in range(1, 6)]
+        options = {"snapshot.mode": "incremental", "snapshot.page.size": "2"}
+        connector = self.connector(bridge)
+        _, first = connector.read_table("app.orders", {}, dict(options))
+        self.assertIn("incremental", first)
+        start = dict(first, incremental={**first["incremental"], "last_pk": None})
+        end = dict(start, capacity_retry_count=1)
+
+        replayed = list(connector._replay_embedded_range("app.orders", start, end, dict(options)))
+
+        self.assertEqual(replayed, [])
+
     def test_a_copy_finished_in_its_first_batch_replays_to_its_bound(self):
         # The copy fitted one chunk, so its first batch finished it and neither offset
         # carries a copy block. Rows were inserted below the bound before the replay: it
@@ -13447,6 +13485,42 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(done["phase"], "stream")
         self.assertNotIn("stage_scope", done)  # dropped at the transition
         self.assertEqual(done["pipeline_scope"], seed["pipeline_scope"])
+
+    def test_a_replayed_cutover_seed_emits_nothing_and_keeps_the_token(self):
+        # The seed of a table parked mid-snapshot was replayed before Spark committed it.
+        # Served from page 0 of the position it names, the replay was taken for the
+        # committed seed and dropped the token, then failed short of the parked page; with
+        # table.migration cleared first, it served pages. A seed emits no rows, replayed too.
+        for migrating in (True, False):
+            with self.subTest(migrating=migrating):
+                bridge = FakeBridge()
+                old = self.connector(
+                    bridge, registration_scope=f"old-{migrating}", **{"snapshot.page.size": "1"}
+                )
+                _, mid = old.read_table("app.orders", {}, {})
+                old.read_table("app.orders", mid, {"table.migration": "true"})
+                new = self.connector(
+                    bridge, registration_scope=f"new-{migrating}", **{"snapshot.page.size": "1"}
+                )
+                _, seed = new.read_table("app.orders", {}, {"table.migration": "true"})
+                self.assertTrue(seed["handoff_seeded"])
+                options = {"table.migration": "true"} if migrating else {}
+
+                replayed = list(
+                    informix_module._replay_between_offsets(
+                        {},
+                        seed,
+                        lambda offset, options=options: new.read_table(
+                            "app.orders", offset, options
+                        ),
+                        options,
+                        new.options,
+                    )
+                )
+
+                self.assertEqual(replayed, [])
+                self.assertEqual(len(self._lakebase.database.handoff), 1)
+                self._lakebase.database.handoff.clear()
 
     def test_handoff_reads_skip_obsolete_scope_cleanup(self):
         # In production, obsolete-scope cleanup runs real SQL. On a same-pipeline

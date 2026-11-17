@@ -253,7 +253,8 @@ class _WorkspaceApi:
                 if error.code == 409:
                     raise LakebaseStateError(f"conflict on {method} {path}") from error
                 if error.code < 500 and error.code != 429:
-                    detail = error.read().decode("utf-8", "replace")[:400]
+                    # A bounded read: a proxy's error page can be any size.
+                    detail = error.read(4096).decode("utf-8", "replace")[:400]
                     raise WorkspaceHttpError(
                         f"{method} {path} failed with HTTP {error.code}: {detail}",
                         error.code,
@@ -926,7 +927,8 @@ class WorkspaceFilesApi:
                     if self._refreshed(bearer):
                         continue
                 if error.code < 500 and error.code != 429:
-                    detail = error.read().decode("utf-8", "replace")[:400]
+                    # A bounded read: a proxy's error page can be any size.
+                    detail = error.read(4096).decode("utf-8", "replace")[:400]
                     raise WorkspaceHttpError(
                         f"{method} files {volume_path} failed with HTTP {error.code}: {detail}",
                         error.code,
