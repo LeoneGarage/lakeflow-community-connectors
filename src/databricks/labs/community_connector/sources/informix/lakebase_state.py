@@ -76,6 +76,7 @@ what the public shape suggests:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.client
 import json
@@ -1663,6 +1664,7 @@ class LakebaseState:
         # was never swept. One on a third name is left alone, as unreadable.
 
         failure: Exception | None = None
+        read = False
         for database in dict.fromkeys((self._database, _DEFAULT_DATABASE)):
             try:
                 connection = self._state_database(facts, token, database)
@@ -1671,7 +1673,11 @@ class LakebaseState:
                 continue
             if connection is not None:
                 return connection, database
-        if failure is not None:
+            read = True
+        # A failure counts only where no database could be read: one read and found to hold
+        # no state (a project of another kind, its state in a third) is no error, and
+        # raised, warned on every sweep.
+        if failure is not None and not read:
             raise failure
         return None, None
 
@@ -1690,7 +1696,13 @@ class LakebaseState:
                 found = bool(cursor.fetchone()[0])
             connection.commit()
         except Exception:  # pylint: disable=broad-except
-            connection.rollback()
+            try:
+                connection.rollback()
+            except Exception:
+                # A connection that dropped mid-query: closed, not left open.
+                with contextlib.suppress(Exception):
+                    connection.close()
+                raise
             return connection
         if found:
             return connection

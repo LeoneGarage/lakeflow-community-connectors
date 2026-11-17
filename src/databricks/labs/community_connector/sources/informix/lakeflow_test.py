@@ -12,6 +12,7 @@ import glob
 import gzip
 import hashlib
 import hmac
+import io
 import importlib
 import json
 import logging
@@ -30,6 +31,8 @@ import time
 import traceback
 import types
 import unittest
+import urllib.error
+import urllib.request
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -1809,15 +1812,49 @@ class LakeflowContractTests(unittest.TestCase):
         )
         # Registered again in the same process too, as a driver kept between updates does:
         # the second registration's pickle carried the first one's reader wrapper, its
-        # hooks and what they close over, ~13 KB more, and passed the limit.
-        sizes = []
-        for _ in range(2):
-            registry = mock.Mock()
-            generated.register_lakeflow_source(types.SimpleNamespace(dataSource=registry))
-            sizes.append(len(cloudpickle.dumps(registry.register.call_args.args[0])))
+        # hooks and what they close over, ~13 KB more, and passed the limit. And as a
+        # serverless driver registers: under a pipeline and update, with the workspace
+        # credential it captures, which the pickle carries (an OAuth token of 1-2 KB). A
+        # bare registration measured without them, and passed by 643 bytes.
+        conf = {
+            "spark.pipelines.pipelineId": str(uuid.UUID(int=1)),
+            "spark.pipelines.updateId": str(uuid.UUID(int=2)),
+        }
 
-        self.assertLess(max(sizes), 1 << 20)
-        self.assertLess(abs(sizes[1] - sizes[0]), 1024)
+        class Config:
+            host = "https://dbc-00000000-0000.cloud.databricks.invalid"
+
+            @staticmethod
+            def authenticate():
+                return {"Authorization": "Bearer " + "e" * 2048}
+
+        def no_such_update(*_, **__):
+            # The update lookup the registration makes, answered at once.
+            raise urllib.error.HTTPError("update", 404, "Not Found", {}, io.BytesIO(b""))
+
+        sdk = types.ModuleType("databricks.sdk")
+        sdk.WorkspaceClient = lambda *_, **__: types.SimpleNamespace(config=Config())
+        sizes = []
+        with (
+            mock.patch.dict(os.environ, {"DATABRICKS_RUNTIME_VERSION": "16.4"}),
+            mock.patch.dict(sys.modules, {"databricks.sdk": sdk}),
+            mock.patch.object(urllib.request, "urlopen", no_such_update),
+        ):
+            for _ in range(2):
+                registry = mock.Mock()
+                session = types.SimpleNamespace(
+                    dataSource=registry,
+                    conf=types.SimpleNamespace(
+                        get=lambda key, default=None: conf.get(key, default)
+                    ),
+                )
+                generated.register_lakeflow_source(session)
+                sizes.append(len(cloudpickle.dumps(registry.register.call_args.args[0])))
+
+        # Room for a longer token or host than these, and the next change. A later
+        # registration may not grow (the first one carries a little more).
+        self.assertLess(max(sizes), (1 << 20) - 4096)
+        self.assertLess(sizes[1] - sizes[0], 1024)
 
     def test_generated_source_drops_the_merge_prefix_and_annotations(self):
         # The merge nests the connector inside register_lakeflow_source, and the end of
@@ -1858,6 +1895,16 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(shape_delete.__annotations__, {})
         self.assertEqual(table.__qualname__, "Table")
         self.assertEqual(table.parse.__qualname__, "Table.parse")
+        # A docstring has two copies, the function's __doc__ and its code's first constant;
+        # both go (the framework's interface methods held some 15 KB of them).
+        interface = next(
+            base
+            for base in reached["InformixLakeflowConnect"].__mro__
+            if base.__name__ == "LakeflowConnect"
+        )
+        read_table = vars(interface)["read_table"]
+        self.assertIsNone(read_table.__doc__)
+        self.assertIsNone(read_table.__code__.co_consts[0])
         # Only the Spark data source wrapper, merged after informix.py, keeps the prefix.
         with open(generated.__file__, encoding="utf-8") as handle:
             wrapper_line = next(
@@ -7734,6 +7781,36 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(rows, [{"id": 1}])
         self.assertEqual(bridge.transport.maximum, 1234)
+
+    def test_a_tables_snapshot_max_bytes_bounds_its_pages_over_the_connections(self):
+        # The incremental copy's chunks were read with no limit of their own, so the
+        # bridge took the connection's and a table's snapshot.max.bytes went unused; and
+        # a blocking snapshot passed a table's 0 (no limit) as None, which took the
+        # connection's limit the table had turned off.
+        bridge = FakeBridge()
+        connector = self.connector(
+            bridge, **{"snapshot.mode": "incremental", "snapshot.max.bytes": "1234"}
+        )
+        connector.read_table("app.orders", {}, {"snapshot.max.bytes": "99999"})
+        self.assertEqual(set(bridge.snapshot_max_bytes), {99999})
+
+        class SnapshotTransport:
+            maximum = "unset"
+
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                self.maximum = max_result_bytes
+                return [{"id": 1}]
+
+        live = object.__new__(PurePythonInformixBridge)
+        live.options = {"snapshot.max.bytes": "1234"}
+        live.transport = SnapshotTransport()
+        live._repeatable_read_transaction = lambda isolation: contextlib.nullcontext()
+        live.boundary_lsn = lambda: 5
+
+        _, rows = live.consistent_snapshot("demo.app.orders", ["id"], ["id"], 10, 0, 0)
+
+        self.assertEqual(rows, [{"id": 1}])
+        self.assertIsNone(live.transport.maximum)
 
     def test_snapshot_page_composite_key_carries_first_rows_directive(self):
         # tw305's shape: a two-column key paged by the OR-form keyset. The
@@ -23152,6 +23229,38 @@ class HostShardRetireRaceTests(unittest.TestCase):
                 self.KEY in informix_module._SHARED_CDC_SHARDS, self.KEY in endpoints.leading
             )
 
+    def test_a_given_up_shard_retiring_later_leaves_a_newer_lead_alone(self):
+        # A shard given up leaves the registry and its thread idles out. Retiring then, it
+        # gave up the key's lead whatever shard held it: the one this process had led the
+        # key with again since.
+        directory = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(shutil.rmtree, directory, True)
+        endpoints = informix_module._HostShardEndpoints(directory)
+
+        def cleanup():
+            informix_module._SHARED_CDC_SHARDS.pop(self.KEY, None)
+            informix_module._SHARED_CDC_THREADS.pop(self.KEY, None)
+            informix_module._host_shard_stop_leading(endpoints, self.KEY)
+
+        self.addCleanup(cleanup)
+        with (
+            mock.patch.object(informix_module, "_HOST_SHARD_ENDPOINTS", endpoints),
+            mock.patch.object(informix_module, "_run_shared_cdc_shard", lambda *_: None),
+        ):
+            self.assertTrue(
+                informix_module._host_shard_try_lead(endpoints, self.KEY, lambda: None, self.CONFIG)
+            )
+            given_up = informix_module._SHARED_CDC_SHARDS.pop(self.KEY)
+            informix_module._host_shard_stop_leading(endpoints, self.KEY)
+            self.assertTrue(
+                informix_module._host_shard_try_lead(endpoints, self.KEY, lambda: None, self.CONFIG)
+            )
+
+            self.assertTrue(informix_module._retire_shared_cdc_shard(self.KEY, given_up))
+
+            self.assertIn(self.KEY, endpoints.leading)
+            self.assertIsNot(informix_module._SHARED_CDC_SHARDS[self.KEY], given_up)
+
 
 class HostSharedCdcTests(unittest.TestCase):
     """cdc.shared.session=host (the default): the flow processes on one host share each
@@ -23623,11 +23732,17 @@ class HostSharedCdcTests(unittest.TestCase):
             self.assertLogs(informix_module.__name__, level="WARNING") as logs,
         ):
             informix_module._host_shard_accept(leader, self.KEY, broken, b"k")
+            # The shard goes with the lead. Kept, it read on for the leader's own
+            # subscriber, which no poll of this process reads any more, beside the
+            # successor's session until the TTL.
+            self.assertNotIn(self.KEY, informix_module._SHARED_CDC_SHARDS)
         self.assertIn("gave up", logs.output[-1])
         self.assertEqual(broken.accept.call_count, informix_module._HOST_SHARD_ACCEPT_FAILURES)
         self.assertNotIn(self.KEY, leader.leading)
-        # Only the leader's own subscriber is left; the successor reads the follower's.
-        self.assertEqual(set(self.shard.subscribers), {self.identity})
+        self.assertEqual(self.shard.subscribers, {})
+        # Its files went before its lock, as when it stops leading.
+        _lock_path, socket_path, key_path = leader.paths(self.KEY)
+        self.assertFalse(os.path.exists(socket_path) or os.path.exists(key_path))
         successor = self.process()
         self.poll(successor)
         self.assertIn(self.KEY, successor.leading)
@@ -24361,6 +24476,45 @@ class SnapshotDrainPoolTests(unittest.TestCase):
         self.assertEqual(calls["read"], ("T", None, "scope", True))
         self.assertEqual(calls["scope_at_read"], "scope")
         self.assertTrue(calls["closed"])
+
+    def test_each_drain_job_runs_on_a_reader_of_the_flow_that_submitted_it(self):
+        # The pool kept the first flow's reader factory, and every later job ran on a reader
+        # built from that flow's options, its table configuration included: a table that
+        # left an option unset took the first flow's value of it.
+        pool = _SnapshotDrainPool()
+        built = []
+
+        def factory(name):
+            class _Reader:
+                def set_registration_scope(self, scope):
+                    pass
+
+                def _read_snapshot(self, table, *args, **kwargs):
+                    built.append((name, table))
+
+                def close(self):
+                    pass
+
+            return _Reader
+
+        pool.configure(reader_factory=factory("first"), thread_count=1)
+        pool.configure(reader_factory=factory("second"), thread_count=1)
+        worker = threading.Thread(
+            target=informix_module._run_snapshot_drain_worker, args=(pool,), daemon=True
+        )
+        worker.start()
+        for key, name in ((("a",), "first"), (("b",), "second")):
+            pool.submit(
+                key,
+                table=name,
+                options={},
+                pipeline_scope="scope",
+                allow_keyless=False,
+                reader_factory=factory(name),
+            )
+            self.assertTrue(pool.wait(key, 2.0))
+
+        self.assertEqual(built, [("first", "first"), ("second", "second")])
 
     def test_worker_of_a_scan_taken_up_runs_as_the_consumers_update(self):
         # A scan taken up from an earlier update is staged under that update's scope, but
@@ -26398,6 +26552,51 @@ class UnloadHelperTests(unittest.TestCase):
                     )
                     self.assertEqual((result["missing_rows"], result["extra_rows"]), (missing, 0))
 
+    def test_the_ansi_live_test_connects_first_and_gives_its_slot_back(self):
+        # Its first query went to a transport the bridge had not opened (session is not
+        # open), and its teardown closed the transport alone, leaving the Lakebase slot
+        # held and its heartbeat renewing it until the test process exited.
+        from databricks.labs.community_connector.sources.informix import ansi_live_test as live
+
+        calls, bridges = [], []
+
+        class Bridge:
+            def __init__(self, options):
+                del options
+                self.transport = mock.Mock()
+                self.transport.execute.side_effect = lambda *_: (
+                    calls.append("execute") or [{"is_ansi": 1}]
+                )
+                self._lakebase_conn = self.state = mock.Mock()
+                bridges.append(self)
+
+            def _ensure_connected(self):
+                calls.append("connect")
+
+            def get_table(self, identity):
+                del identity
+                return {"columns": [{"name": "id"}], "primary_keys": ["id"]}
+
+            def consistent_snapshot(self, *_):
+                return 1, []
+
+            def release_connection(self):
+                calls.append("release")
+
+        options = {"ansi.live.validation": "true", "ansi.test.table": "app.orders", "database": "d"}
+        with (
+            mock.patch.object(live, "_live_config", return_value=options),
+            mock.patch.object(informix_module, "PurePythonInformixBridge", Bridge),
+        ):
+            result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(
+                live.AnsiSnapshotLiveTest("test_repeatable_read_snapshot_on_live_ansi_database")
+            )
+
+        self.assertTrue(result.wasSuccessful(), result.failures + result.errors)
+        self.assertEqual(calls, ["connect", "execute", "release"])
+        self.assertIsNone(bridges[0]._lakebase_conn)
+        bridges[0].state.close.assert_called_once()
+
     def test_the_count_compare_counts_a_whole_row_keyed_table_by_distinct_rows(self):
         # The cycles' count compare counted every row of a table keyed on the whole row,
         # whose destination holds each distinct row once: a row written twice at the source
@@ -28201,7 +28400,12 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
             ("incremental", FakeBridge(), {"snapshot.source": source}, "snapshot.mode=incremental"),
             ("auto_snapshot", FakeBridge(), {"snapshot.source": source}, "auto_snapshot takes"),
             ("cdc_only", FakeBridge(), {"snapshot.source": source}, "cdc_only takes no"),
-            (None, keyless, {"snapshot.source": source}, "cdc_only, an append-only table.s default"),
+            (
+                None,
+                keyless,
+                {"snapshot.source": source},
+                "cdc_only, an append-only table.s default",
+            ),
             ("cdc_only", keyless, {"snapshot.source": source}, "cdc_only, an append-only"),
             ("initial", FakeBridge(), {"snapshot.boundary.lsn": "50"}, "has no snapshot.source"),
         )
@@ -28225,6 +28429,31 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
         # A boundary for the connection's extract.
         connector = self.connector(FakeBridge(), **{"snapshot.source": source})
         connector.read_table_metadata("app.orders", {"snapshot.boundary.lsn": "50"})
+
+    def test_a_staged_snapshot_beside_a_connection_extract_serves_its_own_pages(self):
+        # incremental's blocking fallback (a cursor scan here) stages several pages of the
+        # live table. Its next batch's offset, phase snapshot, read as a split window of
+        # the connection's extract: the window past the extract's one split ended the
+        # snapshot, and the staged pages after the first were never served.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 6)]
+        connector = self._partitioned_connector(
+            bridge,
+            **{
+                "snapshot.source": self._source("7|from-the-extract|\n"),
+                "snapshot.mode": "incremental",
+                "keyless.snapshot.page.size": "1",
+                "stream.partitioned.snapshot.pages.per.batch": "1",
+            },
+        )
+
+        served, offsets = self._drive_partitioned_snapshot(
+            connector, options={"snapshot.scan": "cursor"}
+        )
+
+        self.assertEqual(sorted(row["id"] for row in served), [1, 2, 3, 4, 5])
+        self.assertEqual(offsets[-1]["phase"], "stream")
+        self.assertGreater(len(offsets), 2)
 
     def test_a_fallback_snapshot_of_another_mode_reads_the_table_not_the_extract(self):
         # With snapshot.source on the connection, incremental's blocking fallback (a cursor

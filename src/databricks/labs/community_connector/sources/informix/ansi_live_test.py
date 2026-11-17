@@ -41,6 +41,18 @@ def _live_config() -> dict[str, str]:
     return {str(key): str(item) for key, item in value.items()}
 
 
+def _close_bridge(bridge) -> None:
+    """Close a bridge's SQLI session and give its Lakebase slot back, which stops the
+    slot's heartbeat, then close its state connection. Closing the transport alone left
+    the slot held and renewed until the test process exited."""
+    try:
+        bridge.release_connection()
+    finally:
+        connection, bridge._lakebase_conn = getattr(bridge, "_lakebase_conn", None), None
+        if connection is not None:
+            connection.close()
+
+
 class AnsiSnapshotLiveTest(unittest.TestCase):
     """Run only when the supplied configuration explicitly opts into ANSI validation."""
 
@@ -61,6 +73,9 @@ class AnsiSnapshotLiveTest(unittest.TestCase):
 
         bridge = PurePythonInformixBridge(options)
         try:
+            # The query below goes straight to the transport, which the bridge only opens
+            # on its first own operation.
+            bridge._ensure_connected()
             ansi_rows = bridge.transport.execute(
                 "SELECT is_ansi FROM sysmaster:sysdatabases WHERE name = ?",
                 # sysmaster holds the name folded to lower case.
@@ -82,7 +97,7 @@ class AnsiSnapshotLiveTest(unittest.TestCase):
             )
             self.assertIsInstance(rows, list)
         finally:
-            bridge.transport.close()
+            _close_bridge(bridge)
 
 
 class ScalarTypesLiveTest(unittest.TestCase):
@@ -156,7 +171,7 @@ class ScalarTypesLiveTest(unittest.TestCase):
                 self._assert_scalar_types(padded_row, scalar_columns, expected)
             if self._database_is_ansi(padded_bridge):
                 padded_bridge.transport.execute_command("COMMIT WORK")
-            padded_bridge.transport.close()
+            _close_bridge(padded_bridge)
             padded_bridge = None
             if self._database_is_ansi(bridge):
                 bridge.transport.execute_command("COMMIT WORK")
@@ -227,16 +242,16 @@ class ScalarTypesLiveTest(unittest.TestCase):
                 except Exception as error:
                     cleanup_errors.append(error)
                 try:
-                    writer.transport.close()
+                    _close_bridge(writer)
                 except Exception as error:
                     cleanup_errors.append(error)
             try:
-                bridge.transport.close()
+                _close_bridge(bridge)
             except Exception as error:
                 cleanup_errors.append(error)
             if padded_bridge is not None:
                 try:
-                    padded_bridge.transport.close()
+                    _close_bridge(padded_bridge)
                 except Exception as error:
                     cleanup_errors.append(error)
             if cleanup_errors and primary_error is None:

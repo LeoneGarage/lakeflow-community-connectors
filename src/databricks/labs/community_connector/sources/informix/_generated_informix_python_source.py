@@ -75,6 +75,7 @@ import bisect
 import codecs
 import concurrent.futures
 import contextlib
+import dis
 import errno
 import fnmatch
 import gzip
@@ -2940,6 +2941,7 @@ def register_lakeflow_source(spark):
             # was never swept. One on a third name is left alone, as unreadable.
 
             failure: Exception | None = None
+            read = False
             for database in dict.fromkeys((self._database, _DEFAULT_DATABASE)):
                 try:
                     connection = self._state_database(facts, token, database)
@@ -2948,7 +2950,11 @@ def register_lakeflow_source(spark):
                     continue
                 if connection is not None:
                     return connection, database
-            if failure is not None:
+                read = True
+            # A failure counts only where no database could be read: one read and found to hold
+            # no state (a project of another kind, its state in a third) is no error, and
+            # raised, warned on every sweep.
+            if failure is not None and not read:
                 raise failure
             return None, None
 
@@ -2967,7 +2973,13 @@ def register_lakeflow_source(spark):
                     found = bool(cursor.fetchone()[0])
                 connection.commit()
             except Exception:  # pylint: disable=broad-except
-                connection.rollback()
+                try:
+                    connection.rollback()
+                except Exception:
+                    # A connection that dropped mid-query: closed, not left open.
+                    with contextlib.suppress(Exception):
+                        connection.close()
+                    raise
                 return connection
             if found:
                 return connection
@@ -10785,7 +10797,9 @@ def register_lakeflow_source(spark):
                         primary_keys,
                         after,
                         page_capacity + 1,
-                        remaining_bytes,
+                        # 0, no limit: None would take the connection's, which a table's
+                        # snapshot.max.bytes=0 turned off.
+                        0 if remaining_bytes is None else remaining_bytes,
                         snapshot_filter=snapshot_filter,
                         # The key index's own directions, so that it serves each page's order.
                         **({"key_descending": list(key_descending)} if key_descending else {}),
@@ -15167,19 +15181,25 @@ def register_lakeflow_source(spark):
                 if failures < _HOST_SHARD_ACCEPT_FAILURES:
                     time.sleep(min(5.0, 0.05 * 2**failures))
                     continue
-                with endpoints.lock:
-                    leading = endpoints.leading.pop(key, None)
-                if leading is not None:
-                    with contextlib.suppress(OSError):
-                        leading["listener"].close()
-                    os.close(leading["lock_fd"])
-                    # The successor reads the followers' tables now; keep only this
-                    # process's own subscribers rather than reading them twice until the TTL.
-                    shard = _SHARED_CDC_SHARDS.get(key)
-                    for identity in list(leading["remote"]) if shard is not None else ():
+                # The shard goes with the lead, as an idle one retires: no poll of this
+                # process reads a shard it does not lead (_host_shard_own_poll), its own
+                # included. Kept, it read on for its own subscriber, a second session beside
+                # the successor's, until the TTL; its socket and key files outlived the lock.
+                with endpoints.lock, _shared_cdc_registry_lock():
+                    shard = None
+                    if key in endpoints.leading:
+                        shard = _SHARED_CDC_SHARDS.pop(key, None)
+                        _SHARED_CDC_THREADS.pop(key, None)
+                        _host_shard_stop_leading(endpoints, key, locked=True)
+                        # 145: Process {} gave up host-shared CDC shard {}-{}
+                        logging.getLogger(__name__).warning(_m(145, os.getpid(), key[-2], key[-1]))
+                if shard is not None:
+                    # Its thread then finds no subscriber and lets its session go. Each
+                    # subscriber takes up from its checkpoint, as after a restart.
+                    with shard.condition:
+                        identities = list(shard.subscribers)
+                    for identity in identities:
                         shard.evict(identity)
-                    # 145: Process {} gave up host-shared CDC shard {}-{}
-                    logging.getLogger(__name__).warning(_m(145, os.getpid(), key[-2], key[-1]))
                 return
             failures = 0
             if key not in endpoints.leading:
@@ -15577,6 +15597,8 @@ def register_lakeflow_source(spark):
         # endpoints lock first, as _host_shard_own_poll takes it: a poll that found this
         # process leading between the two made a new shard and thread here, while another
         # process took the lock and led the shard too.
+        # A shard already out of the registry (given up, see _host_shard_accept) leaves the
+        # lead alone: it is a newer shard's, if this process leads the key again.
         endpoints = _HOST_SHARD_ENDPOINTS
         with endpoints.lock, _shared_cdc_registry_lock():
             with shard.condition:
@@ -15585,7 +15607,7 @@ def register_lakeflow_source(spark):
             if _SHARED_CDC_SHARDS.get(key) is shard:
                 _SHARED_CDC_SHARDS.pop(key, None)
                 _SHARED_CDC_THREADS.pop(key, None)
-            _host_shard_stop_leading(endpoints, key, locked=True)
+                _host_shard_stop_leading(endpoints, key, locked=True)
         return True
 
 
@@ -15736,7 +15758,15 @@ def register_lakeflow_source(spark):
                 self.thread_count = thread_count
 
         def submit(
-            self, job_key, *, table, options, pipeline_scope, allow_keyless, registration_scope=None
+            self,
+            job_key,
+            *,
+            table,
+            options,
+            pipeline_scope,
+            allow_keyless,
+            registration_scope=None,
+            reader_factory=None,
         ):
             # ``pipeline_scope`` is where the snapshot is staged. ``registration_scope`` is the
             # update the consumer runs in, when that is another: a scan taken up from an
@@ -15752,6 +15782,9 @@ def register_lakeflow_source(spark):
                         "pipeline_scope": pipeline_scope,
                         "registration_scope": registration_scope or pipeline_scope,
                         "allow_keyless": allow_keyless,
+                        # The submitting flow's own: its options (a flow's carry its table's
+                        # configuration) are the worker's fallback for the job's.
+                        "reader_factory": reader_factory,
                     }
                     self.queue.append(job_key)
                     self.pending.add(job_key)
@@ -15908,7 +15941,7 @@ def register_lakeflow_source(spark):
                     continue
                 job_key = pool.queue.popleft()
                 job = pool.jobs.get(job_key)
-                factory = pool.reader_factory
+                factory = (job or {}).get("reader_factory") or pool.reader_factory
             # Mark the job running (so its waiter switches from pool-wide to own-progress
             # liveness) and reset the idle clock: startup (slot acquisition + first page) gets
             # a fresh window, and every still-queued job sees this pickup as pool progress.
@@ -17477,7 +17510,7 @@ def register_lakeflow_source(spark):
             # for a delete reader would take a slot its upsert reader may need. A dropped Volume
             # mount is retried in place (_plan_with_mount_retry).
 
-            unl = self._unl_snapshot_serve(table_options, effective_start)
+            unl = self._unl_snapshot_serve(table_options, effective_start, table_name)
             if not unl and (
                 self._is_delete_flow()
                 or not effective_start
@@ -17692,7 +17725,7 @@ def register_lakeflow_source(spark):
             # Volume and Lakebase, so a dropped mount is retried in place. The embedded replay in
             # get_partitions stays outside, as a real read that handles the mount itself.
 
-            if self._unl_snapshot_serve(table_options, effective_start):
+            if self._unl_snapshot_serve(table_options, effective_start, table.identity):
                 # File source: fan this microbatch's split window across executors -- one
                 # unl_split descriptor per byte split in [start_split, start_split+window). The
                 # boundary was pinned by latest_offset; take snapshot_lsn from end_offset and
@@ -21420,6 +21453,8 @@ def register_lakeflow_source(spark):
                         list(table.primary_keys),
                         cursor,
                         page_size + 1,
+                        # The table's limit: left out, the bridge took the connection's.
+                        max_bytes=self._table_int_option(options, "snapshot.max.bytes", 0, minimum=0),
                         chunk_exprs=chunk_exprs or None,
                         snapshot_filter=_snapshot_predicate(incremental.get("snapshot_filter"), table),
                         key_descending=list(table.key_descending),
@@ -23449,7 +23484,9 @@ def register_lakeflow_source(spark):
                 raise ValueError(_m(259, _UNL_DELIMITER_OPTION, _UNL_ESCAPE_OPTION))
             return delimiter, escape
 
-        def _unl_snapshot_serve(self, table_options: dict[str, str], effective_start: dict) -> bool:
+        def _unl_snapshot_serve(
+            self, table_options: dict[str, str], effective_start: dict, table_name: str | None = None
+        ) -> bool:
             # Docstring: Whether this read belongs to a file-source initial snapshot's split serve.
             #
             # The single gate the partitioned ``latest_offset``/``get_partitions`` branches
@@ -23471,8 +23508,41 @@ def register_lakeflow_source(spark):
             if not effective_start:
                 return self._snapshot_mode(table_options) in _UNL_SNAPSHOT_MODES
             # A serve part-way through finishes as a staged one does, whatever snapshot.mode
-            # says now: the mode chooses how a snapshot starts.
-            return effective_start.get("phase") == "snapshot"
+            # says now: the mode chooses how a snapshot starts. A staged snapshot's offset is
+            # no split window: one a connection-scope extract was set or added beside (another
+            # mode's, or a fallback's) took its next page for a split, and lost the pages left
+            # or served the extract's rows into the table.
+            return effective_start.get("phase") == "snapshot" and not (
+                table_name is not None
+                and self._staged_snapshot_offset(table_name, table_options, effective_start)
+            )
+
+        def _staged_snapshot_offset(
+            self, table_name: str, table_options: dict[str, str], offset: dict
+        ) -> bool:
+            # Docstring: Whether a snapshot-phase offset is a staged snapshot's, told by the page
+            # manifest the snapshot publishes before it serves its first page; read without
+            # opening Informix (see _delete_floor_recorded).
+
+            identity = self._native_table_state_identity(
+                table_options.get("qualified_source_table", table_name)
+            )
+            if identity is None:
+                return False
+            checkpoint = _validated_offset(offset)
+            key = "/".join(
+                (
+                    identity[1],
+                    identity[2],
+                    "snapshot-page-manifest",
+                    self._offset_scopes(checkpoint)[1],
+                    str(checkpoint["schema_id"]),
+                )
+            )
+            cache = self.__dict__.setdefault("_staged_snapshot_offsets", {})
+            if key not in cache:
+                cache[key] = self._read_immutable_head(key) is not None
+            return cache[key]
 
         def _list_unl_files(self, source: str, exposed_name: str) -> list[str]:
             # Docstring: Sorted `.unl`/`.unl.gz` files under ``source`` (listing/stat only -- no content
@@ -25158,9 +25228,10 @@ def register_lakeflow_source(spark):
             # This update's pool, with its one budget of drains, whichever update's scope the
             # snapshot is staged under.
             registration_scope = self._pipeline_scope()
+            factory = self._snapshot_drain_reader_factory()
             pool = _snapshot_drain_pool(
                 (namespace, registration_scope),
-                reader_factory=self._snapshot_drain_reader_factory(),
+                reader_factory=factory,
                 thread_count=self._snapshot_reader_thread_count(),
             )
             job_key = (namespace, pipeline_scope, table.native_identity, schema_id)
@@ -25171,6 +25242,9 @@ def register_lakeflow_source(spark):
                 pipeline_scope=pipeline_scope,
                 allow_keyless=allow_keyless,
                 registration_scope=registration_scope,
+                # Not the pool's, the first flow's to ask: a worker built from another flow's
+                # options read a table this one left unset with that flow's setting.
+                reader_factory=factory,
             )
             # The wait is a liveness watchdog, not a total-duration cap: it trips only after
             # the worker reports no progress for a whole ``connection.wait.timeout.seconds``
@@ -30473,7 +30547,22 @@ def register_lakeflow_source(spark):
                     visit(accessor)
             elif isinstance(value, types.FunctionType):
                 if prefix in value.__qualname__ or prefix in getattr(value.__code__, "co_qualname", ""):
-                    value.__code__ = shorten(value.__code__)
+                    code = shorten(value.__code__)
+                    # The docstring's other copy, the code's first constant, unless the body
+                    # loads that constant itself. Replaced after shorten, which keys its cache by
+                    # the id of a code object the merged source keeps: a copy made before it was
+                    # freed at once, and its id, reused, handed another function's code back.
+                    if (
+                        value.__doc__ is not None
+                        and code.co_consts
+                        and code.co_consts[0] == value.__doc__
+                        and not any(
+                            ins.opcode in dis.hasconst and ins.arg == 0
+                            for ins in dis.get_instructions(code)
+                        )
+                    ):
+                        code = code.replace(co_consts=(None, *code.co_consts[1:]))
+                    value.__code__ = code
                     value.__qualname__ = value.__qualname__.removeprefix(prefix)
                     value.__annotations__ = {}
                     value.__doc__ = None

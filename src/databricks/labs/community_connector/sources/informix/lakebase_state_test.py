@@ -1731,6 +1731,33 @@ class LakebaseProjectNamingTests(unittest.TestCase):
                     self.assertEqual(state.collect_unused_projects(90, 24), deleted)
                 self.assertEqual(opened, ["custom", "databricks_postgres"])
 
+    def test_a_project_without_connector_state_is_left_quietly(self):
+        # A sweeping connection on a custom lakebase.database, which another server's
+        # project lacks, then read its default database and found no state: the failed open
+        # was raised, a warning for every such project on every sweep. And a probe whose
+        # connection dropped mid-query left it open when the rollback failed too.
+        state = lakebase_state.LakebaseState({"lakebase.database": "custom"}, "current")
+        state._admin_user = mock.Mock(return_value="admin")
+        clean = mock.MagicMock()
+        clean.cursor.return_value.__enter__.return_value.fetchone.return_value = (0,)
+
+        def open_database(facts, user, token, database=None):
+            if database == "custom":
+                raise RuntimeError('database "custom" does not exist')
+            return clean
+
+        state._open = open_database
+        self.assertEqual(state._open_state_database({"host": "h"}, "token"), (None, None))
+        clean.close.assert_called_once()
+
+        dropped = mock.MagicMock()
+        dropped.cursor.return_value.__enter__.return_value.execute.side_effect = OSError("gone")
+        dropped.rollback.side_effect = OSError("gone")
+        state._open = mock.Mock(return_value=dropped)
+        with self.assertRaises(OSError):
+            state._state_database({"host": "h"}, "token", "databricks_postgres")
+        dropped.close.assert_called_once()
+
     def test_a_project_another_of_whose_databases_holds_state_is_kept(self):
         # A project is named by the server alone. Its connections moved to a custom
         # lakebase.database and left the default one's records behind: judged by those,
