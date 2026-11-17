@@ -933,7 +933,17 @@ class WorkspaceFilesApi:
         last_error: Exception | None = None
         refreshed = False
         for attempt in range(_FILES_API_ATTEMPTS):
-            bearer = self._credential.bearer()
+            try:
+                bearer = self._credential.bearer()
+            except Exception as error:
+                if not getattr(self._credential, "rejected", False):
+                    raise
+                # Another request's refresh failed and dropped the token, and a new one
+                # can't be had either (token creation disabled): the 401 that request
+                # reported, so the caller falls back as it does, not fails the read.
+                raise WorkspaceHttpError(
+                    f"{method} files {volume_path}: the staging token was rejected", 401
+                ) from error
             headers = {"Authorization": f"Bearer {bearer}"}
             if byte_range is not None:
                 # Inclusive, zero-based per RFC 9110; the Files API answers 206.

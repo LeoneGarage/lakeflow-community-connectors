@@ -216,7 +216,7 @@
 "The snapshot-staging token was rejected and can't be replaced; snapshot staging uses the FUSE transport from now on",
 "Personal access token creation is unavailable; snapshot staging uses the FUSE transport",
 "The credential that mints the snapshot-staging token was rejected; snapshot staging uses the FUSE transport",
-"Staged snapshot page {} for '{}' exceeds {} decoded bytes; reduce snapshot.page.size",
+"Staged snapshot page {} for '{}' exceeds {} decoded bytes; reduce snapshot.page.size, or keyless.snapshot.page.size for a keyless table or snapshot.scan=cursor",
 "Conflicting immutable snapshot page {} for '{}'",
 "Cannot remove Informix snapshot-page candidate: {}",
 "Compressed staged snapshot page {} for '{}' is too large",
@@ -469,5 +469,6 @@
 "Informix offset has an invalid staged_scope; run a full refresh with this connector version",
 "Key column {} of '{}' became {} while the table's incremental snapshot was copying, and a float key cannot page the copy; run a full refresh",
 "Informix offset has an invalid floor_seed; run a full refresh with this connector version",
-"UNLOAD value {!r} in snapshot.source is not a finite number, which no Informix {} column holds"
+"UNLOAD value {!r} in snapshot.source is not a finite number, which no Informix {} column holds",
+"table.migration cuts '{}' over to append-only, which accepts only snapshot.mode=initial or snapshot.mode=cdc_only, and its restore would fail on the snapshot.mode in force: set one of them in the table's configuration (an incremental copy in progress still finishes)"
 ]

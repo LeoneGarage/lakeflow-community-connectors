@@ -75,6 +75,10 @@ DEFAULT_TABLES = (
     "tw900_member_tag",
     "tw901_claim_note",
 )
+# Keyless tables the demo pipeline keys on the whole row (primary.keys "*"): their SCD1
+# destination holds each distinct row once, so exact duplicates in the source land as one
+# row, and their compare is by distinct rows rather than by row counts.
+WHOLE_ROW_KEY_TABLES = ("tw221d", "tw900_member_tag")
 INTERNAL_COLUMNS = {
     "_informix_change_lsn",
     "_informix_commit_lsn",
@@ -585,6 +589,7 @@ def compare_table(
     types: dict[str, str],
     key_columns: "list[str] | int",
     destination_pipe: pathlib.Path,
+    whole_row_key: bool = False,
 ) -> dict[str, Any]:
     key_columns = _key_names(columns, key_columns)
     key_count = len(key_columns)
@@ -624,9 +629,12 @@ def compare_table(
         # the destination the same number of times. A value difference surfaces as one
         # missing + one extra row (not a cell-level mismatch, which needs a key), and
         # legitimately duplicated source rows are handled by the multiplicity counts.
+        # Keyed on the whole row (whole_row_key), the destination holds each distinct row
+        # once, and counted, a source row written twice read as one missing.
         full_row = lambda row: tuple(normalize(row.get(c), types[c]) for c in columns)
-        source_counter = collections.Counter(full_row(row) for row in source)
-        destination_counter = collections.Counter(full_row(row) for row in destination)
+        rows = set if whole_row_key else list
+        source_counter = collections.Counter(rows(full_row(row) for row in source))
+        destination_counter = collections.Counter(rows(full_row(row) for row in destination))
         missing = source_counter - destination_counter
         extra = destination_counter - source_counter
         return {
@@ -754,6 +762,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--destination-page-size", type=int, default=10000)
     parser.add_argument("--fail-on-difference", action="store_true")
     parser.add_argument("--tables", nargs="+", default=list(DEFAULT_TABLES))
+    parser.add_argument(
+        "--whole-row-key-tables",
+        nargs="*",
+        default=list(WHOLE_ROW_KEY_TABLES),
+        help='keyless tables keyed on the whole row (primary.keys "*"): compared by distinct rows',
+    )
     return parser.parse_args()
 
 
@@ -838,6 +852,7 @@ def main() -> int:
                 types[table],
                 keys.get(table, []),
                 output / f"{table}.destination.unl",
+                table in args.whole_row_key_tables,
             )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:

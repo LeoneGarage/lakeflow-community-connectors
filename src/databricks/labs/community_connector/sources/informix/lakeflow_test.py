@@ -4622,6 +4622,9 @@ class LakeflowContractTests(unittest.TestCase):
             (
                 ("old", "it was last written to too long ago"),
                 ("log", "the log it began in is no longer kept"),
+                # Taken up for a day under a one-day staging retention, its pages were the
+                # sweep's to take meanwhile: within half the retention only.
+                ("retention", "it was last written to too long ago"),
             )
         ):
             pipeline = uuid.UUID(int=90 + number)
@@ -4631,8 +4634,11 @@ class LakeflowContractTests(unittest.TestCase):
                 later = self.connector(bridge)
                 later.set_registration_scope(scopes[1])
                 later.set_update_request("continue")
-                if spoil == "log":
-                    bridge.minimum = bridge.now + 10_000
+                if spoil in ("log", "retention"):
+                    if spoil == "log":
+                        bridge.minimum = bridge.now + 10_000
+                    else:
+                        later._snapshot_staging_retention_seconds = 0.001
                     table = Table.parse(bridge.tables[0], "demo")
                     with self.assertLogs(informix_module.__name__, "INFO") as logs:
                         self.assertEqual(
@@ -7098,6 +7104,24 @@ class LakeflowContractTests(unittest.TestCase):
             connector.read_table_metadata(
                 "orders_log", {"qualified_source_table": "app.orders", "row_filter": "id > 1"}
             )
+
+    def test_an_append_only_cutover_refuses_a_mode_its_restore_would_fail_on(self):
+        # The cutover to append-only skipped the snapshot.mode check, recorded its seed and
+        # stopped; the restore then failed at registration (274) with the table already
+        # moved. The cutover fails instead, the table's mode or the connection's alike. The
+        # capture, still on the keyed path, keeps its mode, and cdc_only passes.
+        append = {"append.only.ingestion": "true", "table.migration": "true"}
+        for where in ("table", "connection"):
+            with self.subTest(where=where):
+                mode = {"snapshot.mode": "auto_snapshot"}
+                connector = self.connector(FakeBridge(), **(mode if where == "connection" else {}))
+                table_mode = mode if where == "table" else {}
+                connector.read_table_metadata(
+                    "app.orders", {"table.migration": "true", **table_mode}
+                )
+                with self.assertRaisesRegex(ValueError, "cuts 'app.orders' over to append-only"):
+                    connector.read_table_metadata("app.orders", {**append, **table_mode})
+                connector.read_table_metadata("app.orders", {**append, "snapshot.mode": "cdc_only"})
 
     def test_a_tables_read_options_are_checked_at_registration(self):
         # Each failed only when the flow first read it, after the pipeline had started.
@@ -11258,6 +11282,37 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual((written, rewritten), (3, 0))
         self.assertEqual(second, first)
 
+    def test_a_dropped_mount_does_not_fail_a_spill_written_over_rest(self):
+        # Before each spilled page the writer asks the mount whether the other channel wrote
+        # it already. Under REST staging, which writes the page without the mount, a dropped
+        # mount failed the shard's poll there; the page is written instead. Over the mount
+        # the drop still fails the poll, for the read's mount retry.
+        connector = self.connector(FakeBridge(), registration_scope="spill-rest")
+        table = connector._table("app.orders", {})
+        capture = informix_module._capture_descriptor(table)
+        changes = [
+            {"op": "INSERT", "tx_id": 7, "lsn": 102 + i, "table": table.identity, "row": {"id": i}}
+            for i in range(5)
+        ]
+        dropped = OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+        for transport in (object(), None):
+            with self.subTest(rest=transport is not None):
+                publish = mock.Mock()
+                with (
+                    mock.patch.object(informix_module, "_CDC_SPILL_PAGE_RECORDS", 2),
+                    mock.patch.object(connector, "_publish_snapshot_stage_page", publish),
+                    mock.patch.object(connector, "_staging_transport", return_value=transport),
+                    mock.patch.object(informix_module, "_is_path", side_effect=dropped),
+                ):
+                    writer = connector._cdc_spill([capture])
+                    if transport is None:
+                        with self.assertRaises(OSError):
+                            writer.start(7, 101, changes)
+                        continue
+                    writer.start(7, 101, changes)
+                    writer.finish(7)
+                self.assertEqual(publish.call_count, 3)
+
     def test_spilled_pages_are_named_by_pipeline_and_first_change(self):
         # A pipeline's updates share one spill scope, so a later update reading a transaction
         # again finds the pages an earlier one wrote; a scope outside a pipeline stays as it
@@ -14357,9 +14412,12 @@ class LakeflowContractTests(unittest.TestCase):
         restart_connector, schema_id, _ = self._drifted_upsert()
         table = restart_connector._table("app.orders", {})
         stale_generation = "f" * 32
-        restart_connector._publish_delete_snapshot_floor(
-            table, stale_generation, 95, restart_connector._pipeline_scope()
-        )
+        # Published by a full refresh under that generation: outside one, the floor the
+        # upsert reader's snapshot published stays (see _publish_delete_snapshot_floor).
+        with mock.patch.object(restart_connector, "_update_request", "full_refresh"):
+            restart_connector._publish_delete_snapshot_floor(
+                table, stale_generation, 95, restart_connector._pipeline_scope()
+            )
         with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
             _, offset = restart_connector.read_table_deletes("app.orders", {}, {})
         self.assertEqual(offset["commit_lsn"], "120")
@@ -19897,6 +19955,43 @@ class LakeflowContractTests(unittest.TestCase):
                 _, seed = later.read_table_deletes("app.orders", dict(checkpoint), dict(options))
 
                 self.assertEqual(seed["commit_lsn"], "150")
+
+    def test_an_auto_snapshot_resnapshot_keeps_a_floor_still_in_the_log(self):
+        # auto_snapshot resnapshots into a destination it does not empty: the first
+        # snapshot's rows stay, and the deletes after its floor still apply to them. Its
+        # boundary replaced the floor, which sent a delete reader past retained deletes of
+        # rows the new snapshot no longer had. The floor stays while it is in the log; a
+        # full refresh, or a floor that has left the log, takes the new boundary.
+        options = {"snapshot.mode": "auto_snapshot", "snapshot.page.size": "1"}
+        for number, (case, request, minimum, expected) in enumerate(
+            (
+                ("retained", "continue", 85, "90"),
+                ("full refresh", "full_refresh", 85, "150"),
+                ("aged out", "continue", 95, "150"),
+            )
+        ):
+            with self.subTest(case=case):
+                bridge = FakeBridge()
+                pipeline = uuid.UUID(int=150 + number)
+
+                def reader(update, request, bridge=bridge, pipeline=pipeline):
+                    connector = self.connector(bridge)
+                    connector.set_registration_scope(f"{pipeline}_@_{uuid.UUID(int=update)}")
+                    connector.set_update_request(request)
+                    return connector
+
+                _, first = reader(2, "full_refresh").read_table("app.orders", {}, {})
+                self.assertEqual(first["commit_lsn"], "90")
+                bridge.minimum, bridge.now = minimum, 150
+                checkpoint = dict(
+                    _stream_offset(100), begin_lsn="80", pipeline_scope=first["pipeline_scope"]
+                )
+                _, end = reader(3, request).read_table("app.orders", checkpoint, dict(options))
+                self.assertEqual(end["commit_lsn"], "150")
+
+                _, seed = reader(4, "continue").read_table_deletes("app.orders", {}, dict(options))
+
+                self.assertEqual(seed["commit_lsn"], expected)
 
     def test_a_replayed_delete_move_below_the_expired_commit_lands(self):
         # An open transaction's begin expired while the checkpoint's commit, 140, is still
@@ -26118,6 +26213,35 @@ class UnloadHelperTests(unittest.TestCase):
             # A count still means the leading columns.
             self.assertEqual(tool._key_names(columns, 2), ["a", "b"])
 
+    def test_the_compare_tool_takes_a_whole_row_keyed_table_by_distinct_rows(self):
+        # A keyless table keyed on the whole row (primary.keys "*") lands each distinct row
+        # once. Compared by counts, a source row written twice read as one missing; by
+        # distinct rows it matches, while a keyless change log still counts every copy.
+        from databricks.labs.community_connector.sources.informix import (
+            compare_live_data_test_tool as tool,
+        )
+
+        self.assertIn("tw221d", tool.WHOLE_ROW_KEY_TABLES)
+        with tempfile.TemporaryDirectory() as folder:
+            root = pathlib.Path(folder)
+            (root / "t.unl").write_text("1|x|\n1|x|\n2|y|\n", encoding="latin-1")
+            columns = ["a", "b"]
+            types = dict.fromkeys(columns, "STRING")
+            destination = [{"a": "1", "b": "x"}, {"a": "2", "b": "y"}]
+            for whole_row_key, missing in ((True, 0), (False, 1)):
+                with self.subTest(whole_row_key=whole_row_key):
+                    result = tool.compare_table(
+                        "t",
+                        root / "t.unl",
+                        destination,
+                        columns,
+                        types,
+                        [],
+                        root / "t.d.unl",
+                        whole_row_key,
+                    )
+                    self.assertEqual((result["missing_rows"], result["extra_rows"]), (missing, 0))
+
     def test_a_hashed_key_column_may_have_a_name_that_needs_quoting(self):
         # HASH("date") on a key named date was refused: its canonical text quotes the name,
         # and was compared with HASH(date).
@@ -27419,6 +27543,36 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
         ):
             connector.latest_offset("app.orders", options, {})
         release.assert_called_once()
+
+    def test_a_unl_first_window_pins_its_boundary_under_a_connection_slot(self):
+        # The pin opens CDC sessions on the source. Planned as metadata it bypassed
+        # max.concurrent.connections, so the first windows of a pipeline's .unl tables
+        # opened sessions all at once, past it. It takes a slot as a read does: a continuous
+        # flow that gets none yields a retry, a triggered one fails.
+        connector = self.connector(FakeBridge())
+        options = {"snapshot.source": self._source("1|alpha|\n2|beta|\n")}
+        bypass = []
+        real_pin = connector._pin_unl_boundary
+
+        def pin(*args, **kwargs):
+            bypass.append(connector.options.get("_informix.bypass.connection.capacity"))
+            return real_pin(*args, **kwargs)
+
+        with mock.patch.object(connector, "_pin_unl_boundary", side_effect=pin):
+            end = connector.latest_offset("app.orders", options, {})
+        self.assertEqual(bypass, [None])
+        self.assertIn("commit_lsn", end)
+        unavailable = informix_module.ConnectionCapacityUnavailable("no slot")
+        with mock.patch.object(connector, "_pin_unl_boundary", side_effect=unavailable):
+            retry = connector.latest_offset("app.orders", options, {})
+        self.assertNotIn("commit_lsn", retry)
+        self.assertEqual(informix_module._capacity_retry_count(retry), 1)
+        connector._trigger_available_now = True
+        with (
+            mock.patch.object(connector, "_pin_unl_boundary", side_effect=unavailable),
+            self.assertRaises(informix_module.ConnectionCapacityUnavailable),
+        ):
+            connector.latest_offset("app.orders", options, {})
 
     def test_a_unl_cutover_seeds_from_the_token_not_the_extract(self):
         # Under table.migration the partitioned reader must not serve the .unl extract: the

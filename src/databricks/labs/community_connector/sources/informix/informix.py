@@ -10344,12 +10344,21 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self._table_snapshot_source(table_options)
         _, escape = self._unl_field_format(table_options)
         _unl_escape_byte(escape, _client_encoding(self.options))
-        if migration:
+        append = self._append_only_table(table, table_options)
+        if migration and not append:
             # A migrating table records and stops whatever its mode (see _read_handoff).
             return
-        if self._append_only_table(table, table_options):
+        if append:
             configured = table_options.get("snapshot.mode", self.options.get("snapshot.mode"))
             if configured is not None and mode not in {"initial", "cdc_only"}:
+                if migration:
+                    # The cutover to append-only recorded its seed, and the restore then
+                    # failed on this, after the migration had moved the table.
+                    # 471: table.migration cuts '{}' over to append-only, which accepts only
+                    # snapshot.mode=initial or snapshot.mode=cdc_only, and its restore would
+                    # fail on the snapshot.mode in force: set one of them in the table's
+                    # configuration (an incremental copy in progress still finishes)
+                    raise ValueError(_m(471, table.exposed_name))
                 # 274: Append-only table '{}' supports only snapshot.mode=initial or
                 # snapshot.mode=cdc_only
                 raise ValueError(_m(274, table.exposed_name))
@@ -11016,8 +11025,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # Docstring: The end of a ``.unl`` split window or staged page batch, else None.
         #
         # Both serves plan from metadata without a read, so they run under _metadata_access:
-        # no wait behind running reads for a slot, and the session a catalog lookup or the
-        # ``.unl`` boundary pin opened is given back whether planning succeeds or fails. A
+        # no wait behind running reads for a slot, and the session a catalog lookup opened
+        # is given back whether planning succeeds or fails; the ``.unl`` boundary pin takes a
+        # slot (see below). A
         # delete flow or a stream-phase offset never serves, so it skips the lookup, which
         # for a delete reader would take a slot its upsert reader may need. A dropped Volume
         # mount is retried in place (_plan_with_mount_retry).
@@ -11038,6 +11048,21 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             )
 
         def plan() -> dict | None:
+            if unl and not effective_start:
+                # The first window pins the extract's boundary, which opens CDC sessions on
+                # the source. Planned as metadata, the first windows of a pipeline's .unl
+                # tables opened them all at once, past max.concurrent.connections: it takes a
+                # slot as a read does, and a continuous flow that gets none yields, as a read
+                # does.
+                try:
+                    with self._capacity_attempt(start_offset):
+                        return serve(self._table(table_name, table_options))
+                except ConnectionCapacityUnavailable:
+                    if self._trigger_available_now:
+                        raise
+                    return self._capacity_retry_offset(start_offset)
+                finally:
+                    self._release_worker_connection()
             with self._metadata_access():
                 table = self._table(table_name, table_options)
                 batch = None
@@ -11054,18 +11079,21 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     )
                 if batch is not None:
                     return self._snapshot_page_batch_offset(table, effective_start, batch)
-                # File source: serve the extract as a window of splits per microbatch. Leaving
-                # the embedded cache untouched steers the following get_partitions to the
-                # unl_split fan-out instead of the driver-side embedded path. A gzip record
-                # window is the exception: its rows were read here on the driver, so they are
-                # cached for get_partitions exactly as an embedded read's are.
-                end, rows = self._unl_snapshot_offset(table, table_options, effective_start)
-                if rows is not None:
-                    self._partition_embedded_rows.clear()
-                    self._partition_embedded_rows[self._partition_offset_key(start_offset)] = (
-                        self._encode_embedded_output(rows, table_options, lambda: table.columns)
-                    )
-                return end
+                return serve(table)
+
+        def serve(table: Table) -> dict:
+            # File source: serve the extract as a window of splits per microbatch. Leaving
+            # the embedded cache untouched steers the following get_partitions to the
+            # unl_split fan-out instead of the driver-side embedded path. A gzip record
+            # window is the exception: its rows were read here on the driver, so they are
+            # cached for get_partitions exactly as an embedded read's are.
+            end, rows = self._unl_snapshot_offset(table, table_options, effective_start)
+            if rows is not None:
+                self._partition_embedded_rows.clear()
+                self._partition_embedded_rows[self._partition_offset_key(start_offset)] = (
+                    self._encode_embedded_output(rows, table_options, lambda: table.columns)
+                )
+            return end
 
         return self._plan_with_mount_retry(plan)
 
@@ -13724,7 +13752,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         record = {**body, "sha256": digest}
         if len(payload) > _MAX_SNAPSHOT_STAGE_PAGE_BYTES:
             # 217: Staged snapshot page {} for '{}' exceeds {} decoded bytes; reduce
-            # snapshot.page.size
+            # snapshot.page.size, or keyless.snapshot.page.size for a keyless table or
+            # snapshot.scan=cursor
             raise InformixError(
                 _m(217, page_index, table.exposed_name, _MAX_SNAPSHOT_STAGE_PAGE_BYTES)
             )
@@ -15772,7 +15801,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     why = "the index it paged by is not the one this snapshot pages by"
                 elif self._table_int_option(options, "snapshot.max.bytes", 0, minimum=0):
                     why = "a snapshot with snapshot.max.bytes set does not go on from one"
-                elif time.time() - touched > _SCAN_RESUME_SECONDS:
+                elif time.time() - touched > min(
+                    _SCAN_RESUME_SECONDS,
+                    # Within half the staging retention: the sweep takes pages older than
+                    # it, and at one day took those of a scan being taken up.
+                    self._snapshot_staging_retention_seconds / 2
+                    if self._snapshot_staging_retention_seconds > 0
+                    else _SCAN_RESUME_SECONDS,
+                ):
                     why = "it was last written to too long ago"
                 elif self._bridge.minimum_lsn() > int(pointer["initial"]):
                     # That update's capture began there, and its changes are read again.
@@ -18175,8 +18211,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # Both are written atomically, so one that exists is whole.
             namespace = self._snapshot_stage_namespace_for(native, scope, _CDC_SPILL_SCHEMA)
             page = f"page-{page_index:08d}"
-            if _is_path(os.path.join(namespace, "runs", run, page, "data.json.gz")):
-                return
+            try:
+                if _is_path(os.path.join(namespace, "runs", run, page, "data.json.gz")):
+                    return
+            except OSError:
+                # Written over REST, the page needs no mount, which only says whether it
+                # is there already: a dropped one failed the shard's poll. It is written
+                # again, with the same contents.
+                if self._staging_transport() is None:
+                    raise
             self._publish_snapshot_stage_page(
                 target, scope, _CDC_SPILL_SCHEMA, run, page_index, records, None
             )
@@ -20089,6 +20132,27 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # snapshot, whose boundary can be lower (a log reinitialized, an older extract).
         # Ordinary polls leave it untouched. The delete channel is idempotent, so a floor
         # that lags only causes a harmless re-read; one left too high loses deletes.
+        #
+        # Only a full refresh empties the destination. Outside one (auto_snapshot's
+        # resnapshot of an expired checkpoint, above all) the rows it holds stay, and the
+        # deletes after an earlier floor still apply to them: a floor of another update
+        # that is still in the log, of this layout and not above this boundary stays.
+        # Replaced, it sent a delete reader past retained deletes of rows the new snapshot
+        # no longer has, which then stayed in the destination.
+        if self._update_request != "full_refresh":
+            kept = self._read_immutable_head(
+                self._immutable_namespace(table, "delete-floor", self._pipeline_id(pipeline_scope))
+            )
+            if (
+                kept is not None
+                and kept.get("snapshot_scope") != pipeline_scope
+                and kept.get("table") == table.native_identity
+                and kept.get("fingerprint") == _schema_fingerprint(table)
+                and self._bridge.minimum_lsn()
+                <= self._immutable_lsn(kept, "start_lsn", table.exposed_name)
+                <= snapshot_lsn
+            ):
+                return
 
         self._state_op_with_reconnect(
             lambda: publish_maximum_lsn_state_record(

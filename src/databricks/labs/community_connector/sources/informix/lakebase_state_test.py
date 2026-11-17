@@ -3317,6 +3317,25 @@ class WorkspaceFilesApiTests(unittest.TestCase):
         provider.refresh.assert_called_once()
         self.assertEqual(len(calls), 2)
 
+    def test_a_token_another_request_lost_reads_as_its_401(self):
+        # Another request's refresh failed and dropped the token, and token creation is
+        # disabled: this request's bearer() raised StagingTokenUnavailable, which the
+        # callers do not take for the 401 they fall back to FUSE on. A credential not yet
+        # rejected still raises what it raised.
+        unavailable = lakebase_state.StagingTokenUnavailable("token creation is disabled")
+        for rejected in (True, False):
+            with self.subTest(rejected=rejected):
+                provider = mock.Mock(rejected=rejected)
+                provider.bearer.side_effect = unavailable
+                client = lakebase_state.WorkspaceFilesApi("https://ws", provider)
+                if rejected:
+                    with self.assertRaises(lakebase_state.WorkspaceHttpError) as ctx:
+                        client.get("/Volumes/c/s/v/x")
+                    self.assertEqual(ctx.exception.status_code, 401)
+                else:
+                    with self.assertRaises(lakebase_state.StagingTokenUnavailable):
+                        client.get("/Volumes/c/s/v/x")
+
     def test_a_fixed_bearer_does_not_retry_a_401(self):
         # An executor gets one bearer per batch and can't mint; the driver's next
         # batch carries a fresh one.

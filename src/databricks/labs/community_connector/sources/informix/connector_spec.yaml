@@ -450,6 +450,9 @@ connection:
         interleaved with the change stream; `initial` takes a single blocking
         repeatable-read snapshot. `auto_snapshot` uses the incremental strategy and
         starts a new chunked copy when a checkpoint LSN is no longer retained.
+        It does not empty the destination: deletes still in the log are applied,
+        but a row deleted at the source while the log was not retained stays
+        there until a full refresh.
         Keyless append-only tables default to `cdc_only` when this option is unset
         and accept `cdc_only` or `initial`; `initial` streams one
         unordered forward-only cursor into durable bounded pages before CDC.
@@ -563,7 +566,8 @@ connection:
         When true the table runs a two-run checkpoint handoff instead of its normal
         read, so it can move to a new Lakeflow flow -- an SCD Type 1 to append-only
         switch, or a destination relocation -- without re-snapshotting. It is
-        orthogonal to `snapshot.mode`, which the table keeps unchanged. Migration
+        orthogonal to `snapshot.mode`, which the table keeps unchanged, except that
+        an append-only cutover needs `initial` or `cdc_only` there. Migration
         never streams: every read records a checkpoint, emits no rows, and stops.
         Run it once on the old flow to park the current stream (or mid-serve snapshot)
         offset in Lakebase, then once on the new flow (fresh checkpoint) to seed from

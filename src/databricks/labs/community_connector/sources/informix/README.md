@@ -1597,7 +1597,7 @@ progress and are rejected.
 | `initial` | If the table has no checkpoint, take a single transactionally consistent (blocking) snapshot under one repeatable-read transaction and continue from its captured Informix LSN. If a checkpoint exists, resume CDC without another snapshot. Use this when you require a single point-in-time snapshot LSN for the whole table rather than per-chunk boundaries. |
 | `initial_only` | Take the initial snapshot, checkpoint its boundary, and emit no later CDC records. Both upsert and delete readers then remain exhausted. Snapshot continuation pages still finish normally after a restart. |
 | `cdc_only` | Do not copy existing rows. Enable full-row logging, record the current schema and LSN, and stream only transactions after that boundary. It requires CDC-supported column types; keyless tables use append-only ingestion. |
-| `auto_snapshot` | Behave like `incremental`, but automatically begin a new PK-chunked snapshot if the checkpoint's restart LSN has fallen out of the retained Informix logical logs. CDC begins immediately at the new deterministic boundary while existing rows are copied in chunks; the independently checkpointed delete reader adopts the same boundary, or the pipeline's snapshot floor where that is lower (a resnapshot batch replayed in a later update, which takes it again) or where the update publishes none (the upsert reader committed its resnapshot in an earlier update). Once the update's upsert reader goes on from the retained log, so that no boundary is coming, the delete reader starts as one with no checkpoint does: at the floor, also during a selective full refresh of other tables or after a column was added, or at the upsert reader's start, with a warning in the event log, once the floor has left the log too. If the pipeline stops before the delete reader's move to that boundary commits, the next update replays it by landing on the boundary without reading, with a warning in the event log. An upsert batch replayed from a start the log no longer holds resnapshots at a later boundary instead, as a first batch does. Other checkpoint or schema errors still fail closed. |
+| `auto_snapshot` | Behave like `incremental`, but automatically begin a new PK-chunked snapshot if the checkpoint's restart LSN has fallen out of the retained Informix logical logs. CDC begins immediately at the new deterministic boundary while existing rows are copied in chunks; the independently checkpointed delete reader adopts the same boundary, or the pipeline's snapshot floor where that is lower (a resnapshot batch replayed in a later update, which takes it again) or where the update publishes none (the upsert reader committed its resnapshot in an earlier update). Once the update's upsert reader goes on from the retained log, so that no boundary is coming, the delete reader starts as one with no checkpoint does: at the floor, also during a selective full refresh of other tables or after a column was added, or at the upsert reader's start, with a warning in the event log, once the floor has left the log too. The destination is not emptied, so the snapshot floor an earlier snapshot left stays while it is in the log, and the delete reader applies the deletes after it. A row deleted at the source while the log was not retained stays in the destination until a full refresh. If the pipeline stops before the delete reader's move to that boundary commits, the next update replays it by landing on the boundary without reading, with a warning in the event log. An upsert batch replayed from a start the log no longer holds resnapshots at a later boundary instead, as a first batch does. Other checkpoint or schema errors still fail closed. |
 | `recovery` | Rebuild missing immutable schema-history state from an existing stream checkpoint, then resume CDC without copying table data. It is accepted only when the current source schema fingerprint exactly matches the checkpoint and the checkpoint LSN is still retained. If either condition is false, run a full refresh. Do not use this mode to accommodate a real schema change. |
 
 To move a table to a **new flow** — an SCD1→append-only switch or a destination
@@ -1669,6 +1669,10 @@ your pipeline spec.
    append rather than re-snapshotted), keeping `table.migration: true`. Run the
    pipeline. The append flow records the parked position as its checkpoint and stops —
    no re-snapshot, no rows yet. (Restoring in step 3 resumes streaming from there.)
+   An append-only table accepts only `snapshot.mode: initial` or `cdc_only`: if the table
+   or the connection names another mode, set one of these two in the table's
+   configuration now, or the cutover stops with an error. An incremental copy the
+   capture parked mid-way still finishes after Restore.
 
    ```json
    {
@@ -1765,6 +1769,9 @@ so a snapshot `r` row is always superseded by any later change to the same key
 and the materialized state is exact.
 
 For `APPEND_ONLY` targets there is no key merge: every emitted row is retained.
+This is a keyed table on its keyed path with `scd_type: APPEND_ONLY` alone, which
+drops deletes (see above); with `append.only.ingestion: "true"` only `initial` and
+`cdc_only` are accepted.
 Because each chunk is read in its own repeatable-read transaction, its `r` rows
 are consistent as-of that chunk's LSN, and no row is ever lost or fabricated.
 The only artifact is that a key changed just before its chunk boundary can
