@@ -16631,6 +16631,7 @@ def register_lakeflow_source(spark):
                 self._schema_transition_waits.clear()
                 self._activity_touched.clear()
                 self._cleaned_update_scopes.clear()
+                self._noted_upsert_starts.clear()
                 self._cleaned_snapshot_stages.clear()
                 self._snapshot_cleanup_watermark.clear()
                 self._snapshot_schema_refreshed_at.clear()
@@ -19398,6 +19399,14 @@ def register_lakeflow_source(spark):
                 bootstrap_offset=bootstrap_offset,
                 restart_from=restart_from,
             )
+            lsn = restart_from and restart_from["commit_lsn"]
+            if lsn and int(end.get("commit_lsn") or lsn) < int(lsn):
+                # 477: Informix delete channel for '{}' started at full refresh {}'s own start,
+                # and its upsert reader went on from a checkpoint instead (the refresh left
+                # the table); it starts again below that start, at {}
+                logging.getLogger(__name__).warning(
+                    _m(477, table_name, restart_from["floor_seed"], end["commit_lsn"])
+                )
             if seeded is not None and end.get("commit_lsn") is not None:
                 end = {**end, "floor_seed": seeded}
                 if seed_floor is not None:
@@ -19420,8 +19429,10 @@ def register_lakeflow_source(spark):
             record_key = "/".join(
                 (connection_key, table_key, "delete-floor", self._pipeline_id(self._pipeline_scope()))
             )
-            record = self._state_op_with_reconnect(
-                lambda: read_state_record(self._lakebase_connection(), connection_key, record_key),
+            record = self._state(
+                read_state_record,
+                connection_key,
+                record_key,
                 operation="delete-floor probe",
             )
             if not isinstance(record, dict) or not isinstance(record.get("snapshot_scope"), str):
@@ -19452,11 +19463,7 @@ def register_lakeflow_source(spark):
 
             if self._update_request in _FULL_REFRESH_REQUESTS and not kept_destination:
                 return None
-            record = self._read_immutable_head(
-                self._immutable_namespace(
-                    table, "delete-floor", self._pipeline_id(self._pipeline_scope())
-                )
-            )
+            record = self._floor_record(table)
             if record is None or not isinstance(record.get("snapshot_scope"), str):
                 return None
             self._validate_immutable_record_header(record, "delete-floor", table.exposed_name)
@@ -19538,9 +19545,7 @@ def register_lakeflow_source(spark):
                 return None
             scope = self._pipeline_scope()
             table = self._refresh_table_schema(table, None)
-            floor = self._read_immutable_head(
-                self._immutable_namespace(table, "delete-floor", self._pipeline_id(scope))
-            )
+            floor = self._floor_record(table, scope)
             start = self._initial_lsn(table, scope=scope)
             schema_id = self._snapshot_schema_ids[(scope, table.identity)]
             # Announced, then this update's start looked for again: an upsert reader publishes
@@ -19580,7 +19585,9 @@ def register_lakeflow_source(spark):
             # this update): the position belongs to the old snapshot, on a rebuilt source
             # perhaps to another log, and the reader starts again as one with no checkpoint.
             # That is told from the floor alone, before this update's start: read on, the old
-            # position could fail on a log that no longer holds it.
+            # position could fail on a log that no longer holds it. An auto_snapshot resnapshot's
+            # floor leaves the destination's rows, and stands for the snapshot before it too
+            # (_floor_scopes).
             #
             # A replay repeats the batch Spark logged, told by the end it logged: one that read
             # on from the seed carries it, or, the floor confirmed, ends on a transaction or below
@@ -19594,20 +19601,21 @@ def register_lakeflow_source(spark):
             pipeline = self._pipeline_id(self._pipeline_scope(start_offset))
             if self._pipeline_id(seeded) != pipeline:
                 return unmarked, None
-            record = self._read_immutable_head(
-                self._immutable_namespace(table, "delete-floor", pipeline)
-            )
+            record = self._floor_record(table, seeded)
             current = None if record is None else record.get("snapshot_scope")
             if _SEED_FLOOR_FIELD in start_offset:
                 return self._confirmed_own_start(table, start_offset, unmarked, record, table_options)
             if current is None:
                 return start_offset, seeded
-            if current != seeded:
+            if seeded not in self._floor_scopes(record):
                 return self._replaced_floor_seed(
                     table, start_offset, unmarked, record, table_options
                 )
             if self._read_upsert_channel_start(table, self._pipeline_scope(start_offset)) is None:
                 return start_offset, seeded
+            # The floor again: a snapshot publishes its floor, then its start, the order read here.
+            if self._floor_scopes(self._floor_record(table, seeded)) != self._floor_scopes(record):
+                return self._confirmed_floor_seed(table, start_offset, table_options)
             return unmarked, None
 
         def _replaced_floor_seed(
@@ -19674,19 +19682,21 @@ def register_lakeflow_source(spark):
             # is not read (_range_emits_nothing), so with the floor unchanged the batch read on.
 
             seeded = start_offset["floor_seed"]
-            current = None if record is None else record.get("snapshot_scope")
+            scopes = self._floor_scopes(record)
             replaying = self._replay_stop_lsn(table_options) is not None
             logged, _ = json.loads(table_options.get(_REPLAY_END_SEED_OPTION) or "[null, false]")
             if replaying and logged == seeded:
                 return start_offset, seeded
-            if current == seeded:
+            if seeded in scopes:
                 return unmarked, None
-            if current is not None and current != start_offset[_SEED_FLOOR_FIELD]:
+            if scopes[0] and start_offset[_SEED_FLOOR_FIELD] not in [scope or "" for scope in scopes]:
                 return self._replaced_floor_seed(table, start_offset, unmarked, record, table_options)
             if replaying:
                 return unmarked, None
             if self._own_start_upsert_start(table, seeded) is None:
                 return start_offset, seeded
+            if self._floor_scopes(self._floor_record(table, seeded)) != scopes:
+                return self._confirmed_floor_seed(table, start_offset, table_options)
             return {}, seeded
 
         def _read_table_deletes_from(
@@ -19774,6 +19784,12 @@ def register_lakeflow_source(spark):
                 # cannot remove a newer row or apply a delete twice. This is a bootstrap-only
                 # cost; once the delete flow checkpoints, it resumes from its own cursor.
                 minimum = self._bridge.minimum_lsn()
+                # A start again (477) at a start not below its position reads on from it instead:
+                # starting there skipped the deletes between, and a replay could not tell the
+                # batch from a read on. One that waits stays where it is, marked: an offset of
+                # advisory fields lost the own start, and the next batch started again above it.
+                position = {k: v for k, v in (restart_from or {}).items() if k not in _SEED_MARKS}
+                below = int(position.get("begin_lsn") or position.get("commit_lsn") or 0)
                 if snapshot_mode == "auto_snapshot" and high_water < minimum:
                     # auto_snapshot replaces the expired checkpoint the channel start names (it was
                     # published before the resnapshot, and the lowest start wins) with a snapshot
@@ -19781,6 +19797,12 @@ def register_lakeflow_source(spark):
                     # until then yield a retry that does not run out, as a checkpointed reader of
                     # an expired position does (_read_resnapshotted_deletes).
                     seed = self._resnapshot_delete_seed(table, self._pipeline_scope())
+                    if restart_from and not seed:
+                        return iter(()), restart_from
+                    if restart_from and int(seed["commit_lsn"]) >= below:
+                        return self._read_table_deletes_from(
+                            table_name, position, table_options, snapshot_mode=snapshot_mode
+                        )
                     return iter(()), seed or self._resnapshot_retry_offset(table, bootstrap_offset)
                 floor_state = self._read_delete_snapshot_floor(table, schema_id, fingerprint)
                 floor = floor_state[0] if floor_state else None
@@ -19810,16 +19832,10 @@ def register_lakeflow_source(spark):
                     logging.getLogger(__name__).info(
                         _m(201, table.exposed_name, floor, high_water),
                     )
-                if restart_from:
-                    position = {k: v for k, v in restart_from.items() if k not in _SEED_MARKS}
-                    if bootstrap_lsn >= int(position.get("begin_lsn") or position["commit_lsn"]):
-                        # No start known below the position: starting again there skipped the
-                        # deletes between, and a replay could not tell the batch from a read on.
-                        return self._read_table_deletes_from(
-                            table_name, position, table_options, snapshot_mode=snapshot_mode
-                        )
-                # A restart that waits stays where it is, marked: an offset of advisory fields
-                # lost the own start, and the next batch started again above it.
+                if restart_from and bootstrap_lsn >= below:
+                    return self._read_table_deletes_from(
+                        table_name, position, table_options, snapshot_mode=snapshot_mode
+                    )
                 if bootstrap_lsn < minimum:
                     # 202: Informix delete bootstrap boundary {} for '{}' precedes the minimum retained
                     # LSN {}; the delete channel is waiting for a resnapshot
@@ -19836,13 +19852,6 @@ def register_lakeflow_source(spark):
                         _m(203, bootstrap_lsn, table.exposed_name, current),
                     )
                     return iter(()), restart_from or self._schema_node_fallback_offset(bootstrap_offset)
-                if restart_from:
-                    # 477: Informix delete channel for '{}' started at full refresh {}'s own start,
-                    # and its upsert reader went on from a checkpoint instead (the refresh left
-                    # the table); it starts again below that start, at {}
-                    logging.getLogger(__name__).warning(
-                        _m(477, table.exposed_name, restart_from["floor_seed"], bootstrap_lsn)
-                    )
                 # The seed is this update's first offset for the flow: see _read_stream.
                 return iter(()), {
                     **_offset(
@@ -19937,15 +19946,13 @@ def register_lakeflow_source(spark):
                 _validated_offset({k: v for k, v in offset.items() if k not in _OFFSET_ADVISORY_FIELDS})
             )
             schema_fp = str(offset.get("schema_fingerprint") or _schema_fingerprint(table))
-            self._state_op_with_reconnect(
-                lambda: put_cdc_handoff(
-                    self._lakebase_connection(),
-                    namespace,
-                    table_key,
-                    channel,
-                    offset_json,
-                    schema_fp,
-                ),
+            self._state(
+                put_cdc_handoff,
+                namespace,
+                table_key,
+                channel,
+                offset_json,
+                schema_fp,
                 operation="handoff token write",
             )
 
@@ -19956,8 +19963,11 @@ def register_lakeflow_source(spark):
 
             _, table_key = self._table_state_keys(table)
             namespace = self._lakebase_state_namespace()
-            return self._state_op_with_reconnect(
-                lambda: get_cdc_handoff(self._lakebase_connection(), namespace, table_key, channel),
+            return self._state(
+                get_cdc_handoff,
+                namespace,
+                table_key,
+                channel,
                 operation="handoff token read",
             )
 
@@ -19966,8 +19976,11 @@ def register_lakeflow_source(spark):
 
             _, table_key = self._table_state_keys(table)
             namespace = self._lakebase_state_namespace()
-            self._state_op_with_reconnect(
-                lambda: delete_cdc_handoff(self._lakebase_connection(), namespace, table_key, channel),
+            self._state(
+                delete_cdc_handoff,
+                namespace,
+                table_key,
+                channel,
                 operation="handoff token delete",
             )
 
@@ -21050,13 +21063,11 @@ def register_lakeflow_source(spark):
             # under different locations, and each is swept by a reader that stages there.
             claim = f"{connection_key}/staging-sweep/{hashlib.sha256(root.encode()).hexdigest()[:16]}"
             try:
-                claimed = self._state_op_with_reconnect(
-                    lambda: claim_staging_sweep(
-                        self._lakebase_connection(),
-                        self._lakebase_state_namespace(),
-                        claim,
-                        interval_seconds,
-                    ),
+                claimed = self._state(
+                    claim_staging_sweep,
+                    self._lakebase_state_namespace(),
+                    claim,
+                    interval_seconds,
                     operation="staging sweep claim",
                 )
             except Exception:  # pylint: disable=broad-except
@@ -25226,15 +25237,13 @@ def register_lakeflow_source(spark):
                 if due:
                     prefix = "/".join((*self._table_state_keys_for(native), _CDC_SPILL_SCHEMA))
                     retention = self._snapshot_staging_retention_seconds
-                    listed, expired = self._state_op_with_reconnect(
-                        lambda: list_spill_runs(
-                            self._lakebase_connection(),
-                            namespace,
-                            prefix,
-                            scope,
-                            channel,
-                            retention,
-                        ),
+                    listed, expired = self._state(
+                        list_spill_runs,
+                        namespace,
+                        prefix,
+                        scope,
+                        channel,
+                        retention,
                         operation="spilled-run listing",
                     )
                     self._spill_runs_listed[(native, channel)] = now
@@ -25303,10 +25312,11 @@ def register_lakeflow_source(spark):
                         "required": required,
                     }
                     key = self._spill_run_key(native, run_scope, run)
-                    marked = self._state_op_with_reconnect(
-                        lambda key=key, record=record: merge_spill_run(
-                            self._lakebase_connection(), namespace, key, record
-                        ),
+                    marked = self._state(
+                        merge_spill_run,
+                        namespace,
+                        key,
+                        record,
                         operation="spilled-run settlement",
                     )
                     del pending[run]
@@ -25394,6 +25404,14 @@ def register_lakeflow_source(spark):
                         reset()
                     time.sleep(delay)
                     attempt += 1
+
+        def _state(self, function, *args, operation: str, **kwargs) -> Any:
+            # Docstring: ``function(state connection, *args, **kwargs)``, through
+            # _state_op_with_reconnect: the connection is fetched again on each attempt.
+
+            return self._state_op_with_reconnect(
+                lambda: function(self._lakebase_connection(), *args, **kwargs), operation=operation
+            )
 
         def _state_op_with_reconnect(self, thunk, *, operation: str) -> Any:
             # Docstring: Run one Lakebase state read/write, retrying in place on a dropped connection.
@@ -26864,23 +26882,21 @@ def register_lakeflow_source(spark):
             # so publishers atomically lower the shared boundary and never raise it.
 
             namespace = self._immutable_namespace(table, "channel-starts", scope, "upsert")
-            winner = self._state_op_with_reconnect(
-                lambda: publish_minimum_lsn_state_record(
-                    self._lakebase_connection(),
-                    self._lakebase_state_namespace(),
-                    namespace,
-                    {
-                        "created_at": time.time(),
-                        "fingerprint": fingerprint,
-                        "format_version": _IMMUTABLE_STATE_VERSION,
-                        "record_type": "channel-start",
-                        "schema_id": schema_id,
-                        "scope": scope,
-                        "start_lsn": str(start_lsn),
-                        "table": table.native_identity,
-                    },
-                    record_type="channel-start",
-                ),
+            winner = self._state(
+                publish_minimum_lsn_state_record,
+                self._lakebase_state_namespace(),
+                namespace,
+                {
+                    "created_at": time.time(),
+                    "fingerprint": fingerprint,
+                    "format_version": _IMMUTABLE_STATE_VERSION,
+                    "record_type": "channel-start",
+                    "schema_id": schema_id,
+                    "scope": scope,
+                    "start_lsn": str(start_lsn),
+                    "table": table.native_identity,
+                },
+                record_type="channel-start",
                 operation="upsert channel-start publish",
             )
             self._validate_immutable_record_header(winner, "channel-start", table.exposed_name)
@@ -26951,19 +26967,32 @@ def register_lakeflow_source(spark):
             # Docstring: Publish to the pipeline's own-start record for the table
             # (publish_own_start_state_record): a full refresh's own start, or a later start.
 
-            self._state_op_with_reconnect(
-                lambda: publish_own_start_state_record(
-                    self._lakebase_connection(),
-                    self._lakebase_state_namespace(),
-                    self._immutable_namespace(table, "own-start", self._pipeline_id(scope)),
-                    {
-                        "format_version": _IMMUTABLE_STATE_VERSION,
-                        "record_type": "own-start",
-                        "table": table.native_identity,
-                        **fields,
-                    },
-                ),
+            self._state(
+                publish_own_start_state_record,
+                self._lakebase_state_namespace(),
+                self._immutable_namespace(table, "own-start", self._pipeline_id(scope)),
+                {
+                    "format_version": _IMMUTABLE_STATE_VERSION,
+                    "record_type": "own-start",
+                    "table": table.native_identity,
+                    **fields,
+                },
                 operation="own-start publish",
+            )
+
+        @staticmethod
+        def _floor_scopes(record: dict | None) -> tuple:
+            # Docstring: The snapshots a floor record stands for: its own, and for an auto_snapshot
+            # resnapshot's, the last one before it, whose rows the destination kept.
+
+            own = None if record is None else record.get("snapshot_scope")
+            return own, record.get("kept_scope") if own and record.get("resnapshot") else own
+
+        def _floor_record(self, table: Table, scope: str | None = None) -> dict | None:
+            return self._read_immutable_head(
+                self._immutable_namespace(
+                    table, "delete-floor", self._pipeline_id(scope or self._pipeline_scope())
+                )
             )
 
         def _own_start_upsert_start(self, table: Table, seeded: str) -> tuple[int, str, str] | None:
@@ -26983,9 +27012,7 @@ def register_lakeflow_source(spark):
                 self._immutable_namespace(table, "own-start", self._pipeline_id(seeded))
             )
             if own is not None and own.get("own_start") == seeded and "start_lsn" in own:
-                self._validate_immutable_record_header(own, "own-start", table.exposed_name)
-                lsn = self._immutable_lsn(own, "start_lsn", table.exposed_name)
-                starts.append((lsn, str(own["schema_id"]), str(own["fingerprint"])))
+                starts.append(self._upsert_start(table, own, "own-start", True))
             return min(filter(None, starts), default=None)
 
         def _read_upsert_channel_start(self, table: Table, scope: str) -> tuple[int, str, str] | None:
@@ -26994,11 +27021,19 @@ def register_lakeflow_source(spark):
             )
             if record is None:
                 return None
-            self._validate_immutable_record_header(record, "channel-start", table.exposed_name)
+            return self._upsert_start(table, record, "channel-start", record.get("scope") == scope)
+
+        def _upsert_start(
+            self, table: Table, record: dict, record_type: str, keyed: bool
+        ) -> tuple[int, str, str]:
+            # Docstring: An upsert reader's published start, as (lsn, schema_id, fingerprint),
+            # from a record of ``record_type`` whose key fields ``keyed`` says match.
+
+            self._validate_immutable_record_header(record, record_type, table.exposed_name)
             schema_id = record.get("schema_id")
             fingerprint = record.get("fingerprint")
             if (
-                record.get("scope") != scope
+                not keyed
                 or record.get("table") != table.native_identity
                 or not isinstance(schema_id, str)
                 or not re.fullmatch(r"[0-9a-f]{32}", schema_id)
@@ -27058,10 +27093,9 @@ def register_lakeflow_source(spark):
             # stays, a table's left out of a selective refresh too. Replaced, it sent a delete
             # reader past retained deletes of rows the new snapshot no longer has, which then
             # stayed in the destination.
+            marks = {}
             if resnapshot:
-                kept = self._read_immutable_head(
-                    self._immutable_namespace(table, "delete-floor", self._pipeline_id(pipeline_scope))
-                )
+                kept = self._floor_record(table, pipeline_scope)
                 if (
                     kept is not None
                     and kept.get("snapshot_scope") != pipeline_scope
@@ -27072,25 +27106,28 @@ def register_lakeflow_source(spark):
                     <= snapshot_lsn
                 ):
                     return
+                # Replaced, the floor names the snapshot before it too, whose rows the
+                # destination kept: a delete position marked with that one goes on (291 sent it
+                # to this floor, past the deletes between).
+                marks = {"resnapshot": True, "kept_scope": self._floor_scopes(kept)[1]}
 
-            self._state_op_with_reconnect(
-                lambda: publish_maximum_lsn_state_record(
-                    self._lakebase_connection(),
-                    self._lakebase_state_namespace(),
-                    self._immutable_namespace(table, "delete-floor", self._pipeline_id(pipeline_scope)),
-                    {
-                        "created_at": time.time(),
-                        "fingerprint": _schema_fingerprint(table),
-                        "format_version": _IMMUTABLE_STATE_VERSION,
-                        "record_type": "delete-floor",
-                        "schema_id": schema_id,
-                        # Not "scope", which would have the update's cleanup delete it.
-                        "snapshot_scope": pipeline_scope,
-                        "start_lsn": str(snapshot_lsn),
-                        "table": table.native_identity,
-                    },
-                    record_type="delete-floor",
-                ),
+            self._state(
+                publish_maximum_lsn_state_record,
+                self._lakebase_state_namespace(),
+                self._immutable_namespace(table, "delete-floor", self._pipeline_id(pipeline_scope)),
+                {
+                    "created_at": time.time(),
+                    "fingerprint": _schema_fingerprint(table),
+                    "format_version": _IMMUTABLE_STATE_VERSION,
+                    "record_type": "delete-floor",
+                    "schema_id": schema_id,
+                    # Not "scope", which would have the update's cleanup delete it.
+                    "snapshot_scope": pipeline_scope,
+                    "start_lsn": str(snapshot_lsn),
+                    "table": table.native_identity,
+                    **marks,
+                },
+                record_type="delete-floor",
                 operation="delete-floor publish",
             )
 
@@ -27108,11 +27145,7 @@ def register_lakeflow_source(spark):
             # floor's schema is not in the channel start's history. The latter is reported: the
             # deletes committed between the snapshot and the resume position are not replayed.
 
-            record = self._read_immutable_head(
-                self._immutable_namespace(
-                    table, "delete-floor", self._pipeline_id(self._pipeline_scope())
-                )
-            )
+            record = self._floor_record(table)
             if record is None:
                 return None
             self._validate_immutable_record_header(record, "delete-floor", table.exposed_name)
@@ -27192,8 +27225,10 @@ def register_lakeflow_source(spark):
                 )
             )
             return (
-                self._state_op_with_reconnect(
-                    lambda: read_state_record(self._lakebase_connection(), connection_key, record_key),
+                self._state(
+                    read_state_record,
+                    connection_key,
+                    record_key,
                     operation="channel-start probe",
                 )
                 is not None
@@ -27258,23 +27293,21 @@ def register_lakeflow_source(spark):
                     "upsert",
                 )
             )
-            winner = self._state_op_with_reconnect(
-                lambda: publish_minimum_lsn_state_record(
-                    self._lakebase_connection(),
-                    connection_key,
-                    record_key,
-                    {
-                        "created_at": time.time(),
-                        "fingerprint": fingerprint,
-                        "format_version": _IMMUTABLE_STATE_VERSION,
-                        "record_type": "channel-start",
-                        "schema_id": schema_id,
-                        "scope": scope,
-                        "start_lsn": str(start_lsn),
-                        "table": native_identity,
-                    },
-                    record_type="channel-start",
-                ),
+            winner = self._state(
+                publish_minimum_lsn_state_record,
+                connection_key,
+                record_key,
+                {
+                    "created_at": time.time(),
+                    "fingerprint": fingerprint,
+                    "format_version": _IMMUTABLE_STATE_VERSION,
+                    "record_type": "channel-start",
+                    "schema_id": schema_id,
+                    "scope": scope,
+                    "start_lsn": str(start_lsn),
+                    "table": native_identity,
+                },
+                record_type="channel-start",
                 operation="pre-capacity channel-start publish",
             )
             winner_start = self._immutable_lsn(winner, "start_lsn", exposed)
@@ -27534,26 +27567,22 @@ def register_lakeflow_source(spark):
             prefix = self._immutable_namespace(table)
             pipeline_key = hashlib.sha256(pipeline_id.encode()).hexdigest()[:32]
             namespace = self._lakebase_state_namespace()
-            self._state_op_with_reconnect(
-                lambda: touch_table_activity(
-                    self._lakebase_connection(),
-                    namespace,
-                    f"{prefix}/activity/{pipeline_key}",
-                    prefix,
-                    pipeline_id,
-                    touch_seconds,
-                ),
+            self._state(
+                touch_table_activity,
+                namespace,
+                f"{prefix}/activity/{pipeline_key}",
+                prefix,
+                pipeline_id,
+                touch_seconds,
                 operation="table-activity touch",
             )
             self._activity_touched[cache_key] = now
-            deleted = self._state_op_with_reconnect(
-                lambda: collect_stale_table_state(
-                    self._lakebase_connection(),
-                    namespace,
-                    "state-gc/table-activity",
-                    retention_days,
-                    interval_hours,
-                ),
+            deleted = self._state(
+                collect_stale_table_state,
+                namespace,
+                "state-gc/table-activity",
+                retention_days,
+                interval_hours,
                 operation="stale-state GC",
             )
             if deleted:
@@ -27567,13 +27596,11 @@ def register_lakeflow_source(spark):
                 # every other connector project in the workspace, which wakes each one's
                 # suspended endpoint, and every flow process doing so would wake them all
                 # that many times over.
-                if state is not None and self._state_op_with_reconnect(
-                    lambda: claim_staging_sweep(
-                        self._lakebase_connection(),
-                        self._lakebase_state_namespace(),
-                        f"{self._table_state_keys_for('')[0]}/project-gc",
-                        interval_hours * 3600,
-                    ),
+                if state is not None and self._state(
+                    claim_staging_sweep,
+                    self._lakebase_state_namespace(),
+                    f"{self._table_state_keys_for('')[0]}/project-gc",
+                    interval_hours * 3600,
                     operation="project cleanup claim",
                 ):
                     state.collect_unused_projects(project_retention_days, interval_hours)
@@ -27633,15 +27660,13 @@ def register_lakeflow_source(spark):
                     and _PIPELINE_SCOPE.fullmatch(candidate) is not None
                 ):
                     retained_scope = candidate
-            deleted = self._state_op_with_reconnect(
-                lambda: delete_obsolete_scoped_state_records(
-                    self._lakebase_connection(),
-                    self._lakebase_state_namespace(),
-                    self._immutable_namespace(table),
-                    f"{pipeline_id}_@_",
-                    current,
-                    retained_scope,
-                ),
+            deleted = self._state(
+                delete_obsolete_scoped_state_records,
+                self._lakebase_state_namespace(),
+                self._immutable_namespace(table),
+                f"{pipeline_id}_@_",
+                current,
+                retained_scope,
                 operation="obsolete-scope cleanup",
             )
             self._cleaned_update_scopes.add(cache_key)
@@ -27672,10 +27697,10 @@ def register_lakeflow_source(spark):
         def _read_immutable_head(self, namespace: str) -> dict[str, object] | None:
             # Docstring: Return the elected record for a key, or None when unwritten.
 
-            return self._state_op_with_reconnect(
-                lambda: read_state_record(
-                    self._lakebase_connection(), self._lakebase_state_namespace(), namespace
-                ),
+            return self._state(
+                read_state_record,
+                self._lakebase_state_namespace(),
+                namespace,
                 operation="head read",
             )
 
@@ -27693,18 +27718,16 @@ def register_lakeflow_source(spark):
             # writer's: a record is shared truth for its key, so a loser must adopt the
             # winner rather than assume its own value took effect.
 
-            return self._state_op_with_reconnect(
-                lambda: publish_state_record(
-                    self._lakebase_connection(),
-                    self._lakebase_state_namespace(),
-                    namespace,
-                    {
-                        **record,
-                        "format_version": _IMMUTABLE_STATE_VERSION,
-                        "record_type": record_type,
-                    },
-                    record_type=record_type,
-                ),
+            return self._state(
+                publish_state_record,
+                self._lakebase_state_namespace(),
+                namespace,
+                {
+                    **record,
+                    "format_version": _IMMUTABLE_STATE_VERSION,
+                    "record_type": record_type,
+                },
+                record_type=record_type,
                 operation="head publish",
             )
 

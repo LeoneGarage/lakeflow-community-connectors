@@ -20225,6 +20225,210 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertIn("waiting for a resnapshot", "\n".join(logs.output))
         self.assertEqual(waiting, seeded)
 
+    def test_an_auto_snapshot_own_start_restart_waits_marked_and_reads_on_above(self):
+        # Under auto_snapshot the upsert reader's expired start sends it to the resnapshot's
+        # boundary: until that was published it waited on an offset of advisory fields, which
+        # lost the own start, and once published, above the position, it jumped there, past
+        # deletes the kept destination needed. It waits marked, and then reads on.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        table, seeded = self._own_start_sent_back(bridge, reader, 30)
+        bridge.minimum = 50
+        options = {"snapshot.mode": "auto_snapshot"}
+
+        _, waiting = reader(4).read_table_deletes("app.orders", seeded, options)
+
+        self.assertEqual(waiting, seeded)
+        # The resnapshot has published its boundary, and not yet its floor.
+        bridge.now = 150
+        upsert = reader(4)
+        expired = dict(
+            _stream_offset(30),
+            schema_id=seeded["schema_id"],
+            schema_fingerprint=seeded["schema_fingerprint"],
+            pipeline_scope=f"{uuid.UUID(int=21)}_@_{uuid.UUID(int=2)}",
+        )
+        with mock.patch.object(upsert, "_publish_delete_snapshot_floor"):
+            upsert.read_table("app.orders", expired, dict(options))
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 124},
+            {"op": "DELETE", "tx_id": 7, "lsn": 125, "row": {"id": 1, "value": "a"}},
+            {"op": "COMMIT", "tx_id": 7, "lsn": 126},
+        ]
+        with self.assertNoLogs(informix_module.__name__, level="WARNING"):
+            rows, on = reader(4).read_table_deletes("app.orders", waiting, options)
+        self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(1, "d")])
+        self.assertNotIn("floor_seed", on)
+
+    def _floor(self, connector):
+        table = Table.parse(_table(), "demo")
+        return connector._read_immutable_head(
+            connector._immutable_namespace(
+                table, "delete-floor", connector._pipeline_id(connector._pipeline_scope())
+            )
+        )
+
+    def _first_floor_read_stale(self, connector, stale):
+        # The floor as read before a snapshot published its floor, then its start.
+        real, floors = connector._read_immutable_head, []
+
+        def read(namespace):
+            if "/delete-floor/" in namespace and not floors:
+                floors.append(namespace)
+                return stale
+            return real(namespace)
+
+        return mock.patch.object(connector, "_read_immutable_head", side_effect=read)
+
+    def test_an_own_start_read_across_its_refreshs_snapshot_is_not_sent_back(self):
+        # The floor read just before the refresh's snapshot published its floor and start,
+        # and the start just after: the own start was sent back (477), and the reader went
+        # back from the deletes it had read to the snapshot's start (an incremental one's is
+        # the refresh's).
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        options = {"snapshot.mode": "incremental"}
+        reader(2, "full_refresh").read_table("app.orders", {}, dict(options))
+        bridge.now = 120
+        deletes = reader(3, "full_refresh")
+        _, seeded = deletes.read_table_deletes("app.orders", {}, options)
+        stale = self._floor(deletes)
+        bridge.now = 140
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 124},
+            {"op": "DELETE", "tx_id": 7, "lsn": 125, "row": {"id": 1, "value": "a"}},
+            {"op": "COMMIT", "tx_id": 7, "lsn": 126},
+        ]
+        _, ahead = deletes.read_table_deletes("app.orders", seeded, options)
+        self.assertEqual((ahead["commit_lsn"], ahead["floor_seed"]), ("126", seeded["floor_seed"]))
+        reader(3, "full_refresh").read_table("app.orders", {}, dict(options))
+        table = Table.parse(_table(), "demo")
+        start = deletes._read_upsert_channel_start(table, seeded["floor_seed"])
+        self.assertEqual(start[0], 120)
+
+        with self._first_floor_read_stale(deletes, stale), self.assertNoLogs(
+            informix_module.__name__, level="WARNING"
+        ):
+            _, on = deletes.read_table_deletes("app.orders", ahead, options)
+
+        self.assertEqual(on["commit_lsn"], "126")
+        self.assertNotIn("floor_seed", on)
+
+    def test_a_floor_seed_read_across_a_new_snapshot_starts_again_at_its_floor(self):
+        # The floor read before a snapshot from no checkpoint published its floor and start,
+        # the start after: the old floor read as confirmed, and the position, the old
+        # snapshot's, read on into the new one's target.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        reader(2, "full_refresh").read_table("app.orders", {}, {})
+        later = reader(4)
+        _, seeded = later.read_table_deletes("app.orders", {}, {})
+        stale = self._floor(later)
+        bridge.now = 70
+        later.read_table("app.orders", {}, {})
+
+        with self._first_floor_read_stale(later, stale), self.assertLogs(
+            informix_module.__name__, level="WARNING"
+        ) as logs:
+            _, again = later.read_table_deletes("app.orders", seeded, {})
+
+        self.assertIn("has since replaced", "\n".join(logs.output))
+        self.assertEqual(again["commit_lsn"], "70")
+
+    def test_a_resnapshot_floor_names_the_last_snapshot_it_replaced(self):
+        # Through resnapshots in a row, and not past a snapshot that emptied the target.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        table = Table.parse(_table(), "demo")
+        bridge.minimum = 200  # no floor in the log is kept
+        scope = lambda update: f"{uuid.UUID(int=21)}_@_{uuid.UUID(int=update)}"  # noqa: E731
+        for update, resnapshot, kept in (
+            (2, False, scope(2)),
+            (4, True, scope(2)),
+            (5, True, scope(2)),
+            (6, False, scope(6)),
+            (7, True, scope(6)),
+        ):
+            with self.subTest(update=update):
+                publisher = reader(update)
+                publisher._publish_delete_snapshot_floor(
+                    table, "1" * 32, 100 + update, scope(update), resnapshot=resnapshot
+                )
+                record = self._floor(publisher)
+                self.assertEqual(publisher._floor_scopes(record), (scope(update), kept))
+                self.assertEqual(record.get("resnapshot", False), resnapshot)
+
+    def test_a_floor_seed_goes_on_across_a_resnapshot_that_replaced_its_floor(self):
+        # auto_snapshot resnapshotted the upsert reader's expired checkpoint, with the floor
+        # out of the log: the floor it published read as a snapshot that emptied the target
+        # (291), and the position, still in the log, started again at it, past the deletes
+        # between, of rows the destination kept.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        options = {"snapshot.mode": "auto_snapshot"}
+        reader(2, "full_refresh").read_table("app.orders", {}, dict(options))
+        later = reader(4)
+        _, seeded = later.read_table_deletes("app.orders", {}, options)
+        bridge.now = 130
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 124},
+            {"op": "DELETE", "tx_id": 7, "lsn": 125, "row": {"id": 1, "value": "a"}},
+            {"op": "COMMIT", "tx_id": 7, "lsn": 126},
+        ]
+        _, ahead = later.read_table_deletes("app.orders", seeded, options)
+        self.assertEqual((ahead["commit_lsn"], ahead["floor_seed"]), ("126", seeded["floor_seed"]))
+        bridge.minimum, bridge.now, bridge.changes = 100, 150, []
+        expired = dict(
+            _stream_offset(50), pipeline_scope=f"{uuid.UUID(int=21)}_@_{uuid.UUID(int=2)}"
+        )
+        later.read_table("app.orders", expired, dict(options))
+        self.assertEqual(self._floor(later)["snapshot_scope"], later._pipeline_scope())
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 8, "lsn": 134},
+            {"op": "DELETE", "tx_id": 8, "lsn": 135, "row": {"id": 2, "value": "b"}},
+            {"op": "COMMIT", "tx_id": 8, "lsn": 136},
+        ]
+
+        with self.assertNoLogs(informix_module.__name__, level="WARNING"):
+            rows, on = later.read_table_deletes("app.orders", ahead, options)
+
+        self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(2, "d")])
+        self.assertNotIn("floor_seed", on)
+
+    def test_an_own_start_beside_a_resnapshot_floor_keeps_its_mark(self):
+        # A resnapshot's floor, with none before it, read as a later update's snapshot of the
+        # emptied target (291): the own start's position was dropped for that floor's.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        bridge.now = 120
+        _, seeded = reader(3, "full_refresh").read_table_deletes("app.orders", {}, {})
+        table = Table.parse(_table(), "demo")
+        later = reader(5)
+        later._publish_delete_snapshot_floor(
+            table, seeded["schema_id"], 150, later._pipeline_scope(), resnapshot=True
+        )
+
+        self.assertEqual(
+            later._confirmed_floor_seed(table, seeded, {}), (seeded, seeded["floor_seed"])
+        )
+
+    def test_an_own_start_record_is_checked_as_a_published_start_is(self):
+        # A start read from the record reached the bootstrap unchecked, schema and table.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        bridge.now = 120
+        deletes = reader(3, "full_refresh")
+        _, seeded = deletes.read_table_deletes("app.orders", {}, {})
+        table = Table.parse(_table(), "demo")
+        deletes._publish_own_start(
+            table, seeded["floor_seed"], {"start_lsn": "90", "schema_id": "x", "fingerprint": "y"}
+        )
+
+        with self.assertRaisesRegex(InformixError, "Invalid Informix upsert start boundary"):
+            deletes._own_start_upsert_start(table, seeded["floor_seed"])
+        deletes.set_registration_scope(f"{uuid.UUID(int=21)}_@_{uuid.UUID(int=9)}")
+        self.assertEqual(deletes._noted_upsert_starts, {})
+
     def test_an_own_start_with_no_floor_starts_again_where_its_upsert_reader_went_on(self):
         # With no floor at all (a pipeline's first refresh, a table a migration brought) the
         # mark was kept for good, the published start never looked at: a kept checkpoint's

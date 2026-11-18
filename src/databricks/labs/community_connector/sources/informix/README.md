@@ -104,7 +104,10 @@ published this update's start. If the floor is another snapshot's (a full refres
 before the table's flows ran, and this update snapshots it), the delete reader starts
 again at the new floor, without waiting for that start; a replayed batch does what the
 batch did, told by the end it logged (one read under the earlier floor carries its mark,
-or ends below the new floor). A position another pipeline seeded, which a
+or ends below the new floor). A floor from auto_snapshot's resnapshot of an expired
+checkpoint is not such a snapshot: the destination kept its rows, so a position marked
+with the floor before it, or the floor beside an own start (below), goes on as it would
+have. A position another pipeline seeded, which a
 `table.migration` checkpoint brings, reads on, its mark dropped: that pipeline's floor
 confirmed it, and this pipeline's says nothing of it. A replayed first batch of a table,
 or of auto_snapshot's resnapshot of an expired checkpoint, which may establish a newer
@@ -130,7 +133,8 @@ kept on a record of the pipeline's, so a start published in an update in between
 too: one whose delete flow had finished before its upsert flow published, or whose own
 records a later update has cleaned up. Where neither is below its position, it reads on
 from the position instead, as starting again higher would skip the deletes between; and
-where it must wait (the start has left the retained log), it waits at its position. A
+where it must wait (the start has left the retained log, and under auto_snapshot until
+the resnapshot has published its boundary), it waits at its position. A
 replay of the batch that took the start, or of one that started again, reads nothing, as
 the batch read nothing. A table read from a `snapshot.source` extract, whose start is
 the extract's boundary, and the `recovery`, `initial_only` and `table.migration` paths do
