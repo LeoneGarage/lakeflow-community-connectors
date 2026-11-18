@@ -3827,6 +3827,31 @@ def register_lakeflow_source(spark):
     """
     )
 
+    # A full refresh's own start, which a delete reader took (own_start), and the lowest start
+    # an upsert reader published after it (start_lsn and its schema): another own start
+    # replaces the record, and a start lowers the one it holds (written alone where there is
+    # no record), so a delete reader sent back from that own start knows a start it never saw,
+    # of an update in between. No "scope", so the obsolete-update cleanup, which removes those
+    # updates' starts, leaves it.
+    _PUBLISH_OWN_START_RECORD = _sql(
+        """
+    INSERT INTO state_records (namespace, record_key, record, record_type)
+    VALUES (%(namespace)s, %(record_key)s, %(record)s::jsonb, %(record_type)s)
+    ON CONFLICT (namespace, record_key) DO UPDATE
+    SET record = CASE WHEN EXCLUDED.record ? 'own_start' THEN EXCLUDED.record
+      ELSE state_records.record || EXCLUDED.record END
+    WHERE state_records.record_type = EXCLUDED.record_type
+      AND state_records.record->>'table' = EXCLUDED.record->>'table'
+      AND CASE WHEN EXCLUDED.record ? 'own_start'
+        THEN state_records.record->>'own_start' IS DISTINCT FROM EXCLUDED.record->>'own_start'
+        ELSE NOT state_records.record ? 'start_lsn'
+          OR (state_records.record->>'start_lsn')::numeric
+             > (EXCLUDED.record->>'start_lsn')::numeric
+      END
+    RETURNING record
+    """
+    )
+
 
     # Resolved once and cached, but in a dict mutated in place -- never a bare module
     # global rebound via ``global``. The single-file merged deployment nests this whole
@@ -3905,6 +3930,36 @@ def register_lakeflow_source(spark):
         return _as_dict(row[0])
 
 
+    def _publish_conditional_record(
+        connection: Any,
+        statement: str,
+        namespace: str,
+        record_key: str,
+        record: dict[str, Any],
+        record_type: str,
+        what: str,
+    ) -> dict[str, Any]:
+        # Docstring: Publish a record by an ON CONFLICT ... DO UPDATE ... WHERE statement and
+        # return the elected value, the stored one where the condition kept it.
+
+        parameters = {
+            "namespace": namespace,
+            "record_key": record_key,
+            "record": json.dumps(record, sort_keys=True),
+            "record_type": record_type,
+        }
+        with connection.cursor() as cursor:
+            cursor.execute(statement, parameters)
+            row = cursor.fetchone()
+            if row is None:
+                cursor.execute(_SELECT_RECORD, parameters)
+                row = cursor.fetchone()
+        connection.commit()
+        if row is None:
+            raise LakebaseStateError(f"state record {namespace}/{record_key} vanished during {what}")
+        return _as_dict(row[0])
+
+
     def publish_minimum_lsn_state_record(
         connection: Any,
         namespace: str,
@@ -3922,25 +3977,15 @@ def register_lakeflow_source(spark):
         # winning minimum because schema transitions can legitimately occur later in
         # the same update.
 
-        payload = json.dumps(record, sort_keys=True)
-        parameters = {
-            "namespace": namespace,
-            "record_key": record_key,
-            "record": payload,
-            "record_type": record_type,
-        }
-        with connection.cursor() as cursor:
-            cursor.execute(_PUBLISH_MINIMUM_LSN_RECORD, parameters)
-            row = cursor.fetchone()
-            if row is None:
-                cursor.execute(_SELECT_RECORD, parameters)
-                row = cursor.fetchone()
-        connection.commit()
-        if row is None:
-            raise LakebaseStateError(
-                f"state record {namespace}/{record_key} vanished during minimum-LSN publication"
-            )
-        return _as_dict(row[0])
+        return _publish_conditional_record(
+            connection,
+            _PUBLISH_MINIMUM_LSN_RECORD,
+            namespace,
+            record_key,
+            record,
+            record_type,
+            "minimum-LSN publication",
+        )
 
 
     def publish_maximum_lsn_state_record(
@@ -3960,25 +4005,32 @@ def register_lakeflow_source(spark):
         # otherwise. PostgreSQL serializes the conflict update so concurrent publishers
         # converge.
 
-        payload = json.dumps(record, sort_keys=True)
-        parameters = {
-            "namespace": namespace,
-            "record_key": record_key,
-            "record": payload,
-            "record_type": record_type,
-        }
-        with connection.cursor() as cursor:
-            cursor.execute(_PUBLISH_MAXIMUM_LSN_RECORD, parameters)
-            row = cursor.fetchone()
-            if row is None:
-                cursor.execute(_SELECT_RECORD, parameters)
-                row = cursor.fetchone()
-        connection.commit()
-        if row is None:
-            raise LakebaseStateError(
-                f"state record {namespace}/{record_key} vanished during maximum-LSN publication"
-            )
-        return _as_dict(row[0])
+        return _publish_conditional_record(
+            connection,
+            _PUBLISH_MAXIMUM_LSN_RECORD,
+            namespace,
+            record_key,
+            record,
+            record_type,
+            "maximum-LSN publication",
+        )
+
+
+    def publish_own_start_state_record(
+        connection: Any, namespace: str, record_key: str, record: dict[str, Any]
+    ) -> dict[str, Any]:
+        # Docstring: Publish a full refresh's own start, or a start after it (see
+        # _PUBLISH_OWN_START_RECORD).
+
+        return _publish_conditional_record(
+            connection,
+            _PUBLISH_OWN_START_RECORD,
+            namespace,
+            record_key,
+            record,
+            "own-start",
+            "own-start publication",
+        )
 
 
     def read_state_record(connection: Any, namespace: str, record_key: str) -> dict[str, Any] | None:
@@ -6776,6 +6828,7 @@ def register_lakeflow_source(spark):
     _FULL_REFRESH_REQUESTS = frozenset({"full_refresh", "selective_refresh"})
     # The floor a delete position seeded at a full refresh's own start was taken beside.
     _SEED_FLOOR_FIELD = "seed_floor"
+    _SEED_MARKS = ("floor_seed", _SEED_FLOOR_FIELD)
     # The modes whose upsert reader starts a full refresh at the update's initialization
     # (_initial_lsn), which a delete reader may then take itself (_full_refresh_delete_seed).
     _OWN_START_SNAPSHOT_MODES = frozenset({"incremental", "auto_snapshot", "initial", "cdc_only"})
@@ -7693,10 +7746,18 @@ def register_lakeflow_source(spark):
             return True
         # A delete position's seed at a floor or a full refresh's own start, from none, holds no
         # rows; so does one that started again from a seeded position, ending idle at or below
-        # it. Replayed before the upsert reader had published, each read again: from no
-        # position it waited until its deadline, or read on from a lower floor and emitted
-        # deletes its batch never had, or fell short of its end (5).
-        if isinstance(end, dict) and end.get("floor_seed") and not positional.intersection(start or {}):
+        # it, or on another seed (a batch that reads on keeps its mark or drops it). Replayed
+        # before the upsert reader had published, each read again: from no position it waited
+        # until its deadline, or read on from a lower floor and emitted deletes its batch never
+        # had, or fell short of its end (5).
+        if (
+            isinstance(end, dict)
+            and end.get("floor_seed")
+            and (
+                not positional.intersection(start or {})
+                or end["floor_seed"] != (start or {}).get("floor_seed", end["floor_seed"])
+            )
+        ):
             return True
         if (
             isinstance(start, dict)
@@ -16487,6 +16548,8 @@ def register_lakeflow_source(spark):
             self._schema_transition_waits: dict[tuple[str, str], float] = {}
             self._activity_touched: dict[tuple[str, str], float] = {}
             self._cleaned_update_scopes: set[tuple[str, str]] = set()
+            # The lowest upsert start of an update this reader noted on the own-start record.
+            self._noted_upsert_starts: dict[tuple[str, str], int] = {}
             self._cleaned_snapshot_stages: set[str] = set()
             # Snapshot-page staging transport, resolved once on first use: None means the
             # FUSE mount; a WorkspaceFilesApi means the Files REST API. See _staging_transport.
@@ -19308,6 +19371,7 @@ def register_lakeflow_source(spark):
             # update until the upsert reader's start shows which snapshot the target holds.
             seeded = (start_offset or {}).get("floor_seed")
             seed_floor = (start_offset or {}).get(_SEED_FLOOR_FIELD)
+            restart_from = None
             if seeded is not None:
                 # Validated first: the check takes the seed apart (469 on an invalid one).
                 _validated_offset(start_offset)
@@ -19315,6 +19379,8 @@ def register_lakeflow_source(spark):
                     self._table(table_name, table_options), start_offset, table_options
                 )
                 if not confirmed:
+                    # One with a scope is sent back from a full refresh's own start (477).
+                    restart_from, seeded = (start_offset if seeded else None), None
                     # Started again, as a reader with no checkpoint, whose waits count on an
                     # offset of advisory fields alone: on the old offset they brought back the
                     # position the floor replaced, and a replay stopped at it.
@@ -19330,6 +19396,7 @@ def register_lakeflow_source(spark):
                 table_options,
                 snapshot_mode=snapshot_mode,
                 bootstrap_offset=bootstrap_offset,
+                restart_from=restart_from,
             )
             if seeded is not None and end.get("commit_lsn") is not None:
                 end = {**end, "floor_seed": seeded}
@@ -19476,6 +19543,17 @@ def register_lakeflow_source(spark):
             )
             start = self._initial_lsn(table, scope=scope)
             schema_id = self._snapshot_schema_ids[(scope, table.identity)]
+            # Announced, then this update's start looked for again: an upsert reader publishes
+            # its start, then looks for the announcement, so one of the two sees the other.
+            self._publish_own_start(table, scope, {"own_start": scope})
+            published = self._read_upsert_channel_start(table, scope)
+            if published is not None:
+                lsn, published_schema, fingerprint = published
+                self._publish_own_start(
+                    table,
+                    scope,
+                    {"start_lsn": str(lsn), "schema_id": published_schema, "fingerprint": fingerprint},
+                )
             # 476: Informix delete channel for '{}' starts at this full refresh's start {}, which it
             # took itself: its upsert reader had not published one yet
             logging.getLogger(__name__).info(_m(476, table.exposed_name, start))
@@ -19512,9 +19590,7 @@ def register_lakeflow_source(spark):
             # floor confirmed: this pipeline's floor says nothing of it, and the position stands.
 
             seeded = start_offset["floor_seed"]
-            unmarked = {
-                k: v for k, v in start_offset.items() if k not in ("floor_seed", _SEED_FLOOR_FIELD)
-            }
+            unmarked = {k: v for k, v in start_offset.items() if k not in _SEED_MARKS}
             pipeline = self._pipeline_id(self._pipeline_scope(start_offset))
             if self._pipeline_id(seeded) != pipeline:
                 return unmarked, None
@@ -19523,72 +19599,95 @@ def register_lakeflow_source(spark):
             )
             current = None if record is None else record.get("snapshot_scope")
             if _SEED_FLOOR_FIELD in start_offset:
-                return self._confirmed_own_start(table, start_offset, unmarked, current, table_options)
+                return self._confirmed_own_start(table, start_offset, unmarked, record, table_options)
             if current is None:
                 return start_offset, seeded
             if current != seeded:
-                stop = self._replay_stop_lsn(table_options)
-                logged, on_transaction = json.loads(
-                    table_options.get(_REPLAY_END_SEED_OPTION) or "[null, false]"
+                return self._replaced_floor_seed(
+                    table, start_offset, unmarked, record, table_options
                 )
-                if stop is not None and logged == seeded:
-                    return start_offset, seeded
-                if (
-                    stop is not None
-                    and logged is None
-                    # A batch that started again ends on its seed, which holds no transaction;
-                    # the new floor's page-start boundary can lie at or below its end.
-                    and (
-                        on_transaction
-                        or stop < self._immutable_lsn(record, "start_lsn", table.exposed_name)
-                    )
-                ):
-                    return unmarked, None
-                # 291: Informix delete channel for '{}' started at a snapshot floor that update {}
-                # has since replaced; it starts again at the new one
-                logging.getLogger(__name__).warning(_m(291, table.exposed_name, current))
-                return {}, None
             if self._read_upsert_channel_start(table, self._pipeline_scope(start_offset)) is None:
                 return start_offset, seeded
             return unmarked, None
+
+        def _replaced_floor_seed(
+            self,
+            table: Table,
+            start_offset: dict,
+            unmarked: dict,
+            record: dict,
+            table_options: dict[str, str],
+        ) -> tuple[dict, str | None]:
+            # Docstring: A seeded delete position whose floor another update's snapshot has
+            # replaced: it starts again, at the new one, but a replay does what its batch did.
+
+            seeded = start_offset["floor_seed"]
+            stop = self._replay_stop_lsn(table_options)
+            logged, on_transaction = json.loads(
+                table_options.get(_REPLAY_END_SEED_OPTION) or "[null, false]"
+            )
+            if stop is not None and logged == seeded:
+                return start_offset, seeded
+            if (
+                stop is not None
+                and logged is None
+                # A batch that started again ends on its seed, which holds no transaction;
+                # the new floor's page-start boundary can lie at or below its end.
+                and (
+                    on_transaction
+                    or stop < self._immutable_lsn(record, "start_lsn", table.exposed_name)
+                )
+            ):
+                return unmarked, None
+            # 291: Informix delete channel for '{}' started at a snapshot floor that update {}
+            # has since replaced; it starts again at the new one
+            logging.getLogger(__name__).warning(
+                _m(291, table.exposed_name, record.get("snapshot_scope"))
+            )
+            return {}, None
 
         def _confirmed_own_start(
             self,
             table: Table,
             start_offset: dict,
             unmarked: dict,
-            current: str | None,
+            record: dict | None,
             table_options: dict[str, str],
         ) -> tuple[dict, str | None]:
             # Docstring: _confirmed_floor_seed for a position seeded at a full refresh's own start
             # (_full_refresh_delete_seed), whose seed_floor names the floor beside it.
             #
-            # Any other floor since is a snapshot's into the target that refresh emptied (its own,
-            # or a later update's after it failed), whose boundary is at or above the start: the
-            # position stands, and the mark goes. With the floor unchanged, a start published by
-            # the refreshing update or this one is an upsert reader's that went on from a
-            # checkpoint the refresh left (a table set not to reset, one a migration brought): it
-            # starts again as one with no checkpoint, at the lower of the floor and that start,
-            # or it skipped the deletes between. Neither yet: read on. A floor of another update
-            # than the refreshing one was read as having replaced it, after a retry: the delete
-            # position was dropped. A replay lands as its batch did, told by the end it logged.
+            # The refresh's floor means the target holds its snapshot, taken at or above the
+            # start: the position stands, and the mark goes (also where that floor was the one
+            # beside the seed, published just before it). The floor unchanged: a start published
+            # by the refreshing update or this one is an upsert reader's that went on from a
+            # checkpoint the refresh left (a table set not to reset, one a migration brought),
+            # and the reader starts again as one with no checkpoint, at the lower of the floor
+            # and that start, or it skipped the deletes between; neither yet, it reads on. A
+            # floor of a third update is a snapshot of a target the refresh emptied and then
+            # failed to fill: the position may be past the log it kept, on a rebuilt source, or
+            # under a layout since changed, and it starts again at that floor, as a floor seed
+            # does. A start again here returns the seeded update, for the bootstrap: its start
+            # lowers the restart, and one not below the position reads on from it instead
+            # (_read_table_deletes_from). A replay does what its batch did: one that kept the
+            # mark keeps it; one that started again ended at or below its start, or seeded, and
+            # is not read (_range_emits_nothing), so with the floor unchanged the batch read on.
 
             seeded = start_offset["floor_seed"]
-            if (current or "") != start_offset[_SEED_FLOOR_FIELD]:
-                return unmarked, None
-            if self._replay_stop_lsn(table_options) is not None:
-                logged, _ = json.loads(table_options.get(_REPLAY_END_SEED_OPTION) or "[null, false]")
-                return (start_offset, seeded) if logged == seeded else (unmarked, None)
-            if all(
-                self._read_upsert_channel_start(table, scope) is None
-                for scope in dict.fromkeys((seeded, self._pipeline_scope()))
-            ):
+            current = None if record is None else record.get("snapshot_scope")
+            replaying = self._replay_stop_lsn(table_options) is not None
+            logged, _ = json.loads(table_options.get(_REPLAY_END_SEED_OPTION) or "[null, false]")
+            if replaying and logged == seeded:
                 return start_offset, seeded
-            # 477: Informix delete channel for '{}' started at full refresh {}'s own start,
-            # and its upsert reader went on from a checkpoint instead (the refresh left
-            # the table); it starts again at the upsert reader's position
-            logging.getLogger(__name__).warning(_m(477, table.exposed_name, seeded))
-            return {}, None
+            if current == seeded:
+                return unmarked, None
+            if current is not None and current != start_offset[_SEED_FLOOR_FIELD]:
+                return self._replaced_floor_seed(table, start_offset, unmarked, record, table_options)
+            if replaying:
+                return unmarked, None
+            if self._own_start_upsert_start(table, seeded) is None:
+                return start_offset, seeded
+            return {}, seeded
 
         def _read_table_deletes_from(
             self,
@@ -19598,6 +19697,7 @@ def register_lakeflow_source(spark):
             *,
             snapshot_mode: str = "initial",
             bootstrap_offset: dict | None = None,
+            restart_from: dict | None = None,
         ) -> tuple[Iterator[dict], dict]:
             # ``start_offset`` has already been through _effective_start_offset, which
             # collapses an all-advisory offset to {} so a retry looks like a fresh
@@ -19642,7 +19742,11 @@ def register_lakeflow_source(spark):
             # upsert reader owns initialization and publishes the table boundary
             # through durable shared state; delete readers only consume it.
             if not start_offset:
-                channel_start = self._read_upsert_channel_start(table, self._pipeline_scope())
+                channel_start = (
+                    self._own_start_upsert_start(table, restart_from["floor_seed"])
+                    if restart_from
+                    else self._read_upsert_channel_start(table, self._pipeline_scope())
+                )
                 if channel_start is None:
                     # The two Lakeflow flows have independent Spark checkpoints.  A
                     # delete flow with no checkpoint must therefore wait until the
@@ -19706,13 +19810,23 @@ def register_lakeflow_source(spark):
                     logging.getLogger(__name__).info(
                         _m(201, table.exposed_name, floor, high_water),
                     )
+                if restart_from:
+                    position = {k: v for k, v in restart_from.items() if k not in _SEED_MARKS}
+                    if bootstrap_lsn >= int(position.get("begin_lsn") or position["commit_lsn"]):
+                        # No start known below the position: starting again there skipped the
+                        # deletes between, and a replay could not tell the batch from a read on.
+                        return self._read_table_deletes_from(
+                            table_name, position, table_options, snapshot_mode=snapshot_mode
+                        )
+                # A restart that waits stays where it is, marked: an offset of advisory fields
+                # lost the own start, and the next batch started again above it.
                 if bootstrap_lsn < minimum:
                     # 202: Informix delete bootstrap boundary {} for '{}' precedes the minimum retained
                     # LSN {}; the delete channel is waiting for a resnapshot
                     logging.getLogger(__name__).warning(
                         _m(202, bootstrap_lsn, table.exposed_name, minimum),
                     )
-                    return iter(()), self._schema_node_fallback_offset(bootstrap_offset)
+                    return iter(()), restart_from or self._schema_node_fallback_offset(bootstrap_offset)
                 current = self._bridge.current_lsn()
                 if (bootstrap_lsn >> 32) > (current >> 32):
                     # 203: Informix delete bootstrap boundary {} for '{}' is ahead of the source's
@@ -19721,7 +19835,14 @@ def register_lakeflow_source(spark):
                     logging.getLogger(__name__).warning(
                         _m(203, bootstrap_lsn, table.exposed_name, current),
                     )
-                    return iter(()), self._schema_node_fallback_offset(bootstrap_offset)
+                    return iter(()), restart_from or self._schema_node_fallback_offset(bootstrap_offset)
+                if restart_from:
+                    # 477: Informix delete channel for '{}' started at full refresh {}'s own start,
+                    # and its upsert reader went on from a checkpoint instead (the refresh left
+                    # the table); it starts again below that start, at {}
+                    logging.getLogger(__name__).warning(
+                        _m(477, table.exposed_name, restart_from["floor_seed"], bootstrap_lsn)
+                    )
                 # The seed is this update's first offset for the flow: see _read_stream.
                 return iter(()), {
                     **_offset(
@@ -26778,6 +26899,15 @@ def register_lakeflow_source(spark):
             ):
                 # 312: Conflicting Informix upsert start boundary for '{}' in update scope '{}'
                 raise InformixError(_m(312, table.exposed_name, scope))
+            # After the start, as _full_refresh_delete_seed announces before it looks for one.
+            noted = self._noted_upsert_starts.get((table.identity, scope))
+            if noted is None or start_lsn < noted:
+                self._publish_own_start(
+                    table,
+                    scope,
+                    {"start_lsn": str(start_lsn), "schema_id": schema_id, "fingerprint": fingerprint},
+                )
+                self._noted_upsert_starts[(table.identity, scope)] = start_lsn
 
         def _schema_descends_from(
             self,
@@ -26816,6 +26946,47 @@ def register_lakeflow_source(spark):
                     return False
                 current, expected_fingerprint = predecessor, None
             return False
+
+        def _publish_own_start(self, table: Table, scope: str, fields: dict) -> None:
+            # Docstring: Publish to the pipeline's own-start record for the table
+            # (publish_own_start_state_record): a full refresh's own start, or a later start.
+
+            self._state_op_with_reconnect(
+                lambda: publish_own_start_state_record(
+                    self._lakebase_connection(),
+                    self._lakebase_state_namespace(),
+                    self._immutable_namespace(table, "own-start", self._pipeline_id(scope)),
+                    {
+                        "format_version": _IMMUTABLE_STATE_VERSION,
+                        "record_type": "own-start",
+                        "table": table.native_identity,
+                        **fields,
+                    },
+                ),
+                operation="own-start publish",
+            )
+
+        def _own_start_upsert_start(self, table: Table, seeded: str) -> tuple[int, str, str] | None:
+            # Docstring: The lowest start an upsert reader published after full refresh
+            # ``seeded``'s own start, as _read_upsert_channel_start gives one, or None.
+            #
+            # From the pipeline's own-start record, which outlives the updates' (the cleanup of
+            # a later one removed the refreshing update's start, and a triggered update's delete
+            # flow could end before its upsert flow published), and from the refreshing and
+            # current updates' starts (a position seeded before the record).
+
+            starts = [
+                self._read_upsert_channel_start(table, scope)
+                for scope in dict.fromkeys((seeded, self._pipeline_scope()))
+            ]
+            own = self._read_immutable_head(
+                self._immutable_namespace(table, "own-start", self._pipeline_id(seeded))
+            )
+            if own is not None and own.get("own_start") == seeded and "start_lsn" in own:
+                self._validate_immutable_record_header(own, "own-start", table.exposed_name)
+                lsn = self._immutable_lsn(own, "start_lsn", table.exposed_name)
+                starts.append((lsn, str(own["schema_id"]), str(own["fingerprint"])))
+            return min(filter(None, starts), default=None)
 
         def _read_upsert_channel_start(self, table: Table, scope: str) -> tuple[int, str, str] | None:
             record = self._read_immutable_head(

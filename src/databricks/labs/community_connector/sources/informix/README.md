@@ -119,11 +119,20 @@ as the upsert reader would). The deletes from that start on are those the emptie
 needs, and they are applied while the refresh runs, however long it takes; any earlier
 than the snapshot remove rows it does not hold. Its mark names this update and the floor
 it was taken beside, until a snapshot publishes another floor; the position stands across
-an automatic retry of the refresh. If the upsert reader instead goes on from a checkpoint
-the refresh left it (a table set not to reset, one a migration brought), it publishes its
-start with the floor unchanged, and the delete reader starts again at the lower of the
-floor and that start, with a warning in the event log. A replay of the batch that took the
-start, or of one that started again, reads nothing, as the batch read nothing. A table read from a `snapshot.source` extract, whose start is
+an automatic retry of the refresh. The refresh's own floor confirms it. A later update's
+floor (the refresh emptied the target and failed, and that update snapshotted it, perhaps
+from a rebuilt source) starts it again at that floor, with a warning in the event log. If
+the upsert reader instead goes on from a checkpoint the refresh left it (a table set not
+to reset, one a migration brought), it publishes its start with the floor unchanged, and
+the delete reader starts again at the lower of the floor and the lowest start any upsert
+reader has published since the refresh, with a warning in the event log. That start is
+kept on a record of the pipeline's, so a start published in an update in between counts
+too: one whose delete flow had finished before its upsert flow published, or whose own
+records a later update has cleaned up. Where neither is below its position, it reads on
+from the position instead, as starting again higher would skip the deletes between; and
+where it must wait (the start has left the retained log), it waits at its position. A
+replay of the batch that took the start, or of one that started again, reads nothing, as
+the batch read nothing. A table read from a `snapshot.source` extract, whose start is
 the extract's boundary, and the `recovery`, `initial_only` and `table.migration` paths do
 not take it.
 

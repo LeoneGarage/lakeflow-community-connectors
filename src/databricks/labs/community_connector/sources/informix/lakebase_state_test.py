@@ -482,9 +482,29 @@ class _FakeCursor:
         # apart by that operator rather than by the shared start_lsn reference.
         minimum_lsn = "::numeric > (EXCLUDED.record->>'start_lsn')" in text
         maximum_lsn = "::numeric < (EXCLUDED.record->>'start_lsn')" in text
+        own_start = "record->>'own_start' IS DISTINCT FROM" in text
         with self._database.lock:
             if key in self._database.records and immutable:
                 return  # ON CONFLICT DO NOTHING: no row returned
+            if key in self._database.records and own_start:
+                existing = json.loads(self._database.records[key])
+                candidate = json.loads(args["record"])
+                if self._database.record_types.get(key) != args.get(
+                    "record_type"
+                ) or existing.get("table") != candidate.get("table"):
+                    return
+                if "own_start" in candidate:
+                    if existing.get("own_start") == candidate["own_start"]:
+                        return
+                elif "start_lsn" in existing and int(existing["start_lsn"]) <= int(
+                    candidate["start_lsn"]
+                ):
+                    return
+                else:
+                    candidate = {**existing, **candidate}
+                self._database.records[key] = json.dumps(candidate)
+                self._result = [(self._database.records[key],)]
+                return
             if key in self._database.records and (minimum_lsn or maximum_lsn):
                 existing = json.loads(self._database.records[key])
                 candidate = json.loads(args["record"])
@@ -1292,6 +1312,37 @@ class LakebaseStateRecordTests(unittest.TestCase):
             record_type="delete-floor",
         )
         self.assertEqual(winner, self._floor_record(120, schema_id="successor"))
+
+    def test_an_own_start_record_keeps_the_lowest_start_since_its_own_start(self):
+        # A start lowers whichever own start the record holds, and only lowers; another own
+        # start replaces it, the same one leaves it.
+        record = {"format_version": 1, "record_type": "own-start", "table": "demo:app.orders"}
+
+        def announce(own_start):
+            return lakebase_state.publish_own_start_state_record(
+                self.connection, "ns", "own", {**record, "own_start": own_start}
+            )
+
+        def lower(lsn):
+            lakebase_state.publish_own_start_state_record(
+                self.connection, "ns", "own", {**record, "start_lsn": str(lsn), "schema_id": "s"}
+            )
+            stored = lakebase_state.read_state_record(self.connection, "ns", "own")
+            return stored.get("own_start"), stored.get("start_lsn")
+
+        # With no record a start is written alone, of no own start; the own start replaces it.
+        self.assertEqual(lower(90), (None, "90"))
+        self.assertNotIn("start_lsn", announce("update-3"))
+        self.assertEqual(lower(1000), ("update-3", "1000"))
+        self.assertEqual(lower(90), ("update-3", "90"))
+        self.assertEqual(lower(150), ("update-3", "90"))
+        self.assertEqual(announce("update-3")["start_lsn"], "90")
+        self.assertNotIn("start_lsn", announce("update-7"))
+        self.assertEqual(lower(200), ("update-7", "200"))
+        other = lakebase_state.publish_own_start_state_record(
+            self.connection, "ns", "own", {**record, "table": "demo:app.other", "own_start": "x"}
+        )
+        self.assertEqual(other["own_start"], "update-7")
 
     def test_vanished_record_raises_rather_than_returning_an_unelected_value(self):
         # Returning the caller's own value here would let two readers disagree

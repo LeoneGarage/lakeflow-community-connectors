@@ -476,5 +476,5 @@
 "Option '{}' of table '{}' is never read: snapshot.mode=cdc_only, an append-only table's default, reads no snapshot; set snapshot.mode=initial",
 "Option '{}' of table '{}' is never read: snapshot.mode={} takes no snapshot from it; set snapshot.mode=initial or snapshot.mode=initial_only",
 "Informix delete channel for '{}' starts at this full refresh's start {}, which it took itself: its upsert reader had not published one yet",
-"Informix delete channel for '{}' started at full refresh {}'s own start, and its upsert reader went on from a checkpoint instead (the refresh left the table); it starts again at the upsert reader's position"
+"Informix delete channel for '{}' started at full refresh {}'s own start, and its upsert reader went on from a checkpoint instead (the refresh left the table); it starts again below that start, at {}"
 ]

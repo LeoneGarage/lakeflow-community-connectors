@@ -2550,6 +2550,31 @@ RETURNING record
 """
 )
 
+# A full refresh's own start, which a delete reader took (own_start), and the lowest start
+# an upsert reader published after it (start_lsn and its schema): another own start
+# replaces the record, and a start lowers the one it holds (written alone where there is
+# no record), so a delete reader sent back from that own start knows a start it never saw,
+# of an update in between. No "scope", so the obsolete-update cleanup, which removes those
+# updates' starts, leaves it.
+_PUBLISH_OWN_START_RECORD = _sql(
+    """
+INSERT INTO state_records (namespace, record_key, record, record_type)
+VALUES (%(namespace)s, %(record_key)s, %(record)s::jsonb, %(record_type)s)
+ON CONFLICT (namespace, record_key) DO UPDATE
+SET record = CASE WHEN EXCLUDED.record ? 'own_start' THEN EXCLUDED.record
+  ELSE state_records.record || EXCLUDED.record END
+WHERE state_records.record_type = EXCLUDED.record_type
+  AND state_records.record->>'table' = EXCLUDED.record->>'table'
+  AND CASE WHEN EXCLUDED.record ? 'own_start'
+    THEN state_records.record->>'own_start' IS DISTINCT FROM EXCLUDED.record->>'own_start'
+    ELSE NOT state_records.record ? 'start_lsn'
+      OR (state_records.record->>'start_lsn')::numeric
+         > (EXCLUDED.record->>'start_lsn')::numeric
+  END
+RETURNING record
+"""
+)
+
 
 # Resolved once and cached, but in a dict mutated in place -- never a bare module
 # global rebound via ``global``. The single-file merged deployment nests this whole
@@ -2628,6 +2653,36 @@ def publish_state_record(
     return _as_dict(row[0])
 
 
+def _publish_conditional_record(
+    connection: Any,
+    statement: str,
+    namespace: str,
+    record_key: str,
+    record: dict[str, Any],
+    record_type: str,
+    what: str,
+) -> dict[str, Any]:
+    # Docstring: Publish a record by an ON CONFLICT ... DO UPDATE ... WHERE statement and
+    # return the elected value, the stored one where the condition kept it.
+
+    parameters = {
+        "namespace": namespace,
+        "record_key": record_key,
+        "record": json.dumps(record, sort_keys=True),
+        "record_type": record_type,
+    }
+    with connection.cursor() as cursor:
+        cursor.execute(statement, parameters)
+        row = cursor.fetchone()
+        if row is None:
+            cursor.execute(_SELECT_RECORD, parameters)
+            row = cursor.fetchone()
+    connection.commit()
+    if row is None:
+        raise LakebaseStateError(f"state record {namespace}/{record_key} vanished during {what}")
+    return _as_dict(row[0])
+
+
 def publish_minimum_lsn_state_record(
     connection: Any,
     namespace: str,
@@ -2645,25 +2700,15 @@ def publish_minimum_lsn_state_record(
     # winning minimum because schema transitions can legitimately occur later in
     # the same update.
 
-    payload = json.dumps(record, sort_keys=True)
-    parameters = {
-        "namespace": namespace,
-        "record_key": record_key,
-        "record": payload,
-        "record_type": record_type,
-    }
-    with connection.cursor() as cursor:
-        cursor.execute(_PUBLISH_MINIMUM_LSN_RECORD, parameters)
-        row = cursor.fetchone()
-        if row is None:
-            cursor.execute(_SELECT_RECORD, parameters)
-            row = cursor.fetchone()
-    connection.commit()
-    if row is None:
-        raise LakebaseStateError(
-            f"state record {namespace}/{record_key} vanished during minimum-LSN publication"
-        )
-    return _as_dict(row[0])
+    return _publish_conditional_record(
+        connection,
+        _PUBLISH_MINIMUM_LSN_RECORD,
+        namespace,
+        record_key,
+        record,
+        record_type,
+        "minimum-LSN publication",
+    )
 
 
 def publish_maximum_lsn_state_record(
@@ -2683,25 +2728,32 @@ def publish_maximum_lsn_state_record(
     # otherwise. PostgreSQL serializes the conflict update so concurrent publishers
     # converge.
 
-    payload = json.dumps(record, sort_keys=True)
-    parameters = {
-        "namespace": namespace,
-        "record_key": record_key,
-        "record": payload,
-        "record_type": record_type,
-    }
-    with connection.cursor() as cursor:
-        cursor.execute(_PUBLISH_MAXIMUM_LSN_RECORD, parameters)
-        row = cursor.fetchone()
-        if row is None:
-            cursor.execute(_SELECT_RECORD, parameters)
-            row = cursor.fetchone()
-    connection.commit()
-    if row is None:
-        raise LakebaseStateError(
-            f"state record {namespace}/{record_key} vanished during maximum-LSN publication"
-        )
-    return _as_dict(row[0])
+    return _publish_conditional_record(
+        connection,
+        _PUBLISH_MAXIMUM_LSN_RECORD,
+        namespace,
+        record_key,
+        record,
+        record_type,
+        "maximum-LSN publication",
+    )
+
+
+def publish_own_start_state_record(
+    connection: Any, namespace: str, record_key: str, record: dict[str, Any]
+) -> dict[str, Any]:
+    # Docstring: Publish a full refresh's own start, or a start after it (see
+    # _PUBLISH_OWN_START_RECORD).
+
+    return _publish_conditional_record(
+        connection,
+        _PUBLISH_OWN_START_RECORD,
+        namespace,
+        record_key,
+        record,
+        "own-start",
+        "own-start publication",
+    )
 
 
 def read_state_record(connection: Any, namespace: str, record_key: str) -> dict[str, Any] | None:

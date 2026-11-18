@@ -20003,7 +20003,7 @@ class LakeflowContractTests(unittest.TestCase):
         # (read as "continue") went on: the floor, still the one before the refresh, read as
         # having replaced the seed (291), which dropped the delete position, and with that
         # floor unusable the reader waited again and ended with nothing. The position
-        # stands, marked, until a snapshot publishes a floor, and then reads on.
+        # stands, marked, until a snapshot publishes a floor.
         bridge = FakeBridge()
         reader = self._floor_updates(bridge)
         reader(2, "full_refresh").read_table("app.orders", {}, {})
@@ -20018,12 +20018,212 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(
             (waiting["commit_lsn"], waiting["floor_seed"]), ("120", seeded["floor_seed"])
         )
-        bridge.now = 140
-        reader(4, "continue").read_table("app.orders", {}, {})
-        _, on = retry.read_table_deletes("app.orders", waiting, {})
+
+    def test_an_own_start_starts_again_at_a_later_updates_floor(self):
+        # The refresh emptied the target and failed; a later update's snapshot filled it, on
+        # a source since rebuilt. That floor dropped the mark and the position stood: it read
+        # on at 120, past the rebuilt log's end, and missed what the new snapshot started at.
+        # Another update's floor restarts it there, as a floor seed's does (291).
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        reader(2, "full_refresh").read_table("app.orders", {}, {})
+        bridge.now = 120
+        _, seeded = reader(3, "full_refresh").read_table_deletes("app.orders", {}, {})
+        later = reader(4, "continue")
+        _, waiting = later.read_table_deletes("app.orders", seeded, {})
+        bridge.now = 70  # the rebuilt source's log is behind the refresh's start
+        later.read_table("app.orders", {}, {})
+
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+            _, again = later.read_table_deletes("app.orders", waiting, {})
+
+        self.assertIn("has since replaced", "\n".join(logs.output))
+        self.assertEqual(again["commit_lsn"], "70")
+        self.assertNotIn("floor_seed", again)
+        self.assertNotIn("seed_floor", again)
+
+    def test_an_own_start_beside_its_refreshs_own_floor_reads_on(self):
+        # The upsert reader published its floor, then its start, between the delete reader's
+        # look for that start and its read of the floor: the seed was taken beside the
+        # refresh's own floor, which then read as unchanged, and the published start sent the
+        # position back to the floor (477), as if the upsert reader had gone on from a
+        # checkpoint. That floor is the refresh's snapshot: the position reads on.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        bridge.now = 120
+        deletes = reader(3, "full_refresh")
+        _, seeded = deletes.read_table_deletes("app.orders", {}, {})
+        reader(3, "full_refresh").read_table("app.orders", {}, {})
+        raced = dict(seeded, seed_floor=seeded["floor_seed"])
+
+        with self.assertNoLogs(informix_module.__name__, level="WARNING"):
+            _, on = deletes.read_table_deletes("app.orders", raced, {})
+
         self.assertEqual(on["commit_lsn"], "120")
         self.assertNotIn("floor_seed", on)
+
+    def _own_start_sent_back(self, bridge, reader, later_start):
+        # A delete reader on update 3's own start, at 120, with no floor; update 4's upsert
+        # reader publishes its start at ``later_start``.
+        bridge.now = 120
+        _, seeded = reader(3, "full_refresh").read_table_deletes("app.orders", {}, {})
+        table = Table.parse(_table(), "demo")
+        upsert = reader(4)
+        upsert._publish_upsert_channel_start(
+            table, later_start, seeded["schema_id"], _schema_fingerprint(table),
+            upsert._pipeline_scope(),
+        )
+        return table, seeded
+
+    def test_an_own_start_sent_back_above_its_position_reads_on(self):
+        # With no floor, the upsert reader's start sent the position back (477) to that
+        # start, above it: the deletes between were skipped, and a replay of the batch, which
+        # read nothing, could not be told from one that read on, once a later update's floor
+        # had replaced the one beside the seed. No start below the position is known, so it
+        # reads on, and so do its replays.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        _, seeded = self._own_start_sent_back(bridge, reader, 130)
+        bridge.now = 140
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 124},
+            {"op": "DELETE", "tx_id": 7, "lsn": 125, "row": {"id": 1, "value": "a"}},
+            {"op": "COMMIT", "tx_id": 7, "lsn": 126},
+        ]
+
+        with self.assertNoLogs(informix_module.__name__, level="WARNING"):
+            rows, on = reader(4).read_table_deletes("app.orders", seeded, {})
+
+        self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(1, "d")])
+        self.assertNotIn("floor_seed", on)
         self.assertNotIn("seed_floor", on)
+        bridge.now = 200
+        for update in (4, 5, 7):
+            if update == 7:
+                # A later update's snapshot publishes a floor before the replay.
+                reader(6, "full_refresh").read_table("app.orders", {}, {})
+            with self.subTest(update=update):
+                replaying = reader(update)
+                options: dict[str, str] = {}
+
+                rows = informix_module._replay_between_offsets(
+                    seeded,
+                    on,
+                    lambda offset, replaying=replaying, options=options: (
+                        replaying.read_table_deletes("app.orders", offset, options)
+                    ),
+                    options,
+                    replaying.options,
+                )
+
+                self.assertEqual([(row["id"], row["_informix_op"]) for row in rows], [(1, "d")])
+
+    def test_an_own_start_sent_back_in_a_later_update_starts_at_the_refreshs_start(self):
+        # The refreshing update's upsert reader went on from a checkpoint at 90 and
+        # published that start, and the delete reader read no batch after it in that update.
+        # In the next one, starting again (477) went to that update's start, and with
+        # none yet seeded at the refresh's own start again, or above both: the deletes
+        # from 90 were skipped.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        table, seeded = self._own_start_sent_back(bridge, reader, 130)
+        refresh = reader(3, "full_refresh")
+        refresh._publish_upsert_channel_start(
+            table, 90, seeded["schema_id"], _schema_fingerprint(table), seeded["pipeline_scope"]
+        )
+        for update, request in ((4, "continue"), (5, "full_refresh")):
+            with self.subTest(update=update):
+                with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+                    _, again = reader(update, request).read_table_deletes(
+                        "app.orders", seeded, {}
+                    )
+
+                self.assertIn("went on from a checkpoint", "\n".join(logs.output))
+                self.assertEqual(again["commit_lsn"], "90")
+                self.assertNotIn("floor_seed", again)
+                # Ending below its start, the batch is not read again in a replay.
+                self.assertTrue(informix_module._range_emits_nothing(seeded, again))
+
+    def _drop_upsert_start(self, connector, table, update):
+        # What a later update's cleanup of update ``update``'s records does to its start.
+        records = self._lakebase.database.records
+        key = connector._immutable_namespace(
+            table, "channel-starts", f"{uuid.UUID(int=21)}_@_{uuid.UUID(int=update)}", "upsert"
+        )
+        self.assertIsNotNone(records.pop((connector._lakebase_state_namespace(), key), None))
+
+    def test_an_own_start_sent_back_after_an_update_in_between_starts_at_its_start(self):
+        # The refresh failed before its upsert flow ran. In the next, triggered, update the
+        # delete flow read before its upsert flow went on from a checkpoint at 90 and
+        # published that start; the update after it cleaned that start up and published its
+        # own, at 150. Starting again (477) then went to 150, or read on from 120: the
+        # deletes from 90 were skipped. The own start's record keeps the lowest start since.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        bridge.now = 120
+        _, seeded = reader(3, "full_refresh").read_table_deletes("app.orders", {}, {})
+        _, waiting = reader(4).read_table_deletes("app.orders", seeded, {})
+        self.assertEqual(waiting["floor_seed"], seeded["floor_seed"])
+        table = Table.parse(_table(), "demo")
+        later = reader(4)
+        later._publish_upsert_channel_start(
+            table, 90, seeded["schema_id"], _schema_fingerprint(table), later._pipeline_scope()
+        )
+        self._drop_upsert_start(later, table, 4)
+        last = reader(5)
+        last._publish_upsert_channel_start(
+            table, 150, seeded["schema_id"], _schema_fingerprint(table), last._pipeline_scope()
+        )
+
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+            _, again = reader(5).read_table_deletes("app.orders", waiting, {})
+
+        self.assertIn("went on from a checkpoint", "\n".join(logs.output))
+        self.assertEqual(again["commit_lsn"], "90")
+        self.assertNotIn("floor_seed", again)
+
+    def test_an_upsert_start_published_as_the_own_start_is_taken_is_kept(self):
+        # The upsert reader published its start after the delete reader looked for one and
+        # before it took the update's start: neither the reader's note (no own start yet)
+        # nor a later update (its cleanup removed that start) knew of it. The delete reader
+        # looks again once it has announced its own start, and notes it.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        bridge.now = 120
+        table = Table.parse(_table(), "demo")
+        refresh = reader(3, "full_refresh")
+        _, seeded = refresh.read_table_deletes("app.orders", {}, {})
+        # As if the seed had not yet announced itself when the upsert reader published: the
+        # announcement then replaces the start the reader wrote.
+        own = refresh._immutable_namespace(
+            table, "own-start", refresh._pipeline_id(seeded["floor_seed"])
+        )
+        self._lakebase.database.records.pop((refresh._lakebase_state_namespace(), own))
+        refresh._publish_upsert_channel_start(
+            table, 90, seeded["schema_id"], _schema_fingerprint(table), seeded["floor_seed"]
+        )
+
+        refresh._full_refresh_delete_seed(table, {}, "incremental")
+
+        self._drop_upsert_start(refresh, table, 3)
+        start = reader(4)._own_start_upsert_start(table, seeded["floor_seed"])
+        self.assertEqual(start[0], 90)
+
+    def test_an_own_start_restart_that_waits_keeps_its_position(self):
+        # The upsert reader's start is below the retained log: the restart waits for a
+        # resnapshot (202). It waited on an offset of advisory fields, which lost the own
+        # start: the next batch bootstrapped as a reader with no checkpoint, at a start
+        # published later and above the refresh's.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        table, seeded = self._own_start_sent_back(bridge, reader, 30)
+        bridge.minimum = 50
+
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+            _, waiting = reader(4).read_table_deletes("app.orders", seeded, {})
+
+        self.assertIn("waiting for a resnapshot", "\n".join(logs.output))
+        self.assertEqual(waiting, seeded)
 
     def test_an_own_start_with_no_floor_starts_again_where_its_upsert_reader_went_on(self):
         # With no floor at all (a pipeline's first refresh, a table a migration brought) the
@@ -20058,8 +20258,13 @@ class LakeflowContractTests(unittest.TestCase):
                 dict(_stream_offset(120), floor_seed=f"{uuid.UUID(int=1)}_@_{uuid.UUID(int=3)}"),
                 _stream_offset(85),
             ),
+            # One that started again and seeded at another floor, above its position.
+            (
+                dict(_stream_offset(120), floor_seed=f"{uuid.UUID(int=1)}_@_{uuid.UUID(int=3)}"),
+                dict(_stream_offset(150), floor_seed=f"{uuid.UUID(int=1)}_@_{uuid.UUID(int=5)}"),
+            ),
         ):
-            with self.subTest(start=start.get("commit_lsn")):
+            with self.subTest(start=start.get("commit_lsn"), end=end["commit_lsn"]):
                 calls = []
 
                 def read(offset, calls=calls):
