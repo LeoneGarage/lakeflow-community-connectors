@@ -1905,14 +1905,11 @@ class LakeflowContractTests(unittest.TestCase):
         read_table = vars(interface)["read_table"]
         self.assertIsNone(read_table.__doc__)
         self.assertIsNone(read_table.__code__.co_consts[0])
-        # Only the Spark data source wrapper, merged after informix.py, keeps the prefix.
-        with open(generated.__file__, encoding="utf-8") as handle:
-            wrapper_line = next(
-                number
-                for number, line in enumerate(handle, 1)
-                if line.strip()
-                == "# src/databricks/labs/community_connector/sparkpds/lakeflow_datasource.py"
-            )
+        # The Spark data source wrapper, merged after informix.py, too: it is shortened as it
+        # registers (_ShortenedRegistrations), where it kept its prefixes and docstrings.
+        source = reached["LakeflowSource"]
+        self.assertEqual(source.__qualname__, "LakeflowSource")
+        self.assertIsNone(vars(source)["reader"].__doc__)
         if sys.version_info < (3, 11):
             # No co_qualname, and a function made at run time (the reader hooks
             # __init_subclass__ installs) takes its qualname from a string constant.
@@ -1921,7 +1918,6 @@ class LakeflowContractTests(unittest.TestCase):
             name
             for name, value in reached.items()
             if isinstance(value, types.FunctionType)
-            and value.__code__.co_firstlineno < wrapper_line
             and "register_lakeflow_source.<locals>." in value.__code__.co_qualname
         )
         self.assertEqual(prefixed, [])
@@ -4724,6 +4720,16 @@ class LakeflowContractTests(unittest.TestCase):
                 "continue",
             ),
             ({"full_refresh": False, "cause": "API_CALL"}, "continue"),
+            # By source file, from an editor's "run file with full refresh".
+            (
+                {"full_refresh": False, "full_refresh_selection_by_path": ["f.py"]},
+                "selective_refresh",
+            ),
+            # A full refresh with a selection resets only some tables.
+            ({"full_refresh": True, "full_refresh_selection": ["t"]}, "selective_refresh"),
+            ({"full_refresh": True, "refresh_selection": ["t"]}, "selective_refresh"),
+            ({"refresh_selection": ["t"]}, "continue"),
+            ({"refresh_selection_by_path": ["f.py"]}, "continue"),
             ({}, "continue"),
             (None, None),
         ):
@@ -19992,6 +19998,104 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(again["commit_lsn"], "90")
         self.assertNotIn("floor_seed", again)
 
+    def test_an_own_start_survives_a_retry_of_its_full_refresh(self):
+        # The refresh failed before its snapshot published a floor, and its automatic retry
+        # (read as "continue") went on: the floor, still the one before the refresh, read as
+        # having replaced the seed (291), which dropped the delete position, and with that
+        # floor unusable the reader waited again and ended with nothing. The position
+        # stands, marked, until a snapshot publishes a floor, and then reads on.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        reader(2, "full_refresh").read_table("app.orders", {}, {})
+        bridge.now = 120
+        _, seeded = reader(3, "full_refresh").read_table_deletes("app.orders", {}, {})
+        self.assertEqual(seeded["seed_floor"], f"{uuid.UUID(int=21)}_@_{uuid.UUID(int=2)}")
+        retry = reader(4, "continue")
+
+        with self.assertNoLogs(informix_module.__name__, level="WARNING"):
+            _, waiting = retry.read_table_deletes("app.orders", seeded, {})
+
+        self.assertEqual(
+            (waiting["commit_lsn"], waiting["floor_seed"]), ("120", seeded["floor_seed"])
+        )
+        bridge.now = 140
+        reader(4, "continue").read_table("app.orders", {}, {})
+        _, on = retry.read_table_deletes("app.orders", waiting, {})
+        self.assertEqual(on["commit_lsn"], "120")
+        self.assertNotIn("floor_seed", on)
+        self.assertNotIn("seed_floor", on)
+
+    def test_an_own_start_with_no_floor_starts_again_where_its_upsert_reader_went_on(self):
+        # With no floor at all (a pipeline's first refresh, a table a migration brought) the
+        # mark was kept for good, the published start never looked at: a kept checkpoint's
+        # deletes below the refresh's start were skipped for good.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        bridge.now = 120
+        deletes = reader(3, "full_refresh")
+        _, seeded = deletes.read_table_deletes("app.orders", {}, {})
+        self.assertEqual(seeded["seed_floor"], "")
+        upsert = reader(3, "full_refresh")
+        table = Table.parse(_table(), "demo")
+        upsert._publish_upsert_channel_start(
+            table, 95, seeded["schema_id"], _schema_fingerprint(table), seeded["pipeline_scope"]
+        )
+
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+            _, again = deletes.read_table_deletes("app.orders", seeded, {})
+
+        self.assertIn("went on from a checkpoint", "\n".join(logs.output))
+        self.assertEqual(again["commit_lsn"], "95")
+
+    def test_a_replayed_seed_or_restart_batch_reads_nothing(self):
+        # A seed batch, replayed before the upsert reader had published, read again: from no
+        # position in the next update it waited until its deadline (2), or read on from an
+        # older floor and emitted deletes its batch never had; and a batch that started
+        # again below its seeded position fell short of its end (5).
+        for start, end in (
+            ({}, dict(_stream_offset(120), floor_seed=f"{uuid.UUID(int=1)}_@_{uuid.UUID(int=3)}")),
+            (
+                dict(_stream_offset(120), floor_seed=f"{uuid.UUID(int=1)}_@_{uuid.UUID(int=3)}"),
+                _stream_offset(85),
+            ),
+        ):
+            with self.subTest(start=start.get("commit_lsn")):
+                calls = []
+
+                def read(offset, calls=calls):
+                    calls.append(offset)
+                    raise AssertionError("a batch with no rows is not read again")
+
+                rows = informix_module._replay_between_offsets(start, end, read, {}, {})
+
+                self.assertEqual((list(rows), calls), ([], []))
+
+    def test_a_migrating_table_does_not_take_a_full_refreshs_start(self):
+        # A cutover seeds the delete channel from its parked position: taking the refresh's
+        # start instead skipped the deletes between that position and it.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+
+        _, waiting = reader(3, "full_refresh").read_table_deletes(
+            "app.orders", {}, {"table.migration": "true"}
+        )
+
+        self.assertNotIn("commit_lsn", waiting)
+
+    def test_a_full_refreshs_own_start_needs_no_connection_extract_or_scope(self):
+        # A connection's extract applies only to tables under initial or initial_only; and a
+        # connector with no registration scope said so by raising from the check that runs
+        # before a slot is taken.
+        extract = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, extract, True)
+        reader = self._floor_updates(FakeBridge())
+        connector = reader(3, "full_refresh")
+        connector.options["snapshot.source"] = extract
+        self.assertTrue(connector._full_refresh_delete_start({}, "incremental"))
+        self.assertFalse(connector._full_refresh_delete_start({}, "initial"))
+        connector._registration_scope = None
+        self.assertFalse(connector._full_refresh_delete_start({}, "incremental"))
+
     def test_a_delete_reader_seeded_at_a_replaced_floor_starts_again_at_the_new_one(self):
         # A full refresh emptied the target and ended before this table's flows ran. The
         # next update's delete flow, first again, starts at the old snapshot's floor; the
@@ -20209,6 +20313,37 @@ class LakeflowContractTests(unittest.TestCase):
                 _, seed = reader(4, "continue").read_table_deletes("app.orders", {}, dict(options))
 
                 self.assertEqual(seed["commit_lsn"], expected)
+
+    def test_a_resnapshots_delete_seed_keeps_the_floor_in_a_refresh_of_other_tables(self):
+        # auto_snapshot resnapshotted a table a selective refresh left alone: its floor stays
+        # (the destination keeps its rows), and the delete reader past the log, in that same
+        # update, seeded at the resnapshot's boundary instead, skipping the deletes between,
+        # since the floor was not looked at in any full refresh.
+        options = {"snapshot.mode": "auto_snapshot", "snapshot.page.size": "1"}
+        bridge = FakeBridge()
+        pipeline = uuid.UUID(int=190)
+
+        def reader(update, request):
+            connector = self.connector(bridge)
+            connector.set_registration_scope(f"{pipeline}_@_{uuid.UUID(int=update)}")
+            connector.set_update_request(request)
+            return connector
+
+        _, first = reader(2, "full_refresh").read_table("app.orders", {}, {})
+        self.assertEqual(first["commit_lsn"], "90")
+        bridge.minimum, bridge.now = 85, 150
+        checkpoint = dict(
+            _stream_offset(100), begin_lsn="80", pipeline_scope=first["pipeline_scope"]
+        )
+        _, end = reader(3, "selective_refresh").read_table("app.orders", checkpoint, dict(options))
+        self.assertEqual(end["commit_lsn"], "150")
+        expired = dict(_stream_offset(84), pipeline_scope=first["pipeline_scope"])
+
+        _, seed = reader(3, "selective_refresh").read_table_deletes(
+            "app.orders", expired, dict(options)
+        )
+
+        self.assertEqual(seed["commit_lsn"], "90")
 
     def test_a_snapshot_from_no_checkpoint_replaces_a_retained_floor(self):
         # A snapshot from no checkpoint lands in a destination that is new or emptied. The

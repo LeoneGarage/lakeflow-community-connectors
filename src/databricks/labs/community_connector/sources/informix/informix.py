@@ -411,6 +411,8 @@ _DEFAULT_SNAPSHOT_MODE = "incremental"
 _UNL_SNAPSHOT_MODES = frozenset({"initial", "initial_only"})
 # What _update_request names a full refresh, of the whole pipeline or of some tables.
 _FULL_REFRESH_REQUESTS = frozenset({"full_refresh", "selective_refresh"})
+# The floor a delete position seeded at a full refresh's own start was taken beside.
+_SEED_FLOOR_FIELD = "seed_floor"
 # The modes whose upsert reader starts a full refresh at the update's initialization
 # (_initial_lsn), which a delete reader may then take itself (_full_refresh_delete_seed).
 _OWN_START_SNAPSHOT_MODES = frozenset({"incremental", "auto_snapshot", "initial", "cdc_only"})
@@ -1196,9 +1198,17 @@ def _update_request(pipeline_id: str, update_id: str) -> str | None:
         return None
     if update.get("cause") == "RETRY_ON_FAILURE":
         return "continue"
-    if update.get("full_refresh"):
+    # Tables named by name or by source file (an editor's "run file with full refresh").
+    selected = any(
+        update.get(name) for name in ("full_refresh_selection", "full_refresh_selection_by_path")
+    )
+    # Only a refresh with no selection of any kind resets every table.
+    partial = selected or any(
+        update.get(name) for name in ("refresh_selection", "refresh_selection_by_path")
+    )
+    if update.get("full_refresh") and not partial:
         return "full_refresh"
-    return "selective_refresh" if update.get("full_refresh_selection") else "continue"
+    return "selective_refresh" if selected or update.get("full_refresh") else "continue"
 
 
 class _StateValidationCoordinator:
@@ -1316,6 +1326,24 @@ def _range_emits_nothing(start: Any, end: Any) -> bool:
         and end
         and set(end) <= _OFFSET_ADVISORY_FIELDS
         and (not positional.intersection(start or {}) or bool((start or {}).get("floor_seed")))
+    ):
+        return True
+    # A delete position's seed at a floor or a full refresh's own start, from none, holds no
+    # rows; so does one that started again from a seeded position, ending idle at or below
+    # it. Replayed before the upsert reader had published, each read again: from no
+    # position it waited until its deadline, or read on from a lower floor and emitted
+    # deletes its batch never had, or fell short of its end (5).
+    if isinstance(end, dict) and end.get("floor_seed") and not positional.intersection(start or {}):
+        return True
+    if (
+        isinstance(start, dict)
+        and start.get("floor_seed")
+        and isinstance(end, dict)
+        and not end.get("floor_seed")
+        and end.get("tx_id") is None
+        and end.get("commit_lsn") is not None
+        and start.get("commit_lsn") is not None
+        and int(end["commit_lsn"]) <= int(start["commit_lsn"])
     ):
         return True
     return bool((end or {}).get("handoff_seeded")) and not (start or {}).get("handoff_seeded")
@@ -1811,6 +1839,36 @@ def _informix_available_now_base(base: type, spark_session: Any | None = None) -
 # defined and the shared reader is defined after this connector. Shadow its base
 # with an Informix-owned wrapper that installs the callback at class creation.
 # In normal package imports that global is absent, so this block is inert.
+class _ShortenedRegistrations:
+    # Docstring: The Spark session the merged source registers its data source with, whose
+    # dataSource.register shortens the data source first (_shorten_merged_definitions).
+    #
+    # The shortening at the end of informix.py runs before the definitions merged after it,
+    # the framework's data source and readers, exist; they kept their prefixes,
+    # annotations, docstrings and columns, some 5 KB of the planner's limit. Everything
+    # else is the session's.
+
+    def __init__(self, session: Any) -> None:
+        self._session = session
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._session, name)
+
+    @property
+    def dataSource(self) -> Any:  # noqa: N802  # pylint: disable=invalid-name
+        registration = self._session.dataSource
+
+        class Registration:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(registration, name)
+
+            def register(self, data_source: Any) -> Any:
+                _shorten_merged_definitions({"data_source": data_source})
+                return registration.register(data_source)
+
+        return Registration()
+
+
 try:
     # This name is local to register_lakeflow_source() after merging; globals()
     # cannot see it. In a normal package import it is intentionally undefined.
@@ -1838,6 +1896,10 @@ else:
     # along. Doing it in the merged-deployment branch is deliberate: a plain
     # package import is not a driver and has nothing to capture.
     capture_workspace_credentials()
+    # The merged source's own parameter: the framework's data source, merged after this
+    # file, registers through it and is shortened then (_ShortenedRegistrations).
+    if locals().get("spark") is not None:
+        spark = _ShortenedRegistrations(locals()["spark"])
 
 
 class InformixError(RuntimeError):
@@ -12806,7 +12868,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # the batch's end at the floor; or the upsert reader committed its resnapshot in an
         # earlier update and resumes from it, and this one never publishes a boundary (427
         # on every update). Started above the floor, the reader skipped the deletes between.
-        floor = self._delete_floor_seed(table)
+        # Whatever the update was started for: a resnapshot's destination keeps its rows, and
+        # the floor it kept (_publish_delete_snapshot_floor), which in a refresh of other
+        # tables was passed over and the deletes after it skipped.
+        floor = self._delete_floor_seed(table, kept_destination=True)
         if floor is None or (high_water is not None and int(floor["commit_lsn"]) >= high_water):
             if high_water is None:
                 return None
@@ -12879,6 +12944,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # A position seeded at the snapshot floor (_delete_floor_seed) carries the floor's
         # update until the upsert reader's start shows which snapshot the target holds.
         seeded = (start_offset or {}).get("floor_seed")
+        seed_floor = (start_offset or {}).get(_SEED_FLOOR_FIELD)
         if seeded is not None:
             # Validated first: the check takes the seed apart (469 on an invalid one).
             _validated_offset(start_offset)
@@ -12904,6 +12970,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         )
         if seeded is not None and end.get("commit_lsn") is not None:
             end = {**end, "floor_seed": seeded}
+            if seed_floor is not None:
+                end[_SEED_FLOOR_FIELD] = seed_floor
         return rows, end
 
     def _delete_floor_recorded(self, table_name: str, table_options: dict[str, str]) -> bool:
@@ -12932,7 +13000,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         rejected = self.__dict__.get("_rejected_delete_floors", {})
         return rejected.get(record_key) != record["snapshot_scope"]
 
-    def _delete_floor_seed(self, table: Table) -> dict | None:
+    def _delete_floor_seed(self, table: Table, *, kept_destination: bool = False) -> dict | None:
         # Docstring: The offset a delete reader with no checkpoint starts at before the
         # upsert reader has published this update's start: this pipeline's snapshot floor.
         #
@@ -12952,7 +13020,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # told later, by its update (_confirmed_floor_seed), and the deletes read before
         # that are older than the rows the new snapshot lands, which they leave alone.
 
-        if self._update_request in _FULL_REFRESH_REQUESTS:
+        if self._update_request in _FULL_REFRESH_REQUESTS and not kept_destination:
             return None
         record = self._read_immutable_head(
             self._immutable_namespace(
@@ -13001,11 +13069,19 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # where the upsert reader starts at the update's initialization: not from a
         # snapshot.source extract (its boundary is the operator's), nor under another mode.
 
+        scope = self._registration_scope
         return (
             self._update_request == "full_refresh"
             and snapshot_mode in _OWN_START_SNAPSHOT_MODES
-            and _PIPELINE_SCOPE.fullmatch(self._pipeline_scope()) is not None
-            and self._table_snapshot_source(table_options) is None
+            and isinstance(scope, str)
+            and _PIPELINE_SCOPE.fullmatch(scope) is not None
+            # A cutover seeds from its parked position (_read_handoff_deletes).
+            and not self._table_migration(table_options)
+            # An extract is read only under the modes that take a snapshot from it.
+            and not (
+                snapshot_mode in _UNL_SNAPSHOT_MODES
+                and self._table_snapshot_source(table_options) is not None
+            )
         )
 
     def _full_refresh_delete_seed(
@@ -13023,14 +13099,18 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # still held it. Either reader takes the initialization, elected once, and the
         # upsert reader's snapshot starts there or later, so the deletes from it on are
         # those the emptied target needs: earlier ones remove rows the snapshot does not
-        # hold. The mark names this update (floor_seed), whose snapshot publishes the floor
-        # and then the start; a start published with no floor of this update is an upsert
-        # reader's that went on from a checkpoint the refresh left (_confirmed_floor_seed).
+        # hold. The mark names this update (floor_seed) and the floor there was beside it
+        # (seed_floor), until a snapshot publishes another floor; a start published with the
+        # floor unchanged is an upsert reader's that went on from a checkpoint the refresh
+        # left (_confirmed_own_start).
 
         if not self._full_refresh_delete_start(table_options, snapshot_mode):
             return None
         scope = self._pipeline_scope()
         table = self._refresh_table_schema(table, None)
+        floor = self._read_immutable_head(
+            self._immutable_namespace(table, "delete-floor", self._pipeline_id(scope))
+        )
         start = self._initial_lsn(table, scope=scope)
         schema_id = self._snapshot_schema_ids[(scope, table.identity)]
         # 476: Informix delete channel for '{}' starts at this full refresh's start {}, which it
@@ -13040,6 +13120,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             **_offset(start, start, start, None, "stream", table, schema_id, scope),
             "update_fingerprint": _schema_fingerprint(table),
             "floor_seed": scope,
+            # The floor beside which it was taken, "" for none: a floor other than this one
+            # is a snapshot's since, at or above this start (_confirmed_own_start).
+            _SEED_FLOOR_FIELD: str((floor or {}).get("snapshot_scope") or ""),
         }
 
     def _confirmed_floor_seed(
@@ -13066,7 +13149,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # floor confirmed: this pipeline's floor says nothing of it, and the position stands.
 
         seeded = start_offset["floor_seed"]
-        unmarked = {k: v for k, v in start_offset.items() if k != "floor_seed"}
+        unmarked = {
+            k: v for k, v in start_offset.items() if k not in ("floor_seed", _SEED_FLOOR_FIELD)
+        }
         pipeline = self._pipeline_id(self._pipeline_scope(start_offset))
         if self._pipeline_id(seeded) != pipeline:
             return unmarked, None
@@ -13074,6 +13159,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             self._immutable_namespace(table, "delete-floor", pipeline)
         )
         current = None if record is None else record.get("snapshot_scope")
+        if _SEED_FLOOR_FIELD in start_offset:
+            return self._confirmed_own_start(table, start_offset, unmarked, current, table_options)
         if current is None:
             return start_offset, seeded
         if current != seeded:
@@ -13094,16 +13181,6 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 )
             ):
                 return unmarked, None
-            if seeded == self._pipeline_scope():
-                # Seeded at this update's own start (_full_refresh_delete_seed), whose snapshot
-                # has yet to publish its floor: read on while no start is published either.
-                if self._read_upsert_channel_start(table, seeded) is None:
-                    return start_offset, seeded
-                # 477: Informix delete channel for '{}' started at full refresh {}'s own start,
-                # and its upsert reader went on from a checkpoint instead (the refresh left
-                # the table); it starts again at the upsert reader's position
-                logging.getLogger(__name__).warning(_m(477, table.exposed_name, seeded))
-                return {}, None
             # 291: Informix delete channel for '{}' started at a snapshot floor that update {}
             # has since replaced; it starts again at the new one
             logging.getLogger(__name__).warning(_m(291, table.exposed_name, current))
@@ -13111,6 +13188,44 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if self._read_upsert_channel_start(table, self._pipeline_scope(start_offset)) is None:
             return start_offset, seeded
         return unmarked, None
+
+    def _confirmed_own_start(
+        self,
+        table: Table,
+        start_offset: dict,
+        unmarked: dict,
+        current: str | None,
+        table_options: dict[str, str],
+    ) -> tuple[dict, str | None]:
+        # Docstring: _confirmed_floor_seed for a position seeded at a full refresh's own start
+        # (_full_refresh_delete_seed), whose seed_floor names the floor beside it.
+        #
+        # Any other floor since is a snapshot's into the target that refresh emptied (its own,
+        # or a later update's after it failed), whose boundary is at or above the start: the
+        # position stands, and the mark goes. With the floor unchanged, a start published by
+        # the refreshing update or this one is an upsert reader's that went on from a
+        # checkpoint the refresh left (a table set not to reset, one a migration brought): it
+        # starts again as one with no checkpoint, at the lower of the floor and that start,
+        # or it skipped the deletes between. Neither yet: read on. A floor of another update
+        # than the refreshing one was read as having replaced it, after a retry: the delete
+        # position was dropped. A replay lands as its batch did, told by the end it logged.
+
+        seeded = start_offset["floor_seed"]
+        if (current or "") != start_offset[_SEED_FLOOR_FIELD]:
+            return unmarked, None
+        if self._replay_stop_lsn(table_options) is not None:
+            logged, _ = json.loads(table_options.get(_REPLAY_END_SEED_OPTION) or "[null, false]")
+            return (start_offset, seeded) if logged == seeded else (unmarked, None)
+        if all(
+            self._read_upsert_channel_start(table, scope) is None
+            for scope in dict.fromkeys((seeded, self._pipeline_scope()))
+        ):
+            return start_offset, seeded
+        # 477: Informix delete channel for '{}' started at full refresh {}'s own start,
+        # and its upsert reader went on from a checkpoint instead (the refresh left
+        # the table); it starts again at the upsert reader's position
+        logging.getLogger(__name__).warning(_m(477, table.exposed_name, seeded))
+        return {}, None
 
     def _read_table_deletes_from(
         self,
@@ -23903,6 +24018,16 @@ def _validated_offset(offset: dict[str, Any]) -> dict[str, Any]:
         # 469: Informix offset has an invalid floor_seed; run a full refresh with this
         # connector version
         raise ValueError(_m(469))
+    # seed_floor rides a floor_seed of a full refresh's own start: the floor beside it.
+    seed_floor = result.get(_SEED_FLOOR_FIELD)
+    if _SEED_FLOOR_FIELD in result and (
+        floor_seed is None
+        or not isinstance(seed_floor, str)
+        or (seed_floor and _PIPELINE_SCOPE.fullmatch(seed_floor) is None)
+    ):
+        # 469: Informix offset has an invalid floor_seed; run a full refresh with this
+        # connector version
+        raise ValueError(_m(469))
     trigger_generation = result.get("trigger_generation")
     if trigger_generation is not None and (
         not isinstance(trigger_generation, str)
@@ -24277,9 +24402,11 @@ def _shorten_merged_definitions(namespace: dict[str, Any]) -> None:
                 value.__qualname__ = value.__qualname__.removeprefix(prefix)
                 value.__annotations__ = {}
                 value.__doc__ = None
-                for cell in value.__closure__ or ():
-                    with contextlib.suppress(ValueError):  # an unfilled cell
-                        visit(cell.cell_contents)
+            # Shortened or not: a hook made from code already shortened (a reader's
+            # wrapped __init__) closes over a definition that was not.
+            for cell in value.__closure__ or ():
+                with contextlib.suppress(ValueError):  # an unfilled cell
+                    visit(cell.cell_contents)
         elif isinstance(value, type):
             if value.__qualname__.startswith(prefix):
                 value.__qualname__ = value.__qualname__.removeprefix(prefix)

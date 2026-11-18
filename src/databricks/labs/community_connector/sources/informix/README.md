@@ -117,16 +117,19 @@ elected initialization its upsert reader then snapshots from, which it records f
 the upsert reader has not (enabling full-row logging and recording the table's layout,
 as the upsert reader would). The deletes from that start on are those the emptied target
 needs, and they are applied while the refresh runs, however long it takes; any earlier
-than the snapshot remove rows it does not hold. Its mark names this update until the
-snapshot publishes its floor. If the upsert reader instead goes on from a checkpoint the
-refresh left it (a table set not to reset), it publishes its start with no floor of this
-update, and the delete reader starts again at the lower of the floor and that start, with
-a warning in the event log. A table read from a `snapshot.source` extract, whose start is
+than the snapshot remove rows it does not hold. Its mark names this update and the floor
+it was taken beside, until a snapshot publishes another floor; the position stands across
+an automatic retry of the refresh. If the upsert reader instead goes on from a checkpoint
+the refresh left it (a table set not to reset, one a migration brought), it publishes its
+start with the floor unchanged, and the delete reader starts again at the lower of the
+floor and that start, with a warning in the event log. A replay of the batch that took the
+start, or of one that started again, reads nothing, as the batch read nothing. A table read from a `snapshot.source` extract, whose start is
 the extract's boundary, and the `recovery`, `initial_only` and `table.migration` paths do
 not take it.
 
-In a refresh of selected tables (which counts as a full refresh for every table, see
-below), or where the floor's column layout is not the table's current one, the delete
+In a refresh of selected tables, by name or by source file (which counts as a full
+refresh for every table, see below), or where the floor's column layout is not the
+table's current one, the delete
 reader waits as described above; if a triggered update ends before the upsert reader has
 published, the next update starts the delete reader at the floor, so its deletes arrive
 one update late and none are lost. In a triggered update, whichever of a table's two
