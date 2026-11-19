@@ -35,7 +35,6 @@ pipeline_spec = {
                 "table_configuration": {
                     "qualified_source_table": "informix.order_items",
                     "snapshot.mode": "initial",
-                    "snapshot.scan": "keyset",
                     # Small pages, so that the scan takes many and can be stopped part-way.
                     "keyless.snapshot.page.size": "200",
                 },
