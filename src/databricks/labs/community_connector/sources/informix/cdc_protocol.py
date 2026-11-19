@@ -46,7 +46,10 @@ def cdc_routine(name: str) -> str:
 def metadata_column_names(payload: bytes, encoding: str = "utf-8") -> tuple[str, ...]:
     # Docstring: Extract CDC metadata column names while ignoring commas in type arguments.
 
-    text = payload.rstrip(b"\0 \t\r\n").decode(encoding)
+    try:
+        text = payload.rstrip(b"\0 \t\r\n").decode(encoding)
+    except UnicodeDecodeError as error:
+        raise CdcProtocolError(f"CDC metadata is not text in {encoding!r}") from error
     fields: list[str] = []
     start = depth = 0
     for index, character in enumerate(text):
@@ -446,19 +449,29 @@ def decode_packed_decimal(data: bytes, precision: int, scale: int) -> Decimal | 
         return value.quantize(Decimal(1).scaleb(-scale))
 
 
-def _decode_datetime(
-    data: memoryview, column: ColumnDescriptor
-) -> tuple[datetime | str | None, int]:
-    qualifier = column.length
+def datetime_size(qualifier: int) -> int:
+    # Docstring: The packed width of a DATETIME of ``qualifier`` (start << 8 | end), as its
+    # decoder reads it: shared with the SQLI tuple layout, which sized it on its own.
+
     start, end = (qualifier >> 8) & 0xF, qualifier & 0xF
     codes = (0, 2, 4, 6, 8, 10)
     if start not in codes or end not in {*codes, 11, 12, 13, 14, 15} or end < start:
         raise UnsupportedCdcType(f"unsupported DATETIME qualifier {start} TO {end}")
+    # Two digits a field from start to SECOND at most, YEAR's two more, then the fraction.
+    digits = min(end, 10) - start + 2 + (2 if start == 0 else 0) + max(0, end - 10)
+    return 1 + (digits + 1) // 2
+
+
+def _decode_datetime(
+    data: memoryview, column: ColumnDescriptor
+) -> tuple[datetime | str | None, int]:
+    qualifier = column.length
+    size = datetime_size(qualifier)
+    start, end = (qualifier >> 8) & 0xF, qualifier & 0xF
+    codes = (0, 2, 4, 6, 8, 10)
     selected = [code for code in codes if start <= code <= min(end, 10)]
     widths = {0: 4, 2: 2, 4: 2, 6: 2, 8: 2, 10: 2}
     fraction_digits = max(0, end - 10)
-    digit_count = sum(widths[code] for code in selected) + fraction_digits
-    size = 1 + (digit_count + 1) // 2
     _need(data, size)
     raw = bytes(data[:size])
     if raw[:2] == b"\0\0":

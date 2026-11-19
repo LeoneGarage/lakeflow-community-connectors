@@ -415,6 +415,8 @@ _FULL_REFRESH_REQUESTS = frozenset({"full_refresh", "selective_refresh"})
 # The floor a delete position seeded at a full refresh's own start was taken beside.
 _SEED_FLOOR_FIELD = "seed_floor"
 _SEED_MARKS = ("floor_seed", _SEED_FLOOR_FIELD)
+# How many snapshots a resnapshot's delete floor names besides its own (_floor_scopes).
+_KEPT_FLOOR_SCOPES = 16
 # The modes whose upsert reader starts a full refresh at the update's initialization
 # (_initial_lsn), which a delete reader may then take itself (_full_refresh_delete_seed).
 _OWN_START_SNAPSHOT_MODES = frozenset({"incremental", "auto_snapshot", "initial", "cdc_only"})
@@ -2032,6 +2034,7 @@ class InformixBridge(Protocol):
         skip: int = 0,
         snapshot_filter: str | None = None,
         key_descending: Sequence[bool] | None = None,
+        chunk_exprs: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]: ...
 
     def consistent_snapshot(
@@ -2060,6 +2063,7 @@ class InformixBridge(Protocol):
         chunk_exprs: dict[str, str] | None = None,
         snapshot_filter: str | None = None,
         key_descending: Sequence[bool] | None = None,
+        isolation: str = "REPEATABLE READ",
     ) -> tuple[int, list[dict[str, Any]]]: ...
 
     def max_primary_key(
@@ -2281,8 +2285,10 @@ class PurePythonInformixBridge:
             self._apply_startup_jitter()
             bypass_capacity = self.options.get("_informix.bypass.connection.capacity") == "true"
             # A reconnect after reset_transport still holds its slot and heartbeat; claiming
-            # another would strand the first, renewed until the process exits.
-            if not bypass_capacity and getattr(self, "_lakebase_slot", None) is None:
+            # another would strand the first, renewed until the process exits. Its connect
+            # failing keeps it too, for the retry: release_connection frees it in the end.
+            held = getattr(self, "_lakebase_slot", None) is not None
+            if not bypass_capacity and not held:
                 budget = self.options.get(_CONNECTION_ATTEMPT_BUDGET_OPTION)
                 budget = float(budget) if budget else None
                 # Lakebase can reap the state connection while this bridge sits idle
@@ -2333,7 +2339,8 @@ class PurePythonInformixBridge:
                 if callable(close):
                     with contextlib.suppress(Exception):
                         close()
-                self._release_connection_slot()
+                if not held:
+                    self._release_connection_slot()
                 raise
 
     def _session_probe_failed(self, error: BaseException) -> None:
@@ -6577,7 +6584,8 @@ def _apply_function(name: str, value: Any, literals: list, context: dict) -> Any
     # Back in the type the column's values arrive as, which the schema declares: a
     # variable-scale DECIMAL can arrive as a float or a fixed-point string.
     if isinstance(value, str):
-        return format(result, "f")
+        # Zero unsigned, as Informix and the decimal decoders write it ("-0" hashed apart).
+        return format(result or abs(result), "f")
     if isinstance(value, float):
         return float(result)
     return result if isinstance(value, Decimal) else int(result)
@@ -10146,8 +10154,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self._schema_transition_waits: dict[tuple[str, str], float] = {}
         self._activity_touched: dict[tuple[str, str], float] = {}
         self._cleaned_update_scopes: set[tuple[str, str]] = set()
-        # The lowest upsert start this reader noted on each own-start record, this update.
-        self._noted_upsert_starts: dict[str, int] = {}
+        # The lowest upsert start this reader published under each channel-start and
+        # own-start record key, this registration.
+        self._noted_upsert_starts: dict[str, tuple] = {}
         self._cleaned_snapshot_stages: set[str] = set()
         # Snapshot-page staging transport, resolved once on first use: None means the
         # FUSE mount; a WorkspaceFilesApi means the Files REST API. See _staging_transport.
@@ -13413,7 +13422,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 # an expired position does (_read_resnapshotted_deletes).
                 seed = self._resnapshot_delete_seed(table, self._pipeline_scope())
                 if restart_from and not seed:
-                    return iter(()), restart_from
+                    # Marked, and for a triggered update a retry that keeps it waiting (427
+                    # bounds it): the position back unchanged ended the flow at once.
+                    return iter(()), self._resnapshot_retry_offset(table, restart_from)
                 if restart_from and int(seed["commit_lsn"]) >= below:
                     return self._read_table_deletes_from(
                         table_name, position, table_options, snapshot_mode=snapshot_mode
@@ -18624,7 +18635,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 return self._bridge.read_changes(captures, restart, timeout_seconds, max_records)
             except ConnectionCapacityUnavailable:
                 raise
-            except SqliProtocolError as error:
+            # A reconnect refused or timed out while the listener recovers, too.
+            except (SqliProtocolError, ConnectionError, TimeoutError) as error:
                 lease_lost = getattr(self._bridge, "_connection_lease_lost", None)
                 if lease_lost is not None and lease_lost.is_set():
                     # The drop is a deliberate lease-loss shutdown, not a blip.
@@ -19001,7 +19013,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 return thunk()
             except ConnectionCapacityUnavailable:
                 raise
-            except SqliProtocolError as error:
+            except (SqliProtocolError, ConnectionError, TimeoutError) as error:
                 lease_lost = getattr(self._bridge, "_connection_lease_lost", None)
                 if lease_lost is not None and lease_lost.is_set():
                     # The drop is a deliberate lease-loss shutdown, not a blip.
@@ -20508,11 +20520,34 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # can both be later. A later poll can discover an older open transaction,
         # so publishers atomically lower the shared boundary and never raise it.
 
-        namespace = self._immutable_namespace(table, "channel-starts", scope, "upsert")
+        self._publish_channel_start(
+            (table.native_identity, *self._table_state_keys(table)),
+            table.exposed_name,
+            scope,
+            (start_lsn, schema_id, fingerprint),
+            table,
+        )
+
+    def _publish_channel_start(self, identity, exposed, scope, start, table=None) -> None:
+        # Docstring: Publish an upsert start ``(lsn, schema_id, fingerprint)`` for ``identity``
+        # ``(native, connection key, table key)``, and lower the own-start record to it.
+        #
+        # Once a registration a start: every microbatch published it twice, the one before
+        # the slot and the one after, each a Lakebase transaction that changed nothing. A
+        # schema stepped at the same position is checked as a successor where ``table``
+        # is given (the reader's own); the pre-capacity publish takes the checkpoint's.
+
+        native, connection_key, table_key = identity
+        start_lsn, schema_id, fingerprint = start
+        base = f"{connection_key}/{table_key}"
+        record_key = f"{base}/channel-starts/{scope}/upsert"
+        noted = self._noted_upsert_starts.get(record_key)
+        if noted is not None and (noted[0] < start_lsn or noted == (start_lsn, schema_id)):
+            return
         winner = self._state(
             publish_minimum_lsn_state_record,
-            self._lakebase_state_namespace(),
-            namespace,
+            connection_key,
+            record_key,
             {
                 "created_at": time.time(),
                 "fingerprint": fingerprint,
@@ -20521,33 +20556,34 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 "schema_id": schema_id,
                 "scope": scope,
                 "start_lsn": str(start_lsn),
-                "table": table.native_identity,
+                "table": native,
             },
             record_type="channel-start",
             operation="upsert channel-start publish",
         )
-        self._validate_immutable_record_header(winner, "channel-start", table.exposed_name)
-        winner_start = self._immutable_lsn(winner, "start_lsn", table.exposed_name)
-        same_position_schema_change = winner_start == start_lsn and (
-            winner.get("schema_id") != schema_id or winner.get("fingerprint") != fingerprint
-        )
-        compatible_successor = same_position_schema_change and self._schema_descends_from(
-            table, schema_id, fingerprint, winner.get("schema_id")
+        self._validate_immutable_record_header(winner, "channel-start", exposed)
+        winner_start = self._immutable_lsn(winner, "start_lsn", exposed)
+        moved = (
+            table is not None
+            and winner_start == start_lsn
+            and (winner.get("schema_id") != schema_id or winner.get("fingerprint") != fingerprint)
         )
         if (
             winner.get("scope") != scope
-            or winner.get("table") != table.native_identity
+            or winner.get("table") != native
             or winner_start > start_lsn
-            or (same_position_schema_change and not compatible_successor)
+            or (
+                moved
+                and not self._schema_descends_from(
+                    table, schema_id, fingerprint, winner.get("schema_id")
+                )
+            )
         ):
             # 312: Conflicting Informix upsert start boundary for '{}' in update scope '{}'
-            raise InformixError(_m(312, table.exposed_name, scope))
+            raise InformixError(_m(312, exposed, scope))
+        self._noted_upsert_starts[record_key] = (start_lsn, schema_id)
         # After the start, as _full_refresh_delete_seed announces before it looks for one.
-        self._note_upsert_start(
-            self._immutable_namespace(table, "own-start", self._pipeline_id(scope)),
-            table.native_identity,
-            (start_lsn, schema_id, fingerprint),
-        )
+        self._note_upsert_start(f"{base}/own-start/{self._pipeline_id(scope)}", native, start)
 
     def _schema_descends_from(
         self,
@@ -20609,21 +20645,23 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # once a process unless the start goes lower.
 
         lsn, schema_id, fingerprint = start
-        if lsn < self._noted_upsert_starts.get(key, lsn + 1):
+        if lsn < self._noted_upsert_starts.get(key, (lsn + 1,))[0]:
             self._publish_own_start(
                 key,
                 native_identity,
                 {"start_lsn": str(lsn), "schema_id": schema_id, "fingerprint": fingerprint},
             )
-            self._noted_upsert_starts[key] = lsn
+            self._noted_upsert_starts[key] = (lsn,)
 
     @staticmethod
     def _floor_scopes(record: dict | None) -> tuple:
         # Docstring: The snapshots a floor record stands for: its own, and for an auto_snapshot
-        # resnapshot's, the last one before it, whose rows the destination kept.
+        # resnapshot's, each before it back to the last whose snapshot emptied the target,
+        # whose rows the destination kept (one in a record of 36acdad9-053c47a7).
 
         own = None if record is None else record.get("snapshot_scope")
-        return own, record.get("kept_scope") if own and record.get("resnapshot") else own
+        kept = record.get("kept_scope") if own and record.get("resnapshot") else []
+        return (own, *(kept if isinstance(kept, list) else [kept]))
 
     def _floor_record(self, table: Table, scope: str | None = None) -> dict | None:
         return self._read_immutable_head(
@@ -20746,7 +20784,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # Replaced, the floor names the snapshot before it too, whose rows the
             # destination kept: a delete position marked with that one goes on (291 sent it
             # to this floor, past the deletes between).
-            marks = {"resnapshot": True, "kept_scope": self._floor_scopes(kept)[1]}
+            # All the replaced one stands for: a second resnapshot kept the first's rows too,
+            # and a position marked with it read as one a full refresh had sent past (291).
+            stood = list(dict.fromkeys(self._floor_scopes(kept)))
+            marks = {"resnapshot": True, "kept_scope": stood[:_KEPT_FLOOR_SCOPES]}
 
         self._state(
             publish_maximum_lsn_state_record,
@@ -20916,52 +20957,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         identity = self._native_table_state_identity(exposed)
         if identity is None:
             return
-        native_identity, connection_key, table_key = identity
-        scope = self._pipeline_scope(checkpoint)
-        start_lsn = int(checkpoint.get("begin_lsn") or checkpoint["commit_lsn"])
-        schema_id = str(checkpoint["schema_id"])
-        fingerprint = str(checkpoint["schema_fingerprint"])
-        record_key = "/".join(
+        self._publish_channel_start(
+            identity,
+            exposed,
+            self._pipeline_scope(checkpoint),
             (
-                connection_key,
-                table_key,
-                "channel-starts",
-                scope,
-                "upsert",
-            )
-        )
-        winner = self._state(
-            publish_minimum_lsn_state_record,
-            connection_key,
-            record_key,
-            {
-                "created_at": time.time(),
-                "fingerprint": fingerprint,
-                "format_version": _IMMUTABLE_STATE_VERSION,
-                "record_type": "channel-start",
-                "schema_id": schema_id,
-                "scope": scope,
-                "start_lsn": str(start_lsn),
-                "table": native_identity,
-            },
-            record_type="channel-start",
-            operation="pre-capacity channel-start publish",
-        )
-        winner_start = self._immutable_lsn(winner, "start_lsn", exposed)
-        if (
-            winner.get("format_version") != _IMMUTABLE_STATE_VERSION
-            or winner.get("record_type") != "channel-start"
-            or winner.get("scope") != scope
-            or winner.get("table") != native_identity
-            or winner_start > start_lsn
-        ):
-            # 312: Conflicting Informix upsert start boundary for '{}' in update scope '{}'
-            raise InformixError(_m(312, exposed, scope))
-        # As _publish_upsert_channel_start does: a partitioned page batch publishes here only.
-        self._note_upsert_start(
-            "/".join((connection_key, table_key, "own-start", self._pipeline_id(scope))),
-            native_identity,
-            (start_lsn, schema_id, fingerprint),
+                int(checkpoint.get("begin_lsn") or checkpoint["commit_lsn"]),
+                str(checkpoint["schema_id"]),
+                str(checkpoint["schema_fingerprint"]),
+            ),
         )
 
     def _shared_table_lsn(
@@ -24558,6 +24562,13 @@ def _shorten_merged_definitions(namespace: dict[str, Any]) -> None:
     seen: set[int] = set()
     codes: dict[int, types.CodeType] = {}
 
+    def short(qualname: str) -> str:
+        # Interned, so code objects sharing a qualname (a function's generator expressions
+        # and lambdas, a decorator's wrappers) share one string, which the pickle writes
+        # once and then refers back to: some 10 KB. cloudpickle copies each co_name and a
+        # function's own __name__ and __qualname__, so those are written apiece.
+        return sys.intern(qualname.removeprefix(prefix))
+
     def shorten(code: types.CodeType) -> types.CodeType:
         if id(code) not in codes:
             consts = tuple(
@@ -24568,7 +24579,7 @@ def _shorten_merged_definitions(namespace: dict[str, Any]) -> None:
                 codes[id(code)] = code.replace(co_consts=consts)
             else:
                 codes[id(code)] = _lines_only(
-                    code.replace(co_consts=consts, co_qualname=qualname.removeprefix(prefix))
+                    code.replace(co_consts=consts, co_qualname=short(qualname))
                 )
         return codes[id(code)]
 
@@ -24599,7 +24610,7 @@ def _shorten_merged_definitions(namespace: dict[str, Any]) -> None:
                 ):
                     code = code.replace(co_consts=(None, *code.co_consts[1:]))
                 value.__code__ = code
-                value.__qualname__ = value.__qualname__.removeprefix(prefix)
+                value.__qualname__ = short(value.__qualname__)
                 value.__annotations__ = {}
                 value.__doc__ = None
             # Shortened or not: a hook made from code already shortened (a reader's

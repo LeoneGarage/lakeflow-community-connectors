@@ -1502,8 +1502,10 @@ an object from column name to an expression over that column:
   a `NOT NULL` key keeps it `NOT NULL`, and `NVL` or `COALESCE` as the outermost function
   makes a column `NOT NULL`. Under the default `string.null.byte=null` a character column
   (`CHAR`, `NCHAR`, `VARCHAR`, `NVARCHAR`, `LVARCHAR`) is nullable however it is declared,
-  as a value holding a NUL byte lands as NULL, unless an outermost `NVL` or `COALESCE`
-  replaces it; other columns that land as strings can't hold one. `NVL` and `COALESCE` fall back to a value of the
+  a `NOT NULL` key and `HASH` of one included, as a value holding a NUL byte lands as NULL
+  (a key refuses one in a snapshot row, an upsert or a delete, but a `d` tombstone on the
+  append path of a row older than the capture carries it), unless an outermost `NVL` or
+  `COALESCE` replaces it; other columns that land as strings can't hold one. `NVL` and `COALESCE` fall back to a value of the
   type the expression inside them lands as, under the table's decimal options: over an
   integer column, `LENGTH`, `CHAR_LENGTH`, `YEAR`, `MONTH`, `DAY`, or `WEEKDAY`, or a
   variable-scale `DECIMAL` under `decimal.variable.type: integer`, the fallback must be a

@@ -1481,6 +1481,23 @@ class SqliPacketTests(unittest.TestCase):
             (accepted.version, accepted.cap_1, accepted.cap_2, accepted.cap_3), ("316", 1, 2, 3)
         )
 
+    def test_non_ascii_version_does_not_fail_the_accept(self):
+        fixed = (
+            struct.pack(">hh", 100, 101)
+            + b"\0" * 4
+            + struct.pack(">h", 0)
+            + struct.pack(">h", 108)
+            + b"\0" * 12
+            + struct.pack(">h", 3)
+            + b"3\xe96"
+            + struct.pack(">hhiii", 0, 0, 316, 0, 0)
+            + b"\0" * 2
+            + struct.pack(">hh", 0, 0)
+            + b"\0" * 24
+            + struct.pack(">h", 127)
+        )
+        self.assertEqual(decode_asc_accept(encode_session_packet(2, fixed)).version, "3\xe96")
+
     def test_rejected_session_points_at_the_server_log(self):
         with self.assertRaisesRegex(SqliSessionRejected, "server log"):
             decode_asc_accept(encode_session_packet(3, b""))
@@ -1988,6 +2005,22 @@ class WireTextDecodeTests(unittest.TestCase):
         cursor = _sqli._BufferCursor(struct.pack(">h", 2) + b"\xff\xfe")
         with self.assertRaises(SqliProtocolError):
             cursor.char("utf-8")
+
+
+class DatetimeResultSizeTests(unittest.TestCase):
+    def test_a_datetime_result_is_sized_by_its_qualifier(self):
+        # With the qualifier in extended_id, encoded_length's low byte is not the
+        # fraction's width: HOUR TO SECOND was sliced as 5 bytes, not the 4 it takes.
+        for column, size in (
+            (ResultColumn("t", 0, 10, 0x060A, 0x0603), 4),
+            (ResultColumn("updated_at", 0, 266, 0, 0x130F), 11),
+        ):
+            with self.subTest(column=column.name):
+                self.assertEqual(_sqli._fixed_result_size(column), size)
+
+    def test_cdc_metadata_not_in_its_codeset_is_a_protocol_error(self):
+        with self.assertRaises(CdcProtocolError):
+            metadata_column_names(b"\xff\xfe", "utf-8")
 
 
 class DatetimeChunkCastTests(unittest.TestCase):

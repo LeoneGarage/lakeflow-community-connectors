@@ -619,7 +619,7 @@ def compare_table(
                 )
             )
         )
-    with destination_pipe.open("w") as handle:
+    with destination_pipe.open("w", encoding="utf-8") as handle:
         for row in destination:
             handle.write("|".join(pipe_value(row.get(column)) for column in columns) + "|\n")
 
@@ -816,7 +816,9 @@ def main() -> int:
                 raise
             keys = source_future.result()
 
-        (output / "destination_schema.json").write_text(json.dumps(schema, indent=2))
+        (output / "destination_schema.json").write_text(
+            json.dumps(schema, indent=2), encoding="utf-8"
+        )
         columns: dict[str, list[str]] = collections.defaultdict(list)
         types: dict[str, dict[str, str]] = collections.defaultdict(dict)
         for row in schema:
@@ -867,7 +869,7 @@ def main() -> int:
                 )
         report = [results_by_table[table] for table in sorted(args.tables)]
         report_path = output / "comparison.json"
-        report_path.write_text(json.dumps(report, indent=2, default=str))
+        report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
         progress(f"Report: {report_path}")
         # Duplicate keys too: a keyed target with two rows for one key differs from the
         # source, though its other counts can all be 0.

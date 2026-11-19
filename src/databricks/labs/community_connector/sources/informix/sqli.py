@@ -30,6 +30,7 @@ from typing import BinaryIO, Callable, Protocol
 from databricks.labs.community_connector.sources.informix.cdc_protocol import (
     ColumnDescriptor,
     apply_null_byte,
+    datetime_size,
     decode_interval,
     decode_packed_decimal,
     decode_value,
@@ -395,7 +396,8 @@ def decode_asc_accept(packet: bytes, encoding: str = "utf-8") -> AscAccept:
     if cursor.smallint() != 108:
         raise SqliProtocolError("ASC response is missing marker 108")
     cursor.skip(12)
-    version_text = cursor.bytes(cursor.smallint_length()).decode("ascii", "strict").rstrip("\0")
+    # Latin-1 decodes any bytes: the version is only reported, never worth failing a connect.
+    version_text = cursor.bytes(cursor.smallint_length()).decode("latin-1").rstrip("\0")
     cursor.skip(cursor.smallint_length())
     cursor.skip(cursor.smallint_length())
     cap_1, cap_2, cap_3 = cursor.int32(), cursor.int32(), cursor.int32()
@@ -1146,19 +1148,10 @@ def _decode_result_value_raw(
         value = struct.unpack(">q", data[:8])[0]
         return None if value == -(1 << 63) else value
     if kind == 10:
-        # Some descriptors carry the start/end qualifier in extended_id.  Live
-        # Informix 15 ordinary SELECT descriptors instead use extended_id=0
-        # and the syscolumns.collength layout in encoded_length: packed width
-        # in the high byte, qualifier nibbles in the low byte (0x130f for YEAR
-        # TO FRACTION(5)).  Normalize that fallback to the CDC extended-id
-        # layout expected by the shared DATETIME decoder.
-        qualifier = column.extended_id
-        if qualifier == 0:
-            encoded_qualifier = column.encoded_length & 0xFF
-            qualifier = ((encoded_qualifier >> 4) << 8) | (encoded_qualifier & 0x0F)
+        # In the CDC extended-id layout the shared DATETIME decoder expects.
         value, _ = decode_value(
             memoryview(data),
-            ColumnDescriptor("datetime", "DATETIME", length=qualifier),
+            ColumnDescriptor("datetime", "DATETIME", length=_datetime_qualifier(column)),
         )
         return value
     if kind == 14:
@@ -1189,6 +1182,18 @@ def _decode_result_value_raw(
     raise SqliDescriptorNotImplemented(f"ordinary Informix result type {kind} is unsupported")
 
 
+def _datetime_qualifier(column: ResultColumn) -> int:
+    # Docstring: A DATETIME result column's qualifier, start << 8 | end. Some descriptors
+    # carry it in extended_id. Live Informix 15 ordinary SELECT descriptors instead use
+    # extended_id=0 and the syscolumns.collength layout in encoded_length: packed width
+    # in the high byte, qualifier nibbles in the low byte (0x130f for YEAR TO FRACTION(5)).
+
+    if column.extended_id:
+        return column.extended_id
+    encoded = column.encoded_length & 0xFF
+    return ((encoded >> 4) << 8) | (encoded & 0x0F)
+
+
 def _fixed_result_size(column: ResultColumn) -> int:
     kind = column.type_code & 0xFF
     widths = {
@@ -1211,8 +1216,10 @@ def _fixed_result_size(column: ResultColumn) -> int:
         precision, scale = (column.encoded_length >> 8) & 0xFF, column.encoded_length & 0xFF
         return (precision + (scale & 1) + 3) // 2
     if kind == 10:
-        total, fraction = (column.encoded_length >> 8) & 0xFF, column.encoded_length & 0xFF
-        return (total + (fraction & 1) + 3) // 2
+        # By the qualifier, as the decoder reads it: where extended_id carries that, the
+        # low byte of encoded_length is not the fraction's width, and the slice was a
+        # byte longer than the value (HOUR TO SECOND as 5 bytes, not 4).
+        return datetime_size(_datetime_qualifier(column))
     if kind == 14:
         layout = interval_layout(column.encoded_length)
         if layout is None:

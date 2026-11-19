@@ -3682,6 +3682,45 @@ class LakeflowContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             informix_module._option_bool({"flag": "maybe"}, "flag", False)
 
+    def test_a_rounded_or_truncated_string_decimal_is_an_unsigned_zero(self):
+        # A variable-scale DECIMAL landing as a string: -0.4 rounded or truncated to a
+        # whole number was written "-0", so HASH of it differed from that of 0.4's "0".
+        context = {"encoding": "utf-8", "hash_key": b""}
+        for name, value in (("ROUND", "-0.4"), ("TRUNC", "-0.9"), ("ROUND", "-0.004")):
+            with self.subTest(name=name, value=value):
+                digits = ["2"] if value == "-0.004" else []
+                result = informix_module._apply_function(name, value, digits, context)
+                self.assertFalse(result.startswith("-"), result)
+        self.assertEqual(informix_module._apply_function("ROUND", "-1.6", [], context), "-2")
+
+    def test_an_upsert_start_is_published_once_a_registration(self):
+        # Before the slot and after it, every microbatch published the same start: two
+        # Lakebase transactions a batch that changed nothing.
+        connector = self.connector(FakeBridge())
+        table = connector._table("app.orders", {})
+        checkpoint = dict(_stream_offset(90), pipeline_scope=connector._pipeline_scope())
+        real = informix_module.publish_minimum_lsn_state_record
+
+        with mock.patch.object(
+            informix_module, "publish_minimum_lsn_state_record", side_effect=real
+        ) as published:
+            for _ in range(3):
+                connector._publish_checkpoint_channel_start_before_capacity(
+                    "app.orders", checkpoint, {}
+                )
+                connector._publish_upsert_channel_start(
+                    table, 90, checkpoint["schema_id"], checkpoint["schema_fingerprint"],
+                    checkpoint["pipeline_scope"],
+                )
+            connector._publish_upsert_channel_start(
+                table, 85, checkpoint["schema_id"], checkpoint["schema_fingerprint"],
+                checkpoint["pipeline_scope"],
+            )
+
+        self.assertEqual(published.call_count, 2)
+        start = connector._read_upsert_channel_start(table, checkpoint["pipeline_scope"])
+        self.assertEqual(start[0], 85)
+
     def test_numbers_past_eighty_digits_and_long_literals_keep_their_digits(self):
         # A DECIMAL(p) with no scale runs from 1E-130 to 1E+126: rounding one to a whole
         # number takes over a hundred digits, more than the context these ran under.
@@ -16320,6 +16359,29 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertGreater(len(list(rows)), 0)
         self.assertIsNotNone(offset)
 
+    def test_stream_retries_a_reconnect_the_listener_refused(self):
+        # The reconnect of an in-place retry met a listener still coming back: a refused
+        # or timed-out connect is an OSError, not a protocol error, and ended the read.
+        bridge = FakeBridge()
+        bridge.reset_transport = lambda: None
+        attempts = {"n": 0}
+        real = bridge.read_changes
+
+        def refused_then_back(*args):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise ConnectionRefusedError(111, "Connection refused")
+            if attempts["n"] == 2:
+                raise TimeoutError("timed out")
+            return real(*args)
+
+        bridge.read_changes = refused_then_back
+        with mock.patch.object(time, "sleep"):
+            _, offset = self.connector(bridge).read_table("app.orders", _stream_offset(), {})
+
+        self.assertEqual(attempts["n"], 3)
+        self.assertIsNotNone(offset)
+
     def test_stream_raises_after_connection_drop_retries_exhausted(self):
         # A persistent drop must still fail rather than loop forever. After the
         # bounded attempts are exhausted the SqliProtocolError propagates.
@@ -20388,6 +20450,8 @@ class LakeflowContractTests(unittest.TestCase):
 
         _, waiting = reader(4).read_table_deletes("app.orders", seeded, options)
 
+        # Marked, and changed by a retry count, so a triggered update goes on waiting.
+        self.assertEqual(waiting.pop("trigger_boundary_retry_count"), 1)
         self.assertEqual(waiting, seeded)
         # The resnapshot has published its boundary, and not yet its floor.
         bridge.now = 150
@@ -20486,18 +20550,20 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(again["commit_lsn"], "70")
 
     def test_a_resnapshot_floor_names_the_last_snapshot_it_replaced(self):
-        # Through resnapshots in a row, and not past a snapshot that emptied the target.
+        # Through resnapshots in a row, each of them, and not past a snapshot that emptied
+        # the target: with the last one alone, a position marked with the first resnapshot
+        # read as one a full refresh had sent past (291) at the second.
         bridge = FakeBridge()
         reader = self._floor_updates(bridge)
         table = Table.parse(_table(), "demo")
         bridge.minimum = 200  # no floor in the log is kept
         scope = lambda update: f"{uuid.UUID(int=21)}_@_{uuid.UUID(int=update)}"  # noqa: E731
         for update, resnapshot, kept in (
-            (2, False, scope(2)),
-            (4, True, scope(2)),
-            (5, True, scope(2)),
-            (6, False, scope(6)),
-            (7, True, scope(6)),
+            (2, False, ()),
+            (4, True, (scope(2),)),
+            (5, True, (scope(4), scope(2))),
+            (6, False, ()),
+            (7, True, (scope(6),)),
         ):
             with self.subTest(update=update):
                 publisher = reader(update)
@@ -20505,7 +20571,7 @@ class LakeflowContractTests(unittest.TestCase):
                     table, "1" * 32, 100 + update, scope(update), resnapshot=resnapshot
                 )
                 record = self._floor(publisher)
-                self.assertEqual(publisher._floor_scopes(record), (scope(update), kept))
+                self.assertEqual(publisher._floor_scopes(record), (scope(update), *kept))
                 self.assertEqual(record.get("resnapshot", False), resnapshot)
 
     def test_a_floor_seed_goes_on_across_a_resnapshot_that_replaced_its_floor(self):
@@ -20561,6 +20627,26 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(
             later._confirmed_floor_seed(table, seeded, {}), (seeded, seeded["floor_seed"])
         )
+
+    def test_a_floor_seed_at_a_resnapshot_goes_on_across_the_next_one(self):
+        # The second resnapshot's floor named only the last snapshot that emptied the
+        # target, not the first resnapshot: a position seeded at that one read as sent
+        # past by a full refresh (291) and started again, skipping the deletes between.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        table = Table.parse(_table(), "demo")
+        bridge.minimum = 200
+        scope = lambda update: f"{uuid.UUID(int=21)}_@_{uuid.UUID(int=update)}"  # noqa: E731
+        for update, resnapshot in ((2, False), (4, True), (5, True)):
+            reader(update)._publish_delete_snapshot_floor(
+                table, "1" * 32, 100 + update, scope(update), resnapshot=resnapshot
+            )
+        seeded = dict(_stream_offset(160), floor_seed=scope(4), pipeline_scope=scope(4))
+
+        with self.assertNoLogs(informix_module.__name__, level="WARNING"):
+            confirmed, _ = reader(5)._confirmed_floor_seed(table, seeded, {})
+
+        self.assertEqual(confirmed["commit_lsn"], "160")
 
     def test_an_own_start_record_is_checked_as_a_published_start_is(self):
         # A start read from the record reached the bootstrap unchecked, schema and table.
@@ -26019,6 +26105,22 @@ class FairSlotQueueWiringTests(unittest.TestCase):
         self.assertIs(bridge._lakebase_slot, slot)
         self.assertIs(bridge._connection_slot_heartbeat, heartbeat)
         self.assertTrue(heartbeat.is_alive())
+
+    def test_a_failed_reconnect_keeps_the_slot_it_held(self):
+        # The reconnect of an in-place retry failed to connect, and released the slot
+        # reset_transport had kept, so the next attempt queued for one again.
+        bridge = self._bridge(**{"max.concurrent.connections": "2"})
+        bridge.transport = mock.Mock()
+        bridge._ensure_connected()
+        self.addCleanup(bridge._release_connection_slot)
+        slot = bridge._lakebase_slot
+        bridge.reset_transport()
+        bridge.transport.connect.side_effect = ConnectionResetError(104, "reset")
+
+        with self.assertRaises(ConnectionResetError):
+            bridge._ensure_connected()
+
+        self.assertIs(bridge._lakebase_slot, slot)
 
     def test_a_bridge_seeds_its_slots_once_per_limit(self):
         bridge = self._bridge()
