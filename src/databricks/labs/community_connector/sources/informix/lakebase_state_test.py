@@ -3331,12 +3331,26 @@ class StagingCredentialProviderTests(unittest.TestCase):
         ]
         now["t"] = 500.0
         self.assertEqual(provider.bearer(), "dapi-2")
+        # Kept for one more rotation: split descriptors carried it to executors.
+        self.assertEqual(api.deleted, [])
+        now["t"] = 1000.0
+        self.assertEqual(provider.bearer(), "dapi-3")
+        self.assertEqual(api.deleted, ["tid-1"])
+
+    def test_a_rejected_token_is_revoked_at_once(self):
+        api = _StagingTokenApi()
+        provider, _ = self._provider(api, clock=lambda: 0.0, lifetime_seconds=1000)
+        first = provider.bearer()
+
+        self.assertEqual(provider.refresh(first), "dapi-2")
+
         self.assertEqual(api.deleted, ["tid-1"])
 
 
 class _FakeHttpResponse:
-    def __init__(self, body=b""):
+    def __init__(self, body=b"", status=206):
         self._body = body
+        self.status = status
 
     def __enter__(self):
         return self
@@ -3344,8 +3358,8 @@ class _FakeHttpResponse:
     def __exit__(self, *exc):
         return False
 
-    def read(self):
-        return self._body
+    def read(self, size=-1):
+        return self._body if size < 0 else self._body[:size]
 
 
 class WorkspaceApiClientTests(unittest.TestCase):
@@ -3531,6 +3545,21 @@ class WorkspaceFilesApiTests(unittest.TestCase):
         # Half-open [10, 30) -> inclusive HTTP range bytes=10-29 (RFC 9110).
         self.assertEqual(captured["range"], "bytes=10-29")
         self.assertTrue(captured["url"].endswith("/api/2.0/fs/files/Volumes/c/s/v/extract.unl"))
+
+    def test_get_range_refuses_a_response_that_ignored_the_range(self):
+        # A server that ignores Range answers 200 with the whole file: every split of a
+        # file then served all of it, or the read exhausted the memory.
+        for response in (
+            _FakeHttpResponse(b"the-whole-file", status=200),
+            _FakeHttpResponse(b"more-than-asked-for", status=206),
+        ):
+            with self.subTest(status=response.status):
+                client, _ = self._client()
+                with mock.patch.object(
+                    lakebase_state.urllib.request, "urlopen", lambda request, timeout=None: response
+                ):
+                    with self.assertRaisesRegex(lakebase_state.LakebaseStateError, "byte range"):
+                        client.get_range("/Volumes/c/s/v/extract.unl", 10, 14)
 
     def test_get_range_returns_empty_without_a_request_when_empty(self):
         def fake_urlopen(request, timeout=None):

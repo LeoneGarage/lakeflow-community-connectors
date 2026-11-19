@@ -466,7 +466,7 @@ class _BufferCursor:
     def char(self, encoding: str) -> str:
         size = self.smallint_length()
         raw = self.bytes(size)
-        return raw.rstrip(b"\0").decode(encoding)
+        return _decode_text(raw.rstrip(b"\0"), encoding)
 
 
 def encode_normal_auth_prefix(
@@ -1497,7 +1497,7 @@ class InformixSqliClient:
                 raise SqliProtocolError(f"unsupported PAM challenge style {style}")
             if style in {3, 4}:
                 continue
-            challenge = raw.decode(self._encoding, "strict")
+            challenge = _decode_text(raw, self._encoding)
             response = self.authentication_provider.respond(style, challenge)
             if isinstance(response, bytes):
                 response_raw = response
@@ -1981,7 +1981,10 @@ class InformixSqliClient:
         names = (
             []
             if count == 0 and not names_raw
-            else [item.decode(self._text_encoding) for item in names_raw.rstrip(b"\0").split(b"\0")]
+            else [
+                _decode_text(item, self._text_encoding)
+                for item in names_raw.rstrip(b"\0").split(b"\0")
+            ]
         )
         if len(names) != count or len(set(names)) != count:
             raise SqliProtocolError("descriptor names do not match column count")

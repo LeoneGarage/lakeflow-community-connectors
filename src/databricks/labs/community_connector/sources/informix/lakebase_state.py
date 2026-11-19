@@ -765,6 +765,8 @@ class StagingCredentialProvider:
         self._lock = threading.Lock()
         self._token: str | None = None
         self._token_id = ""
+        # The token a rotation replaced, revoked at the next one (see _mint).
+        self._retiring_id = ""
         self._minted_at = 0.0
         # When a refresh that failed may be tried again (clock time); 0 until one fails.
         self._refresh_retry_at = 0.0
@@ -821,14 +823,14 @@ class StagingCredentialProvider:
         with self._lock:
             if self._token == rejected:
                 try:
-                    self._mint(self._bootstrap_token)
+                    self._mint(self._bootstrap_token, rejected=True)
                 except BaseException:
                     self._token = None
                     self.rejected = True
                     raise
             return self._token or ""
 
-    def _mint(self, minting_token: str) -> None:
+    def _mint(self, minting_token: str, *, rejected: bool = False) -> None:
         token, token_id, granted = mint_staging_token(
             _WorkspaceApi(self._host, minting_token),
             self._pipeline_id,
@@ -842,10 +844,13 @@ class StagingCredentialProvider:
         self.rejected = False
         lifetime = min(self._lifetime_seconds, granted) if granted else self._lifetime_seconds
         self._refresh_after = lifetime * _STAGING_TOKEN_REFRESH_FRACTION
-        # Rotation with the new token: revoke this provider's previous token and, when
-        # this process is the one to, earlier updates' tokens; best-effort inside the
-        # helper. A refresh has only its own predecessor to revoke.
+        # Rotation with the new token: revoke this provider's token before the previous one
+        # and, when this process is the one to, earlier updates' tokens; best-effort inside
+        # the helper. The previous one goes at the next rotation, unless it was rejected:
+        # split descriptors carry it to executors, whose ranged reads it may still serve.
         earlier = not predecessor_id
+        if not rejected:
+            predecessor_id, self._retiring_id = self._retiring_id, predecessor_id
         claim = self._sweeps_earlier_updates
         if earlier and claim is not None:
             try:
@@ -956,7 +961,18 @@ class WorkspaceFilesApi:
                 with urllib.request.urlopen(
                     request, timeout=_FILES_API_TIMEOUT_SECONDS
                 ) as response:
-                    return response.read()
+                    if byte_range is None:
+                        return response.read()
+                    # At most the range: a server that ignored it (200, the whole file)
+                    # gave every split of a file all of it, or exhausted the memory.
+                    size = byte_range[1] - byte_range[0] + 1
+                    body = response.read(size + 1)
+                    if len(body) > size or (byte_range[0] and response.status != 206):
+                        raise LakebaseStateError(
+                            f"{method} files {volume_path}: the server did not honour the "
+                            f"byte range (HTTP {response.status})"
+                        )
+                    return body
             except urllib.error.HTTPError as error:
                 # An expired or revoked token: replace it once and retry at once.
                 if error.code == 401 and not refreshed:

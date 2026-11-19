@@ -2042,6 +2042,8 @@ def register_lakeflow_source(spark):
             self._lock = threading.Lock()
             self._token: str | None = None
             self._token_id = ""
+            # The token a rotation replaced, revoked at the next one (see _mint).
+            self._retiring_id = ""
             self._minted_at = 0.0
             # When a refresh that failed may be tried again (clock time); 0 until one fails.
             self._refresh_retry_at = 0.0
@@ -2098,14 +2100,14 @@ def register_lakeflow_source(spark):
             with self._lock:
                 if self._token == rejected:
                     try:
-                        self._mint(self._bootstrap_token)
+                        self._mint(self._bootstrap_token, rejected=True)
                     except BaseException:
                         self._token = None
                         self.rejected = True
                         raise
                 return self._token or ""
 
-        def _mint(self, minting_token: str) -> None:
+        def _mint(self, minting_token: str, *, rejected: bool = False) -> None:
             token, token_id, granted = mint_staging_token(
                 _WorkspaceApi(self._host, minting_token),
                 self._pipeline_id,
@@ -2119,10 +2121,13 @@ def register_lakeflow_source(spark):
             self.rejected = False
             lifetime = min(self._lifetime_seconds, granted) if granted else self._lifetime_seconds
             self._refresh_after = lifetime * _STAGING_TOKEN_REFRESH_FRACTION
-            # Rotation with the new token: revoke this provider's previous token and, when
-            # this process is the one to, earlier updates' tokens; best-effort inside the
-            # helper. A refresh has only its own predecessor to revoke.
+            # Rotation with the new token: revoke this provider's token before the previous one
+            # and, when this process is the one to, earlier updates' tokens; best-effort inside
+            # the helper. The previous one goes at the next rotation, unless it was rejected:
+            # split descriptors carry it to executors, whose ranged reads it may still serve.
             earlier = not predecessor_id
+            if not rejected:
+                predecessor_id, self._retiring_id = self._retiring_id, predecessor_id
             claim = self._sweeps_earlier_updates
             if earlier and claim is not None:
                 try:
@@ -2233,7 +2238,18 @@ def register_lakeflow_source(spark):
                     with urllib.request.urlopen(
                         request, timeout=_FILES_API_TIMEOUT_SECONDS
                     ) as response:
-                        return response.read()
+                        if byte_range is None:
+                            return response.read()
+                        # At most the range: a server that ignored it (200, the whole file)
+                        # gave every split of a file all of it, or exhausted the memory.
+                        size = byte_range[1] - byte_range[0] + 1
+                        body = response.read(size + 1)
+                        if len(body) > size or (byte_range[0] and response.status != 206):
+                            raise LakebaseStateError(
+                                f"{method} files {volume_path}: the server did not honour the "
+                                f"byte range (HTTP {response.status})"
+                            )
+                        return body
                 except urllib.error.HTTPError as error:
                     # An expired or revoked token: replace it once and retry at once.
                     if error.code == 401 and not refreshed:
@@ -4796,7 +4812,7 @@ def register_lakeflow_source(spark):
         def char(self, encoding: str) -> str:
             size = self.smallint_length()
             raw = self.bytes(size)
-            return raw.rstrip(b"\0").decode(encoding)
+            return _decode_text(raw.rstrip(b"\0"), encoding)
 
 
     def encode_normal_auth_prefix(
@@ -5827,7 +5843,7 @@ def register_lakeflow_source(spark):
                     raise SqliProtocolError(f"unsupported PAM challenge style {style}")
                 if style in {3, 4}:
                     continue
-                challenge = raw.decode(self._encoding, "strict")
+                challenge = _decode_text(raw, self._encoding)
                 response = self.authentication_provider.respond(style, challenge)
                 if isinstance(response, bytes):
                     response_raw = response
@@ -6311,7 +6327,10 @@ def register_lakeflow_source(spark):
             names = (
                 []
                 if count == 0 and not names_raw
-                else [item.decode(self._text_encoding) for item in names_raw.rstrip(b"\0").split(b"\0")]
+                else [
+                    _decode_text(item, self._text_encoding)
+                    for item in names_raw.rstrip(b"\0").split(b"\0")
+                ]
             )
             if len(names) != count or len(set(names)) != count:
                 raise SqliProtocolError("descriptor names do not match column count")
@@ -10452,7 +10471,8 @@ def register_lakeflow_source(spark):
                         # row anyway. Paging by key cannot go past one.
                         # 461: The snapshot of {} pages by its key and reached a NULL in key
                         # column {}; paging by key can't go past it: set snapshot.scan: cursor
-                        # for this table
+                        # for this table, and run a full refresh of it, as a snapshot already
+                        # begun goes on as it began
                         raise InformixError(_m(461, _join_identity(owner, name), key))
                 bound_after = list(after)
                 if any(isinstance(value, str) for value in after):
@@ -16561,8 +16581,8 @@ def register_lakeflow_source(spark):
             self._schema_transition_waits: dict[tuple[str, str], float] = {}
             self._activity_touched: dict[tuple[str, str], float] = {}
             self._cleaned_update_scopes: set[tuple[str, str]] = set()
-            # The lowest upsert start of an update this reader noted on the own-start record.
-            self._noted_upsert_starts: dict[tuple[str, str], int] = {}
+            # The lowest upsert start this reader noted on each own-start record, this update.
+            self._noted_upsert_starts: dict[str, int] = {}
             self._cleaned_snapshot_stages: set[str] = set()
             # Snapshot-page staging transport, resolved once on first use: None means the
             # FUSE mount; a WorkspaceFilesApi means the Files REST API. See _staging_transport.
@@ -19397,15 +19417,19 @@ def register_lakeflow_source(spark):
             # update until the upsert reader's start shows which snapshot the target holds.
             seeded = (start_offset or {}).get("floor_seed")
             seed_floor = (start_offset or {}).get(_SEED_FLOOR_FIELD)
-            restart_from = table = None
+            restart_from = table = stamp = None
             if seeded is not None:
                 # Validated first: the check takes the seed apart (469 on an invalid one).
                 _validated_offset(start_offset)
                 table = self._table(table_name, table_options)
                 confirmed, seeded = self._confirmed_floor_seed(table, start_offset, table_options)
                 if not confirmed:
-                    # One with a scope is sent back from a full refresh's own start (477).
-                    restart_from, seeded = (start_offset if seeded else None), None
+                    # One with its own seed is sent back from a full refresh's own start (477);
+                    # one with another floor's (291) starts again marked with that floor, which
+                    # the next batch confirms. Unmarked, a seed above the start read as a read
+                    # on in a replay, which then read from the position the floor replaced.
+                    restart_from = start_offset if seeded == start_offset["floor_seed"] else None
+                    stamp, seeded = (None if restart_from else seeded), None
                     # Started again, as a reader with no checkpoint, whose waits count on an
                     # offset of advisory fields alone: on the old offset they brought back the
                     # position the floor replaced, and a replay stopped at it.
@@ -19435,6 +19459,8 @@ def register_lakeflow_source(spark):
                 end = {**end, "floor_seed": seeded}
                 if seed_floor is not None:
                     end[_SEED_FLOOR_FIELD] = seed_floor
+            elif stamp and end.get("commit_lsn") is not None and "floor_seed" not in end:
+                end = {**end, "floor_seed": stamp}
             return rows, end
 
         def _delete_floor_recorded(self, table_name: str, table_options: dict[str, str]) -> bool:
@@ -19574,15 +19600,12 @@ def register_lakeflow_source(spark):
             schema_id = self._snapshot_schema_ids[(scope, table.identity)]
             # Announced, then this update's start looked for again: an upsert reader publishes
             # its start, then looks for the announcement, so one of the two sees the other.
-            self._publish_own_start(table, scope, {"own_start": scope})
+            own = self._immutable_namespace(table, "own-start", self._pipeline_id(scope))
+            self._publish_own_start(own, table.native_identity, {"own_start": scope})
             published = self._read_upsert_channel_start(table, scope)
             if published is not None:
-                lsn, published_schema, fingerprint = published
-                self._publish_own_start(
-                    table,
-                    scope,
-                    {"start_lsn": str(lsn), "schema_id": published_schema, "fingerprint": fingerprint},
-                )
+                self._noted_upsert_starts.pop(own, None)
+                self._note_upsert_start(own, table.native_identity, published)
             # 476: Informix delete channel for '{}' starts at this full refresh's start {}, which it
             # took itself: its upsert reader had not published one yet
             logging.getLogger(__name__).info(_m(476, table.exposed_name, start))
@@ -19676,7 +19699,8 @@ def register_lakeflow_source(spark):
             logging.getLogger(__name__).warning(
                 _m(291, table.exposed_name, record.get("snapshot_scope"))
             )
-            return {}, None
+            # The new floor's update, to mark where it starts again with (_read_table_deletes).
+            return {}, record.get("snapshot_scope")
 
         def _confirmed_own_start(
             self,
@@ -19812,8 +19836,10 @@ def register_lakeflow_source(spark):
                 # starting there skipped the deletes between, and a replay could not tell the
                 # batch from a read on. One that waits stays where it is, marked: an offset of
                 # advisory fields lost the own start, and the next batch started again above it.
+                # Below its commit_lsn, not its begin_lsn: reading on drops every transaction
+                # committed at or below that (_recover), the deletes from a start between too.
                 position = {k: v for k, v in (restart_from or {}).items() if k not in _SEED_MARKS}
-                below = int(position.get("begin_lsn") or position.get("commit_lsn") or 0)
+                below = int(position.get("commit_lsn") or 0)
                 if snapshot_mode == "auto_snapshot" and high_water < minimum:
                     # auto_snapshot replaces the expired checkpoint the channel start names (it was
                     # published before the resnapshot, and the lowest start wins) with a snapshot
@@ -26952,14 +26978,11 @@ def register_lakeflow_source(spark):
                 # 312: Conflicting Informix upsert start boundary for '{}' in update scope '{}'
                 raise InformixError(_m(312, table.exposed_name, scope))
             # After the start, as _full_refresh_delete_seed announces before it looks for one.
-            noted = self._noted_upsert_starts.get((table.identity, scope))
-            if noted is None or start_lsn < noted:
-                self._publish_own_start(
-                    table,
-                    scope,
-                    {"start_lsn": str(start_lsn), "schema_id": schema_id, "fingerprint": fingerprint},
-                )
-                self._noted_upsert_starts[(table.identity, scope)] = start_lsn
+            self._note_upsert_start(
+                self._immutable_namespace(table, "own-start", self._pipeline_id(scope)),
+                table.native_identity,
+                (start_lsn, schema_id, fingerprint),
+            )
 
         def _schema_descends_from(
             self,
@@ -26999,22 +27022,35 @@ def register_lakeflow_source(spark):
                 current, expected_fingerprint = predecessor, None
             return False
 
-        def _publish_own_start(self, table: Table, scope: str, fields: dict) -> None:
-            # Docstring: Publish to the pipeline's own-start record for the table
+        def _publish_own_start(self, key: str, native_identity: str, fields: dict) -> None:
+            # Docstring: Publish to a pipeline's own-start record for a table
             # (publish_own_start_state_record): a full refresh's own start, or a later start.
 
             self._state(
                 publish_own_start_state_record,
                 self._lakebase_state_namespace(),
-                self._immutable_namespace(table, "own-start", self._pipeline_id(scope)),
+                key,
                 {
                     "format_version": _IMMUTABLE_STATE_VERSION,
                     "record_type": "own-start",
-                    "table": table.native_identity,
+                    "table": native_identity,
                     **fields,
                 },
                 operation="own-start publish",
             )
+
+        def _note_upsert_start(self, key: str, native_identity: str, start: tuple) -> None:
+            # Docstring: Lower the own-start record under ``key`` to an upsert reader's start,
+            # once a process unless the start goes lower.
+
+            lsn, schema_id, fingerprint = start
+            if lsn < self._noted_upsert_starts.get(key, lsn + 1):
+                self._publish_own_start(
+                    key,
+                    native_identity,
+                    {"start_lsn": str(lsn), "schema_id": schema_id, "fingerprint": fingerprint},
+                )
+                self._noted_upsert_starts[key] = lsn
 
         @staticmethod
         def _floor_scopes(record: dict | None) -> tuple:
@@ -27356,6 +27392,12 @@ def register_lakeflow_source(spark):
             ):
                 # 312: Conflicting Informix upsert start boundary for '{}' in update scope '{}'
                 raise InformixError(_m(312, exposed, scope))
+            # As _publish_upsert_channel_start does: a partitioned page batch publishes here only.
+            self._note_upsert_start(
+                "/".join((connection_key, table_key, "own-start", self._pipeline_id(scope))),
+                native_identity,
+                (start_lsn, schema_id, fingerprint),
+            )
 
         def _shared_table_lsn(
             self,

@@ -1980,6 +1980,16 @@ class SqliPacketTests(unittest.TestCase):
                 self.assertEqual(context.calls, 1 if tls else 0)
 
 
+class WireTextDecodeTests(unittest.TestCase):
+    def test_wire_text_not_in_its_codeset_is_a_protocol_error(self):
+        # A redirect's detail, a PAM challenge and a result's column names decoded bare:
+        # a codeset mismatch escaped as a UnicodeDecodeError, past the handlers that take
+        # a protocol error, the connection left mid-message.
+        cursor = _sqli._BufferCursor(struct.pack(">h", 2) + b"\xff\xfe")
+        with self.assertRaises(SqliProtocolError):
+            cursor.char("utf-8")
+
+
 class DatetimeChunkCastTests(unittest.TestCase):
     def test_contiguous_qualifiers_produce_fixed_width_casts(self):
         # (packed qualifier, expected CHAR width) for the column's own range.

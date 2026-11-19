@@ -20117,8 +20117,11 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertIn("has since replaced", "\n".join(logs.output))
         self.assertEqual(again["commit_lsn"], "70")
-        self.assertNotIn("floor_seed", again)
+        # Marked with the floor it starts again at, which the next batch confirms.
+        self.assertEqual(again["floor_seed"], later._pipeline_scope())
         self.assertNotIn("seed_floor", again)
+        _, on = later.read_table_deletes("app.orders", again, {})
+        self.assertNotIn("floor_seed", on)
 
     def test_an_own_start_beside_its_refreshs_own_floor_reads_on(self):
         # The upsert reader published its floor, then its start, between the delete reader's
@@ -20302,6 +20305,75 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertIn("waiting for a resnapshot", "\n".join(logs.output))
         self.assertEqual(waiting, seeded)
+
+    def test_an_own_start_mid_transaction_starts_again_below_its_commit(self):
+        # A transaction open across the position made its begin_lsn the lowest: a start
+        # at 200, above that begin and below the position's commit at 550, read as one not
+        # below the position, so the reader read on from it; reading on drops what
+        # committed by 550, and the deletes from 200 up to the own start were lost.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        _, seeded = self._own_start_sent_back(bridge, reader, 200)
+        open_across = dict(seeded, commit_lsn="550", change_lsn="550", begin_lsn="100")
+        bridge.now = 600
+
+        with self.assertLogs(informix_module.__name__, level="WARNING") as logs:
+            _, again = reader(4).read_table_deletes("app.orders", open_across, {})
+
+        self.assertIn("went on from a checkpoint", "\n".join(logs.output))
+        self.assertEqual(again["commit_lsn"], "200")
+
+    def test_a_floor_seed_started_again_above_its_position_is_not_read_in_a_replay(self):
+        # The new floor's update had published its start, so the reader started again at
+        # it, above the position and unmarked; a replay took that for a read on once a
+        # third floor had come, and read the deletes after the old position again.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        reader(2, "full_refresh").read_table("app.orders", {}, {})
+        _, seeded = reader(4).read_table_deletes("app.orders", {}, {})
+        bridge.now = 150
+        reader(5, "full_refresh").read_table("app.orders", {}, {})
+        later = reader(5)
+        _, again = later.read_table_deletes("app.orders", seeded, {})
+        self.assertEqual(again["commit_lsn"], "150")
+        bridge.now = 200
+        reader(6, "full_refresh").read_table("app.orders", {}, {})
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 104},
+            {"op": "DELETE", "tx_id": 7, "lsn": 105, "row": {"id": 1, "value": "a"}},
+            {"op": "COMMIT", "tx_id": 7, "lsn": 106},
+        ]
+        replaying = reader(7)
+        options: dict[str, str] = {}
+
+        rows = informix_module._replay_between_offsets(
+            seeded,
+            again,
+            lambda offset: replaying.read_table_deletes("app.orders", offset, options),
+            options,
+            replaying.options,
+        )
+
+        self.assertEqual(list(rows), [])
+
+    def test_an_upsert_start_published_before_capacity_lowers_the_own_start(self):
+        # A partitioned reader serving a staged snapshot publishes its start only before
+        # it takes a slot: the own-start record never had it, and once a later update's
+        # cleanup removed the start the delete reader sent back found none below it.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        bridge.now = 120
+        _, seeded = reader(3, "full_refresh").read_table_deletes("app.orders", {}, {})
+        table = Table.parse(_table(), "demo")
+        upsert = reader(4)
+        upsert._publish_checkpoint_channel_start_before_capacity(
+            "app.orders", dict(_stream_offset(90), pipeline_scope=upsert._pipeline_scope()), {}
+        )
+        self._drop_upsert_start(upsert, table, 4)
+
+        start = reader(5)._own_start_upsert_start(table, seeded["floor_seed"])
+
+        self.assertEqual(start[0], 90)
 
     def test_an_auto_snapshot_own_start_restart_waits_marked_and_reads_on_above(self):
         # Under auto_snapshot the upsert reader's expired start sends it to the resnapshot's
@@ -20499,7 +20571,11 @@ class LakeflowContractTests(unittest.TestCase):
         _, seeded = deletes.read_table_deletes("app.orders", {}, {})
         table = Table.parse(_table(), "demo")
         deletes._publish_own_start(
-            table, seeded["floor_seed"], {"start_lsn": "90", "schema_id": "x", "fingerprint": "y"}
+            deletes._immutable_namespace(
+                table, "own-start", deletes._pipeline_id(seeded["floor_seed"])
+            ),
+            table.native_identity,
+            {"start_lsn": "90", "schema_id": "x", "fingerprint": "y"},
         )
 
         with self.assertRaisesRegex(InformixError, "Invalid Informix upsert start boundary"):
@@ -20602,7 +20678,10 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(list(rows), [])
         self.assertEqual(again["commit_lsn"], "70")
-        self.assertNotIn("floor_seed", again)
+        # Marked with the floor it starts again at, which the next batch confirms.
+        self.assertEqual(again["floor_seed"], new["pipeline_scope"])
+        _, on = later.read_table_deletes("app.orders", again, {})
+        self.assertNotIn("floor_seed", on)
 
     def test_a_floor_the_delete_reader_turned_down_takes_no_connection_slot_again(self):
         # The floor is another column layout's (or out of the log): the reader can't start
@@ -20968,11 +21047,11 @@ class LakeflowContractTests(unittest.TestCase):
         for options, expected in (
             ({stop: "130", end_seed: logged(seeded["floor_seed"])}, (seeded, seeded["floor_seed"])),
             ({stop: "110", end_seed: logged(None)}, (unmarked, None)),
-            ({stop: "130", end_seed: logged(None)}, ({}, None)),
+            ({stop: "130", end_seed: logged(None)}, ({}, new["pipeline_scope"])),
             # On a transaction above the new floor's page-start boundary: it read on.
             ({stop: "130", end_seed: logged(None, True)}, (unmarked, None)),
-            ({stop: "130", end_seed: logged(new["pipeline_scope"])}, ({}, None)),
-            ({}, ({}, None)),
+            ({stop: "130", end_seed: logged(new["pipeline_scope"])}, ({}, new["pipeline_scope"])),
+            ({}, ({}, new["pipeline_scope"])),
         ):
             with self.subTest(options=options):
                 self.assertEqual(later._confirmed_floor_seed(table, seeded, options), expected)
@@ -28933,6 +29012,8 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
         payload = b"3|x|\n4|y|\n"
 
         class _RangeResponse:
+            status = 206
+
             def __init__(self, body):
                 self._body = body
 
@@ -28942,8 +29023,8 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
             def __exit__(self, *args):
                 return False
 
-            def read(self):
-                return self._body
+            def read(self, size=-1):
+                return self._body if size < 0 else self._body[:size]
 
         def fake_urlopen(request, timeout=None):
             header = request.headers.get("Range")

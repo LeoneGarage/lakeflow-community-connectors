@@ -4036,7 +4036,8 @@ class PurePythonInformixBridge:
                     # row anyway. Paging by key cannot go past one.
                     # 461: The snapshot of {} pages by its key and reached a NULL in key
                     # column {}; paging by key can't go past it: set snapshot.scan: cursor
-                    # for this table
+                    # for this table, and run a full refresh of it, as a snapshot already
+                    # begun goes on as it began
                     raise InformixError(_m(461, _join_identity(owner, name), key))
             bound_after = list(after)
             if any(isinstance(value, str) for value in after):
@@ -10145,8 +10146,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self._schema_transition_waits: dict[tuple[str, str], float] = {}
         self._activity_touched: dict[tuple[str, str], float] = {}
         self._cleaned_update_scopes: set[tuple[str, str]] = set()
-        # The lowest upsert start of an update this reader noted on the own-start record.
-        self._noted_upsert_starts: dict[tuple[str, str], int] = {}
+        # The lowest upsert start this reader noted on each own-start record, this update.
+        self._noted_upsert_starts: dict[str, int] = {}
         self._cleaned_snapshot_stages: set[str] = set()
         # Snapshot-page staging transport, resolved once on first use: None means the
         # FUSE mount; a WorkspaceFilesApi means the Files REST API. See _staging_transport.
@@ -12981,15 +12982,19 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # update until the upsert reader's start shows which snapshot the target holds.
         seeded = (start_offset or {}).get("floor_seed")
         seed_floor = (start_offset or {}).get(_SEED_FLOOR_FIELD)
-        restart_from = table = None
+        restart_from = table = stamp = None
         if seeded is not None:
             # Validated first: the check takes the seed apart (469 on an invalid one).
             _validated_offset(start_offset)
             table = self._table(table_name, table_options)
             confirmed, seeded = self._confirmed_floor_seed(table, start_offset, table_options)
             if not confirmed:
-                # One with a scope is sent back from a full refresh's own start (477).
-                restart_from, seeded = (start_offset if seeded else None), None
+                # One with its own seed is sent back from a full refresh's own start (477);
+                # one with another floor's (291) starts again marked with that floor, which
+                # the next batch confirms. Unmarked, a seed above the start read as a read
+                # on in a replay, which then read from the position the floor replaced.
+                restart_from = start_offset if seeded == start_offset["floor_seed"] else None
+                stamp, seeded = (None if restart_from else seeded), None
                 # Started again, as a reader with no checkpoint, whose waits count on an
                 # offset of advisory fields alone: on the old offset they brought back the
                 # position the floor replaced, and a replay stopped at it.
@@ -13019,6 +13024,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             end = {**end, "floor_seed": seeded}
             if seed_floor is not None:
                 end[_SEED_FLOOR_FIELD] = seed_floor
+        elif stamp and end.get("commit_lsn") is not None and "floor_seed" not in end:
+            end = {**end, "floor_seed": stamp}
         return rows, end
 
     def _delete_floor_recorded(self, table_name: str, table_options: dict[str, str]) -> bool:
@@ -13158,15 +13165,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         schema_id = self._snapshot_schema_ids[(scope, table.identity)]
         # Announced, then this update's start looked for again: an upsert reader publishes
         # its start, then looks for the announcement, so one of the two sees the other.
-        self._publish_own_start(table, scope, {"own_start": scope})
+        own = self._immutable_namespace(table, "own-start", self._pipeline_id(scope))
+        self._publish_own_start(own, table.native_identity, {"own_start": scope})
         published = self._read_upsert_channel_start(table, scope)
         if published is not None:
-            lsn, published_schema, fingerprint = published
-            self._publish_own_start(
-                table,
-                scope,
-                {"start_lsn": str(lsn), "schema_id": published_schema, "fingerprint": fingerprint},
-            )
+            self._noted_upsert_starts.pop(own, None)
+            self._note_upsert_start(own, table.native_identity, published)
         # 476: Informix delete channel for '{}' starts at this full refresh's start {}, which it
         # took itself: its upsert reader had not published one yet
         logging.getLogger(__name__).info(_m(476, table.exposed_name, start))
@@ -13260,7 +13264,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         logging.getLogger(__name__).warning(
             _m(291, table.exposed_name, record.get("snapshot_scope"))
         )
-        return {}, None
+        # The new floor's update, to mark where it starts again with (_read_table_deletes).
+        return {}, record.get("snapshot_scope")
 
     def _confirmed_own_start(
         self,
@@ -13396,8 +13401,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # starting there skipped the deletes between, and a replay could not tell the
             # batch from a read on. One that waits stays where it is, marked: an offset of
             # advisory fields lost the own start, and the next batch started again above it.
+            # Below its commit_lsn, not its begin_lsn: reading on drops every transaction
+            # committed at or below that (_recover), the deletes from a start between too.
             position = {k: v for k, v in (restart_from or {}).items() if k not in _SEED_MARKS}
-            below = int(position.get("begin_lsn") or position.get("commit_lsn") or 0)
+            below = int(position.get("commit_lsn") or 0)
             if snapshot_mode == "auto_snapshot" and high_water < minimum:
                 # auto_snapshot replaces the expired checkpoint the channel start names (it was
                 # published before the resnapshot, and the lowest start wins) with a snapshot
@@ -20536,14 +20543,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # 312: Conflicting Informix upsert start boundary for '{}' in update scope '{}'
             raise InformixError(_m(312, table.exposed_name, scope))
         # After the start, as _full_refresh_delete_seed announces before it looks for one.
-        noted = self._noted_upsert_starts.get((table.identity, scope))
-        if noted is None or start_lsn < noted:
-            self._publish_own_start(
-                table,
-                scope,
-                {"start_lsn": str(start_lsn), "schema_id": schema_id, "fingerprint": fingerprint},
-            )
-            self._noted_upsert_starts[(table.identity, scope)] = start_lsn
+        self._note_upsert_start(
+            self._immutable_namespace(table, "own-start", self._pipeline_id(scope)),
+            table.native_identity,
+            (start_lsn, schema_id, fingerprint),
+        )
 
     def _schema_descends_from(
         self,
@@ -20583,22 +20587,35 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             current, expected_fingerprint = predecessor, None
         return False
 
-    def _publish_own_start(self, table: Table, scope: str, fields: dict) -> None:
-        # Docstring: Publish to the pipeline's own-start record for the table
+    def _publish_own_start(self, key: str, native_identity: str, fields: dict) -> None:
+        # Docstring: Publish to a pipeline's own-start record for a table
         # (publish_own_start_state_record): a full refresh's own start, or a later start.
 
         self._state(
             publish_own_start_state_record,
             self._lakebase_state_namespace(),
-            self._immutable_namespace(table, "own-start", self._pipeline_id(scope)),
+            key,
             {
                 "format_version": _IMMUTABLE_STATE_VERSION,
                 "record_type": "own-start",
-                "table": table.native_identity,
+                "table": native_identity,
                 **fields,
             },
             operation="own-start publish",
         )
+
+    def _note_upsert_start(self, key: str, native_identity: str, start: tuple) -> None:
+        # Docstring: Lower the own-start record under ``key`` to an upsert reader's start,
+        # once a process unless the start goes lower.
+
+        lsn, schema_id, fingerprint = start
+        if lsn < self._noted_upsert_starts.get(key, lsn + 1):
+            self._publish_own_start(
+                key,
+                native_identity,
+                {"start_lsn": str(lsn), "schema_id": schema_id, "fingerprint": fingerprint},
+            )
+            self._noted_upsert_starts[key] = lsn
 
     @staticmethod
     def _floor_scopes(record: dict | None) -> tuple:
@@ -20940,6 +20957,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         ):
             # 312: Conflicting Informix upsert start boundary for '{}' in update scope '{}'
             raise InformixError(_m(312, exposed, scope))
+        # As _publish_upsert_channel_start does: a partitioned page batch publishes here only.
+        self._note_upsert_start(
+            "/".join((connection_key, table_key, "own-start", self._pipeline_id(scope))),
+            native_identity,
+            (start_lsn, schema_id, fingerprint),
+        )
 
     def _shared_table_lsn(
         self,
