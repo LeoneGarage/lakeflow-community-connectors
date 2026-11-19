@@ -746,6 +746,15 @@ _CONNECTION_LOSS = (ConnectionError, TimeoutError, ssl.SSLError)
 _UNREACHABLE_ERRNOS = frozenset({errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN})
 
 
+# What no retry helps: a certificate that failed verification, a login refused (bad
+# credentials, a login deadline, a redirect not allowed), a type the client can't decode.
+CONFIGURATION_ERRORS = (
+    ssl.SSLCertVerificationError,
+    SqliUnsupportedAuthentication,
+    SqliDescriptorNotImplemented,
+)
+
+
 def reconnectable_error(error: BaseException) -> bool:
     # Docstring: Whether an in-place reconnect may retry ``error``: a lost connection, or a
     # connect refused, reset or timed out, a TLS handshake cut short, a name lookup or a
@@ -754,10 +763,7 @@ def reconnectable_error(error: BaseException) -> bool:
     # credentials, a login deadline, a redirect not allowed) or a type it can't decode:
     # those are configuration, and fail the same way again.
 
-    if isinstance(
-        error,
-        (ssl.SSLCertVerificationError, SqliUnsupportedAuthentication, SqliDescriptorNotImplemented),
-    ):
+    if isinstance(error, CONFIGURATION_ERRORS):
         return False
     return isinstance(error, (SqliProtocolError, socket.gaierror, *_CONNECTION_LOSS)) or (
         isinstance(error, OSError) and error.errno in _UNREACHABLE_ERRNOS
@@ -1398,9 +1404,14 @@ class InformixSqliClient:
                     break
                 except ssl.SSLError:
                     raise
-                except OSError:
+                except OSError as error:
                     if attempt == 2:
-                        raise
+                        # A transport loss, so a reconnect tries again: a mount dropped for
+                        # longer (ENOTCONN, seen on serverless) failed the stream reader's
+                        # lookup at once. The OSError stays the cause.
+                        raise SqliTransportError(
+                            f"ssl.ca.file could not be read: {error!r}"
+                        ) from error
                     time.sleep(_CA_FILE_RETRY_SECONDS * (attempt + 1))
         remaining = deadline - time.monotonic()
         if remaining <= 0:

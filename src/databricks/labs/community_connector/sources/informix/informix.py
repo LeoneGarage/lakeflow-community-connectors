@@ -123,6 +123,7 @@ from databricks.labs.community_connector.sources.informix.lakebase_state import 
     validate_lakebase_options,
 )
 from databricks.labs.community_connector.sources.informix.sqli import (
+    CONFIGURATION_ERRORS,
     InformixDatetimeLiteral,
     InformixSqliClient,
     PasswordAuthenticationProvider,
@@ -11111,8 +11112,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 # reader for the whole update, and a file snapshot part-way through a serve
                 # then failed with 423, which asks for stream.partitioned=true. Retried as a
                 # snapshot read is; a source that stays down fails the flow, as its reads
-                # would. Not a certificate, a login or a file error, which are no blip.
-                if not reconnectable_error(error) or attempt >= _SNAPSHOT_RECONNECT_MAX_RETRIES:
+                # would. Any OSError, a file's too (ssl.ca.file on a dropped mount gave
+                # ENOTCONN, which failed the update at once), but not a certificate, a login
+                # or a type no retry helps.
+                if (
+                    isinstance(error, CONFIGURATION_ERRORS)
+                    or attempt >= _SNAPSHOT_RECONNECT_MAX_RETRIES
+                ):
                     raise
                 reset = getattr(self._bridge, "reset_transport", None)
                 if reset is not None:

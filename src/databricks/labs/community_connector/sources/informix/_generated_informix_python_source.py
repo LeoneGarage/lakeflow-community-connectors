@@ -5115,6 +5115,15 @@ def register_lakeflow_source(spark):
     _UNREACHABLE_ERRNOS = frozenset({errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN})
 
 
+    # What no retry helps: a certificate that failed verification, a login refused (bad
+    # credentials, a login deadline, a redirect not allowed), a type the client can't decode.
+    CONFIGURATION_ERRORS = (
+        ssl.SSLCertVerificationError,
+        SqliUnsupportedAuthentication,
+        SqliDescriptorNotImplemented,
+    )
+
+
     def reconnectable_error(error: BaseException) -> bool:
         # Docstring: Whether an in-place reconnect may retry ``error``: a lost connection, or a
         # connect refused, reset or timed out, a TLS handshake cut short, a name lookup or a
@@ -5123,10 +5132,7 @@ def register_lakeflow_source(spark):
         # credentials, a login deadline, a redirect not allowed) or a type it can't decode:
         # those are configuration, and fail the same way again.
 
-        if isinstance(
-            error,
-            (ssl.SSLCertVerificationError, SqliUnsupportedAuthentication, SqliDescriptorNotImplemented),
-        ):
+        if isinstance(error, CONFIGURATION_ERRORS):
             return False
         return isinstance(error, (SqliProtocolError, socket.gaierror, *_CONNECTION_LOSS)) or (
             isinstance(error, OSError) and error.errno in _UNREACHABLE_ERRNOS
@@ -5767,9 +5773,14 @@ def register_lakeflow_source(spark):
                         break
                     except ssl.SSLError:
                         raise
-                    except OSError:
+                    except OSError as error:
                         if attempt == 2:
-                            raise
+                            # A transport loss, so a reconnect tries again: a mount dropped for
+                            # longer (ENOTCONN, seen on serverless) failed the stream reader's
+                            # lookup at once. The OSError stays the cause.
+                            raise SqliTransportError(
+                                f"ssl.ca.file could not be read: {error!r}"
+                            ) from error
                         time.sleep(_CA_FILE_RETRY_SECONDS * (attempt + 1))
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -17600,8 +17611,13 @@ def register_lakeflow_source(spark):
                     # reader for the whole update, and a file snapshot part-way through a serve
                     # then failed with 423, which asks for stream.partitioned=true. Retried as a
                     # snapshot read is; a source that stays down fails the flow, as its reads
-                    # would. Not a certificate, a login or a file error, which are no blip.
-                    if not reconnectable_error(error) or attempt >= _SNAPSHOT_RECONNECT_MAX_RETRIES:
+                    # would. Any OSError, a file's too (ssl.ca.file on a dropped mount gave
+                    # ENOTCONN, which failed the update at once), but not a certificate, a login
+                    # or a type no retry helps.
+                    if (
+                        isinstance(error, CONFIGURATION_ERRORS)
+                        or attempt >= _SNAPSHOT_RECONNECT_MAX_RETRIES
+                    ):
                         raise
                     reset = getattr(self._bridge, "reset_transport", None)
                     if reset is not None:

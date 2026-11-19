@@ -7179,19 +7179,21 @@ class LakeflowContractTests(unittest.TestCase):
         ):
             connector.is_partitioned("app.orders")
 
-    def test_the_partitioned_reader_lookup_retries_network_failures_only(self):
-        # A certificate that fails verification, a login refused, a CA file it can't read:
-        # retried four times like a drop, though each fails the same way again.
+    def test_the_partitioned_reader_lookup_fails_at_once_only_on_configuration(self):
+        # A certificate that fails verification, a login refused, a type the client can't
+        # decode fail the same way again, so they fail at once.
+        import errno
         import ssl
 
         from databricks.labs.community_connector.sources.informix.sqli import (
+            SqliDescriptorNotImplemented,
             SqliUnsupportedAuthentication,
         )
 
         for error in (
             ssl.SSLCertVerificationError(1, "certificate verify failed"),
             SqliUnsupportedAuthentication("Informix login failed"),
-            PermissionError(1, "Operation not permitted"),
+            SqliDescriptorNotImplemented("type 99"),
         ):
             with self.subTest(error=type(error).__name__):
                 connector = self._partitioned_connector()
@@ -7203,6 +7205,27 @@ class LakeflowContractTests(unittest.TestCase):
                 ):
                     connector.is_partitioned("app.orders")
                 self.assertEqual(lookup.call_count, 1)
+        # A file the lookup can't read is retried as a drop is: ssl.ca.file on a Volume
+        # whose FUSE mount dropped (ENOTCONN) failed a serverless update at once.
+        for error in (
+            OSError(errno.ENOTCONN, "Transport endpoint is not connected"),
+            PermissionError(1, "Operation not permitted"),
+        ):
+            with self.subTest(error=str(error)):
+                connector = self._partitioned_connector()
+                real = connector._registration_table
+                calls = []
+
+                def flaky(name, options, error=error, calls=calls, real=real):
+                    calls.append(name)
+                    if len(calls) < 3:
+                        raise error
+                    return real(name, options)
+
+                connector._registration_table = flaky
+                with mock.patch.object(informix_module.time, "sleep"):
+                    self.assertTrue(connector.is_partitioned("app.orders"))
+                self.assertEqual(len(calls), 3)
 
     def test_pages_staged_under_another_flows_scope_are_cleaned_from_there(self):
         # A table.migration relocation serves pages staged under the capturing flow's scope:

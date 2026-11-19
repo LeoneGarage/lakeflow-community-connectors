@@ -1363,7 +1363,12 @@ class SqliPacketTests(unittest.TestCase):
         create_context.assert_called_with(cafile="/v/ca.pem")
         open_socket.assert_called_once()
         error, create_context, open_socket = connect([refused] * 3)
-        self.assertIs(error, refused)
+        # A read that keeps failing is a transport loss, so the reconnect loops and the
+        # partitioned reader lookup try again: a mount dropped for longer (ENOTCONN on
+        # serverless) failed an update at once.
+        self.assertIsInstance(error, _sqli.SqliTransportError)
+        self.assertIs(error.__cause__, refused)
+        self.assertTrue(_sqli.reconnectable_error(error))
         self.assertEqual(create_context.call_count, 3)
         open_socket.assert_not_called()
         bad = ssl.SSLError("no certificate or crl found")
