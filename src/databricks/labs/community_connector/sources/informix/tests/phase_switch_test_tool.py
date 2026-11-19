@@ -4,15 +4,25 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 # Same tables, profile, pipeline and warehouse lookups as the count compare (run from
-# the repo root).
-from count_compare_test_tool import (
-    PIPELINE_NAME,
-    PROFILE,
-    TABLES,
-    resolve_pipeline,
-    resolve_target,
-    resolve_warehouse,
-)
+# the repo root): from the package, or, run as a script, from next to this file.
+try:
+    from databricks.labs.community_connector.sources.informix.tests.count_compare_test_tool import (
+        PIPELINE_NAME,
+        PROFILE,
+        TABLES,
+        resolve_pipeline,
+        resolve_target,
+        resolve_warehouse,
+    )
+except ModuleNotFoundError:
+    from count_compare_test_tool import (
+        PIPELINE_NAME,
+        PROFILE,
+        TABLES,
+        resolve_pipeline,
+        resolve_target,
+        resolve_warehouse,
+    )
 
 SYD = ZoneInfo("Australia/Sydney")
 UTC = ZoneInfo("UTC")

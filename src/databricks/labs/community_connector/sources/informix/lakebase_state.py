@@ -1572,7 +1572,9 @@ class LakebaseState:
             try:
                 # A candidate is read on a live read's path: wait briefly, not for provisioning.
                 facts = _endpoint_facts(api, project_id, deadline=time.monotonic() + 60)
-                token = generate_credential(api, facts["endpoint"])
+                # As _connect_as_admin: the admin role's password where one is set, which
+                # an OAuth token minted beside it failed to stand in for.
+                token = self._admin_password or generate_credential(api, facts["endpoint"])
                 connection, database = self._open_state_database(facts, token)
                 if connection is None:
                     _LOGGER.debug(

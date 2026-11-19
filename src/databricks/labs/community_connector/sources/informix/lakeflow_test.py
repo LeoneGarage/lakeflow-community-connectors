@@ -1571,6 +1571,35 @@ class LakeflowContractTests(unittest.TestCase):
             keys.add(connector._registration_table_cache_key())
         self.assertEqual(len(keys), 2)
 
+    def test_registration_cache_key_is_the_identity_the_state_keys_hold(self):
+        # Folded, a database or server name in another case shared the cached table with
+        # its own database name, and the connection's lookups then differed from it; a
+        # port or a switch written another way did not share one it could have.
+        def key(**options):
+            connector = self.connector()
+            connector.options.update(
+                {"hostname": "informix.example", "server": "ol_informix", "database": "demo"}
+            )
+            connector.options.update(options)
+            return connector._registration_table_cache_key()
+
+        self.assertNotEqual(key(database="DEMO"), key())
+        self.assertNotEqual(key(server="OL_INFORMIX"), key())
+        self.assertEqual(key(port="09088"), key(port="9088"))
+        self.assertEqual(key(**{"primary.key.from.unique.index": "1"}), key())
+
+    def test_floor_and_staged_snapshot_findings_go_with_their_registration(self):
+        # Kept across a new registration, a floor turned down in one update stayed turned
+        # down in the next, its options corrected or not; and they rode to every worker.
+        names = {"_rejected_delete_floors", "_staged_snapshot_offsets"}
+        connector = self.connector()
+        for name in names:
+            connector.__dict__[name] = {"key": "value"}
+
+        self.assertFalse(names & set(connector.__getstate__()))
+        connector.set_registration_scope(f"{uuid.UUID(int=21)}_@_{uuid.UUID(int=9)}")
+        self.assertFalse(names & set(vars(connector)))
+
     def test_each_message_call_matches_its_template_and_comment(self):
         # informix.py's messages live in informix_messages.json, out of the pickled source.
         # Each _m(index, ...) call passes the values its template has fields for, every
@@ -2252,6 +2281,34 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(
             [row["variable_amount"] for row in rows],
             [Decimal("114250.000000000000000000"), Decimal("0.001230000000000000")],
+        )
+
+    def test_a_schema_is_nullable_only_where_a_null_can_land(self):
+        # Under string.null.byte=null every string column was nullable, though only a
+        # character value can hold a NUL byte; and NVL or COALESCE outermost, which
+        # replace any NULL, left a nullable column nullable.
+        bridge = FakeBridge()
+        bridge.tables[0]["columns"] += [
+            {"name": "code", "type_name": "VARCHAR", "length": 8, "nullable": False},
+            {
+                "name": "amount",
+                "type_name": "DECIMAL",
+                "nullable": False,
+                "precision": 5,
+                "scale": 0xFF,
+            },
+        ]
+        options = {
+            "decimal.variable.type": "string",
+            "transform_columns": '{"value": "NVL(value, \'none\')"}',
+        }
+
+        schema = self.connector(bridge).get_table_schema("app.orders", options)
+
+        nullable = {field.name: field.nullable for field in schema.fields}
+        self.assertEqual(
+            {name: nullable[name] for name in ("id", "value", "code", "amount")},
+            {"id": False, "value": False, "code": True, "amount": False},
         )
 
     def test_variable_decimal_type_string_converts_values(self):
@@ -3231,6 +3288,16 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(kind(-3), "LongType")
         self.assertEqual(kind(), "IntegerType")
         self.assertEqual(kind(2), "IntegerType")
+
+    def test_a_bridge_built_directly_reads_its_options_as_the_connector_does(self):
+        # Under names in another case, or left empty, a direct caller's options were read
+        # as written: "Transport.Factory" passed the refusal, an empty CA file failed TLS.
+        base = {"hostname": "h", "user": "u", "password": "p", "server": "s", "database": "d"}
+        with self.assertRaisesRegex(ValueError, "'transport.factory' is not accepted"):
+            PurePythonInformixBridge({**base, "Transport.Factory": "os:getcwd"})
+        bridge = PurePythonInformixBridge({**base, "Encrypt": "true", "ssl.ca.file": ""})
+        self.assertEqual(bridge.options.get("encrypt"), "true")
+        self.assertNotIn("ssl.ca.file", bridge.options)
 
     def test_no_connection_option_names_code_to_load(self):
         # bridge.factory and transport.factory imported a module and handed its callable
@@ -14103,6 +14170,17 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(seed["phase"], "stream")
         self.assertEqual(seed["commit_lsn"], "125")
         self.assertTrue(seed.get("handoff_seeded"))
+
+    def test_migration_on_an_append_flow_returns_its_offset_undecayed(self):
+        # The record-and-stop fell through to the retry reset, which halved a busy flow's
+        # capacity pressure: each batch's offset differed, and each wrote the token again.
+        start = dict(_stream_offset(125), capacity_pressure=8)
+
+        _, offset = self.connector(FakeBridge()).read_table(
+            "app.orders", start, {"table.migration": "true", "append.only.ingestion": "true"}
+        )
+
+        self.assertEqual(offset, start)
 
     def test_migration_on_an_append_flow_mid_snapshot_records_and_stops(self):
         # Under table.migration an append flow records and stops whatever its phase: a keyed
@@ -28732,6 +28810,27 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
                 for row in connector.read_partition("app.orders", partition, options)
             ]
             self.assertEqual([(r["id"], r["value"]) for r in fanned], expected, target)
+
+    def test_an_extracts_split_plan_is_probed_once_while_its_files_stand(self):
+        # Each read planned every split of every file again, probing each boundary with a
+        # ranged read: the offset once and the partitions twice, window after window.
+        source = self._source("1|a|\n2|b|\n3|c|\n4|d|\n5|e|\n")
+        options = {"snapshot.source": source, "snapshot.split.bytes": "1"}
+        connector = self.connector(FakeBridge())
+        planned = mock.Mock(side_effect=informix_module._unl_byte_splits)
+
+        with mock.patch.object(informix_module, "_unl_byte_splits", planned):
+            offset = connector.latest_offset("app.orders", options, {})
+            connector.get_partitions("app.orders", options, {}, offset)
+            connector.get_partitions("app.orders", options, {}, offset)
+            self.assertEqual(planned.call_count, 1)
+            path = next(iter(connector._list_unl_files(source, "app.orders")))
+            os.utime(path, ns=(1, 1))
+            connector._unl_all_splits(connector._table("app.orders", options), options)
+
+        self.assertEqual(planned.call_count, 2)
+        state = connector.__getstate__()
+        self.assertNotIn("_unl_split_plans", state)
 
     def test_unl_split_bytes_option_rejects_a_non_positive_value(self):
         with self.assertRaises(ValueError):

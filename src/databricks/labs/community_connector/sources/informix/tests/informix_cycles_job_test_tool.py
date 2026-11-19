@@ -50,6 +50,7 @@ import datetime as dt
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import time
@@ -456,13 +457,16 @@ class PipelineFailed(RuntimeError):
 
 def fail_pipeline(cycle, label, update_id):
     # An update ended FAILED: record it with its error and fail the run (see the top).
-    # The update's own error, for the record: the first one its event log holds.
+    # The update's own error, for the record: the first exception its event log holds. A
+    # flow's exception is on the WARN event of each failed attempt; the ERROR event that
+    # ends the update carries none, and is taken only when no event has one.
     try:
         row = spark.sql(
             f"SELECT message, error.exceptions[0].message AS cause "
             f"FROM event_log('{PIPELINE_ID}') "
-            f"WHERE origin.update_id = '{update_id}' AND level = 'ERROR' "
-            f"ORDER BY timestamp LIMIT 1"
+            f"WHERE origin.update_id = '{update_id}' AND level IN ('ERROR', 'WARN') "
+            f"AND (error IS NOT NULL OR level = 'ERROR') "
+            f"ORDER BY error IS NULL, timestamp LIMIT 1"
         ).first()
         cause = "" if row is None else f"{row['message']} {(row['cause'] or '')[-600:]}"
     except Exception as error:  # noqa: BLE001 - the failure is reported either way
@@ -593,6 +597,13 @@ def data_compare(cycle):
     finally:
         sys.argv = argv
     rows = json.loads((output / "comparison.json").read_text())
+    # The dumps of every table, a cycle's worth each, on the driver's disk: kept, five
+    # cycles of them filled it. The comparison is all the run reads of them.
+    for path in output.iterdir():
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.name != "comparison.json":
+            path.unlink()
     keys = (
         "missing_rows",
         "extra_rows",

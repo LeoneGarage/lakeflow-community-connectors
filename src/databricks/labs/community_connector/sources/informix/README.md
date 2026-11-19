@@ -1499,7 +1499,11 @@ an object from column name to an expression over that column:
   lands as a `BIGINT` for the same reason (2147483647 to the thousand is 2147484000). A
   transformed column is nullable when its source
   column is, or when `NULLIFY` or `SUBSTR` (NULL past the end) can produce NULL; `HASH` on
-  a `NOT NULL` key keeps it `NOT NULL`. `NVL` and `COALESCE` fall back to a value of the
+  a `NOT NULL` key keeps it `NOT NULL`, and `NVL` or `COALESCE` as the outermost function
+  makes a column `NOT NULL`. Under the default `string.null.byte=null` a character column
+  (`CHAR`, `NCHAR`, `VARCHAR`, `NVARCHAR`, `LVARCHAR`) is nullable however it is declared,
+  as a value holding a NUL byte lands as NULL, unless an outermost `NVL` or `COALESCE`
+  replaces it; other columns that land as strings can't hold one. `NVL` and `COALESCE` fall back to a value of the
   type the expression inside them lands as, under the table's decimal options: over an
   integer column, `LENGTH`, `CHAR_LENGTH`, `YEAR`, `MONTH`, `DAY`, or `WEEKDAY`, or a
   variable-scale `DECIMAL` under `decimal.variable.type: integer`, the fallback must be a

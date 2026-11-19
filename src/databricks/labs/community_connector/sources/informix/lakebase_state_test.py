@@ -1741,6 +1741,39 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         api.request.assert_any_call("DELETE", "/api/2.0/postgres/projects/informix-state-old")
         connection.close.assert_called_once()
 
+    def test_an_unused_project_is_swept_with_the_admin_password_where_one_is_set(self):
+        # Provisioning connects with lakebase.admin_password where one is set; the sweep
+        # minted an OAuth token instead and gave it as that role's password, so where
+        # no token can be minted, or the role takes a password, it never deleted one.
+        lakebase_state.LakebaseState._project_gc_checked.clear()
+        state = lakebase_state.LakebaseState({"lakebase.admin_password": "secret"}, "current")
+        api = mock.MagicMock()
+        api.request.side_effect = [
+            {"projects": [{"name": "projects/informix-state-old"}]},
+            {"name": "operations/delete"},
+        ]
+        state._api_client = mock.Mock(return_value=api)
+        connection = mock.MagicMock()
+        _answer_sweep_queries(connection.cursor.return_value.__enter__.return_value)
+        state._open = mock.Mock(return_value=connection)
+        state._admin_user = mock.Mock(return_value="admin")
+
+        with (
+            mock.patch.object(
+                lakebase_state,
+                "_endpoint_facts",
+                return_value={"endpoint": "endpoint", "host": "host"},
+            ),
+            mock.patch.object(
+                lakebase_state, "generate_credential", side_effect=AssertionError("minted")
+            ),
+            mock.patch.object(lakebase_state.time, "time", return_value=100_000_000),
+        ):
+            deleted = state.collect_unused_projects(90, 24)
+
+        self.assertEqual(deleted, 1)
+        self.assertEqual({call.args[2] for call in state._open.call_args_list}, {"secret"})
+
     def test_a_candidate_project_is_read_in_the_database_its_state_is_in(self):
         # Opened in this connection's lakebase.database alone, a project another connection
         # kept on the default database was never swept; one in neither is left alone.

@@ -637,7 +637,16 @@ _INDEX_SCAN_SETTLE_ATTEMPTS = 5
 # How many times a claim of a connection slot reopens a state connection Lakebase
 # dropped, as the other state operations do.
 _SLOT_CLAIM_RECONNECTS = 3
-_SCAN_CACHES = ("_moved_rows", "_index_scans", "_index_scan_live", "_scan_progress_forgotten")
+_SCAN_CACHES = (
+    "_moved_rows",
+    "_index_scans",
+    "_index_scan_live",
+    "_scan_progress_forgotten",
+    # And what it has found of delete floors, staged snapshots and extract split plans.
+    "_rejected_delete_floors",
+    "_staged_snapshot_offsets",
+    "_unl_split_plans",
+)
 # How many rows of a table keyed by primary.keys may change index value during the scan:
 # each is left out of the pages and read once more at the end, and the manifest names it.
 _INDEX_SCAN_MOVED_ROWS = 10_000
@@ -2178,7 +2187,9 @@ class PurePythonInformixBridge:
     # replaces the bridge with set_bridge_factory: no connection option names code to load.
 
     def __init__(self, options: dict[str, str]) -> None:
-        self.options = options
+        # As the connector reads them: a bridge built directly (the ANSI live test) read
+        # "Encrypt" or "Bridge.Factory" as unset, and an empty "port" as a number.
+        self.options = options = _options_set(options)
         authentication = options.get("authentication.mode", "password").lower()
         if authentication not in {"password", "pam"}:
             # 14: Authentication mode {!r} is unsupported; use password or pam.
@@ -10403,27 +10414,35 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # key and nothing else. And under string.null.byte=null a character value
             # that holds a NUL byte is a NULL. Spark plans on what the schema says cannot
             # be NULL, so it says what can.
+            # Only a character column's values can hold one: INTERVAL, partial DATETIME and
+            # decimals as strings are text the connector writes. A transform whose outermost
+            # function is NVL or COALESCE replaces any NULL, the NUL byte's included.
             deletes = self._is_delete_flow()
             nulled = _null_byte_mode(self.options) == "null"
             fields = []
             for column in table.columns:
+                operand = transforms.get(column.name)
                 kind = (
-                    _transform_spark_type(transforms[column.name], column, table_options)
-                    if column.name in transforms
+                    _transform_spark_type(operand, column, table_options)
+                    if operand is not None
                     else _spark_type(column, table_options)
+                )
+                filled = operand is not None and _operand_functions(operand)[:1] in (
+                    ["NVL"],
+                    ["COALESCE"],
                 )
                 fields.append(
                     StructField(
                         renames.get(column.name, column.name),
                         kind,
-                        column.nullable
-                        or (
-                            column.name in transforms
-                            and _transform_may_null(transforms[column.name])
-                        )
-                        or (deletes and column.name not in table.primary_keys)
-                        # By the column as read: a transform of such a value gets the NULL.
-                        or (nulled and isinstance(_spark_type(column, table_options), StringType)),
+                        (deletes and column.name not in table.primary_keys)
+                        or not filled
+                        and (
+                            column.nullable
+                            or (operand is not None and _transform_may_null(operand))
+                            # By the column as read: a transform of such a value gets the NULL.
+                            or (nulled and _row_filter_kind(column) in _STRING_KINDS)
+                        ),
                     )
                 )
             fields.extend(
@@ -10641,16 +10660,18 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # Injected test bridges and incomplete discovery configurations do
             # not have a stable source identity and must remain instance-local.
             return None
+        # As the state keys hold them: a table cached under one database name's case was
+        # handed to a connection naming it in another, whose own lookups then differed.
         return (
             scope,
             hostname.strip().rstrip(".").casefold(),
-            self.options.get("port", "9088"),
-            server.strip().casefold(),
-            self.options.get("database", "").strip().casefold(),
+            str(int(self.options.get("port") or 9088)),
+            server.strip(),
+            self.options.get("database", "").strip(),
             self.options.get("table.include.list", self.options.get("tables", "")),
             self.options.get("table.exclude.list", ""),
             # Discovery keys a table by its unique index only when this is on.
-            self.options.get(_PROMOTE_UNIQUE_INDEX_OPTION, ""),
+            str(_option_bool(self.options, _PROMOTE_UNIQUE_INDEX_OPTION, True)),
         )
 
     def _scope_from_checkpoint(self, offset: Any) -> None:
@@ -10800,9 +10821,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     # table follows the identical CDC path from here on.
                     if effective_start and migration:
                         # Whatever the phase: a capture parks it and a committed seed drops
-                        # the token. A seed from a keyed capture can be mid-snapshot.
-                        result = self._append_migration_record_and_stop(table, effective_start)
-                    elif effective_start and effective_start.get("phase") == "stream":
+                        # the token. A seed from a keyed capture can be mid-snapshot. The same
+                        # offset back, undecayed, as _read_handoff's below.
+                        return self._append_migration_record_and_stop(table, effective_start)
+                    if effective_start and effective_start.get("phase") == "stream":
                         # After Restore, a handoff seed can carry an in-flight incremental
                         # copy (phase=="stream" with an "incremental" block, only ever from a
                         # keyed capture that was mid-copy); continue the copy from its cursor
@@ -11510,6 +11532,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 snapshot_lsn,
                 start_split=start_split,
                 window=end_split - start_split,
+                all_splits=splits,
             )
         batch = (
             self._snapshot_page_batch(table, effective_start, table_options)
@@ -12958,13 +12981,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # update until the upsert reader's start shows which snapshot the target holds.
         seeded = (start_offset or {}).get("floor_seed")
         seed_floor = (start_offset or {}).get(_SEED_FLOOR_FIELD)
-        restart_from = None
+        restart_from = table = None
         if seeded is not None:
             # Validated first: the check takes the seed apart (469 on an invalid one).
             _validated_offset(start_offset)
-            confirmed, seeded = self._confirmed_floor_seed(
-                self._table(table_name, table_options), start_offset, table_options
-            )
+            table = self._table(table_name, table_options)
+            confirmed, seeded = self._confirmed_floor_seed(table, start_offset, table_options)
             if not confirmed:
                 # One with a scope is sent back from a full refresh's own start (477).
                 restart_from, seeded = (start_offset if seeded else None), None
@@ -12991,7 +13013,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # and its upsert reader went on from a checkpoint instead (the refresh left
             # the table); it starts again below that start, at {}
             logging.getLogger(__name__).warning(
-                _m(477, table_name, restart_from["floor_seed"], end["commit_lsn"])
+                _m(477, table.exposed_name, restart_from["floor_seed"], end["commit_lsn"])
             )
         if seeded is not None and end.get("commit_lsn") is not None:
             end = {**end, "floor_seed": seeded}
@@ -18340,21 +18362,31 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         _delimiter, escape = self._unl_field_format(table_options)
         escape_byte = _unl_escape_byte(escape, _client_encoding(self.options))
         splits: list[tuple[str, int, int, bool]] = []
+        # A file's plan, by its size and change time: re-planned on every read, an extract's
+        # boundaries were probed again in every window served from it, ranged reads of each.
+        plans = self.__dict__.setdefault("_unl_split_plans", {})
         for path in self._list_unl_files(source, table.exposed_name):
-            size = os.path.getsize(path)
-            if not size:
-                # No records to split, and a ranged read of an empty file fails (416).
-                continue
-            read_chunk = self._unl_read_chunk(path)
-            if _unl_file_is_gzip(read_chunk):
-                # Gzip is not seekable, so the whole compressed file is one split.
-                splits.append((path, 0, size, True))
-                continue
+            info = os.stat(path)
+            key = (path, info.st_size, info.st_mtime_ns, target_bytes, escape_byte)
+            if key not in plans:
+                plans[key] = self._unl_file_splits(path, info.st_size, target_bytes, escape_byte)
+            splits += plans[key]
+        return splits
+
+    def _unl_file_splits(self, path, size, target_bytes, escape_byte):
+        if not size:
+            # No records to split, and a ranged read of an empty file fails (416).
+            return []
+        read_chunk = self._unl_read_chunk(path)
+        if _unl_file_is_gzip(read_chunk):
+            # Gzip is not seekable, so the whole compressed file is one split.
+            return [(path, 0, size, True)]
+        return [
+            (path, start_byte, end_byte, False)
             for start_byte, end_byte in _unl_byte_splits(
                 read_chunk, size, target_bytes=target_bytes, escape=escape_byte
-            ):
-                splits.append((path, start_byte, end_byte, False))
-        return splits
+            )
+        ]
 
     def _unl_split_descriptors(
         self,
@@ -18364,6 +18396,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         *,
         start_split: int,
         window: int,
+        all_splits: list | None = None,
     ) -> list[dict]:
         # Docstring: ``unl_split`` partition descriptors for the split window ``[start_split,
         # +window)``.
@@ -18375,7 +18408,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # makes executors fall back to a local seek. The token rides only this batch's
         # transient descriptors, never the checkpoint offset.
 
-        all_splits = self._unl_all_splits(table, table_options)
+        if all_splits is None:
+            all_splits = self._unl_all_splits(table, table_options)
         end_split = min(start_split + window, len(all_splits))
         columns = [_partition_column(column) for column in table.catalog_columns or table.columns]
         encoding = _client_encoding(self.options)
