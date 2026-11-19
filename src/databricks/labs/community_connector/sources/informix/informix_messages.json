@@ -476,5 +476,9 @@
 "Option '{}' of table '{}' is never read: snapshot.mode=cdc_only, an append-only table's default, reads no snapshot; set snapshot.mode=initial",
 "Option '{}' of table '{}' is never read: snapshot.mode={} takes no snapshot from it; set snapshot.mode=initial or snapshot.mode=initial_only",
 "Informix delete channel for '{}' starts at this full refresh's start {}, which it took itself: its upsert reader had not published one yet",
-"Informix delete channel for '{}' started at full refresh {}'s own start, and its upsert reader went on from a checkpoint instead (the refresh left the table); it starts again below that start, at {}"
+"Informix delete channel for '{}' started at full refresh {}'s own start, and its upsert reader went on from a checkpoint instead (the refresh left the table); it starts again below that start, at {}",
+"gzip snapshot file {} ends inside a compressed member, before its trailer: the file is cut short (an incomplete copy or upload); replace it with the whole extract",
+".unl snapshot file {} ended at byte {}, short of the {} planned; the extract changed under a running snapshot -- run a full refresh",
+"Option '{}' gives {} the number {}, which has more than 17 significant digits; a FLOAT or SMALLFLOAT takes at most 17, which name any of its values",
+"Option '{}' gives {} the number {}, outside what a {} compares exactly: 0, or a magnitude from {} to {}"
 ]

@@ -1711,6 +1711,23 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         with self.assertLogs(lakebase_state.__name__, "WARNING"):
             self.assertEqual(state.collect_unused_projects(90, 24), 0)
 
+    def test_a_claim_won_just_short_of_the_interval_still_looks_for_projects(self):
+        # The caller's Lakebase claim spaces runs an interval apart. At a whole interval by
+        # this process's clock too, a claim won a few milliseconds short of it was spent
+        # with no run; half an interval still keeps another connection from repeating one.
+        lakebase_state.LakebaseState._project_gc_checked.clear()
+        state = lakebase_state.LakebaseState({}, "current")
+        api = mock.MagicMock()
+        api.request.return_value = {"projects": []}
+        state._api_client = mock.Mock(return_value=api)
+        looked = []
+        for now in (1000.0, 1000.0 + 60, 1000.0 + 24 * 3600 - 0.005):
+            with mock.patch.object(lakebase_state.time, "monotonic", return_value=now):
+                before = api.request.call_count
+                state.collect_unused_projects(90, 24)
+                looked.append(api.request.call_count > before)
+        self.assertEqual(looked, [True, False, True])
+
     def test_owned_inactive_project_is_deleted_after_retention(self):
         lakebase_state.LakebaseState._project_gc_checked.clear()
         state = lakebase_state.LakebaseState({}, "current")
@@ -3588,6 +3605,38 @@ class WorkspaceFilesApiTests(unittest.TestCase):
                 data = client.get_range("/Volumes/c/s/v/extract.unl", 0, 4 << 20)
         self.assertEqual(data, b"whole-range-body")
         self.assertEqual(attempts["n"], 2)
+
+    def test_get_range_retries_a_body_cut_short_of_its_content_length(self):
+        # http.client's read(amt) returns the bytes that came before the connection dropped
+        # and raises nothing; read() alone checks Content-Length. The split took the bytes
+        # it got for the end of its range, and a cut right after the headers read as b"".
+        class _Socket:
+            def __init__(self, raw):
+                self._raw = raw
+
+            def makefile(self, *_args, **_kwargs):
+                return io.BytesIO(self._raw)
+
+        def response(body, length):
+            head = f"HTTP/1.1 206 Partial Content\r\nContent-Length: {length}\r\n\r\n"
+            answer = http.client.HTTPResponse(_Socket(head.encode() + body))
+            answer.begin()
+            return answer
+
+        for cut in (b"", b"0123"):
+            with self.subTest(cut=cut):
+                attempts = []
+
+                def fake_urlopen(request, timeout=None, _cut=cut, _attempts=attempts):
+                    _attempts.append(request)
+                    return response(_cut if len(_attempts) == 1 else b"0123456789", 10)
+
+                client, _ = self._client()
+                with mock.patch.object(lakebase_state.urllib.request, "urlopen", fake_urlopen):
+                    with mock.patch.object(lakebase_state.time, "sleep", lambda _s: None):
+                        data = client.get_range("/Volumes/c/s/v/extract.unl", 0, 10)
+                self.assertEqual(data, b"0123456789")
+                self.assertEqual(len(attempts), 2)
 
     def test_get_range_exhausts_attempts_on_persistent_truncation(self):
         def fake_urlopen(request, timeout=None):

@@ -972,6 +972,11 @@ class WorkspaceFilesApi:
                             f"{method} files {volume_path}: the server did not honour the "
                             f"byte range (HTTP {response.status})"
                         )
+                    # Short of its Content-Length: a sized read returns what came before
+                    # the connection dropped and raises nothing, as a whole read does, so a
+                    # split took the bytes it got for the end of its range. Retried below.
+                    if getattr(response, "length", None):
+                        raise http.client.IncompleteRead(body, response.length)
                     return body
             except urllib.error.HTTPError as error:
                 # An expired or revoked token: replace it once and retry at once.
@@ -1544,12 +1549,17 @@ class LakebaseState:
 
     def collect_unused_projects(self, retention_days: int, interval_hours: float) -> int:
         # Docstring: Delete inactive, auto-named connector projects once per scan interval.
+        #
+        # The caller's claim in Lakebase spaces the runs an interval apart. This process-wide
+        # check only keeps the process's other connections to the workspace from repeating a
+        # run one of them just made, so it waits half an interval: at a whole one, a claim
+        # won a few milliseconds short of it by this process's clock was spent with no run.
 
         if self._options.get("lakebase.project.id", "").strip():
             return 0
         now = time.monotonic()
         cache_key = self._options.get("lakebase.workspace.host", "workspace")
-        if now - self._project_gc_checked.get(cache_key, float("-inf")) < interval_hours * 3600:
+        if now - self._project_gc_checked.get(cache_key, float("-inf")) < interval_hours * 1800:
             return 0
         self._project_gc_checked[cache_key] = now
         # Housekeeping on the read path, run a day apart by default: a listing that fails

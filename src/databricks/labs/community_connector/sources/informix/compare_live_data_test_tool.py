@@ -595,7 +595,9 @@ def compare_table(
     key_count = len(key_columns)
     source = []
     for number, line in enumerate(
-        iter_unload_records(source_file.read_text(encoding=UNLOAD_ENCODING)), 1
+        # Bytes decoded, not read_text: its newline translation turned a value's lone \r
+        # into a record end, where UNLOAD (and the connector) end records on \n only.
+        iter_unload_records(source_file.read_bytes().decode(UNLOAD_ENCODING)), 1
     ):
         values = parse_unload_line(line)
         if len(values) != len(columns):

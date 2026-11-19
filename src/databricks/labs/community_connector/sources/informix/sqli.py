@@ -9,6 +9,7 @@ fail-closed where the recovered evidence is incomplete.
 from __future__ import annotations
 
 import contextlib
+import errno
 import io
 import ipaddress
 import logging
@@ -742,6 +743,20 @@ def encode_lodata_read(descriptor: int, requested: int) -> bytes:
 # to a closed peer, a read timeout. read_exact raises SqliTransportError only for a clean
 # end of stream.
 _CONNECTION_LOSS = (ConnectionError, TimeoutError, ssl.SSLError)
+_UNREACHABLE_ERRNOS = frozenset({errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN})
+
+
+def reconnectable_error(error: BaseException) -> bool:
+    # Docstring: Whether an in-place reconnect may retry ``error``: a lost connection, or a
+    # connect refused, reset or timed out, a TLS handshake cut short, a name lookup or a
+    # route that failed while the network or the listener recovers. connect() raises these
+    # as they are. Not a certificate that failed verification: that is configuration.
+
+    if isinstance(error, ssl.SSLCertVerificationError):
+        return False
+    return isinstance(error, (SqliProtocolError, socket.gaierror, *_CONNECTION_LOSS)) or (
+        isinstance(error, OSError) and error.errno in _UNREACHABLE_ERRNOS
+    )
 
 
 def _raise_connection_loss(error: BaseException) -> None:
@@ -936,8 +951,7 @@ def _partial_datetime_sql(value: str, qualifier: int) -> str:
             or (end <= 10 and separator)
         ):
             raise ValueError("TIME string does not match its Informix DATETIME qualifier")
-        qualifier_sql = expected[0] if start == end else f"{expected[0]} TO {expected[-1]}"
-        return f"DATETIME({value}) {qualifier_sql}"
+        return f"DATETIME({value}) {expected[0]} TO {expected[-1]}"
     parts = value.split(":")
     if len(parts) != len(expected):
         raise ValueError("partial Informix DATETIME does not match its qualifier")
@@ -963,8 +977,9 @@ def _partial_datetime_sql(value: str, qualifier: int) -> str:
         else:
             separator = ":"
         payload += separator + component
-    qualifier_sql = expected[0] if start == end else f"{expected[0]} TO {expected[-1]}"
-    return f"DATETIME({payload}) {qualifier_sql}"
+    # TO even for one field: Informix takes DATETIME(2024) YEAR TO YEAR, and fails
+    # DATETIME(2024) YEAR with -201 (checked on 14.10).
+    return f"DATETIME({payload}) {expected[0]} TO {expected[-1]}"
 
 
 def datetime_order_preserving_cast(column: str, qualifier: int) -> str | None:

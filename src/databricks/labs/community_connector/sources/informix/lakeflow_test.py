@@ -3721,6 +3721,27 @@ class LakeflowContractTests(unittest.TestCase):
         start = connector._read_upsert_channel_start(table, checkpoint["pipeline_scope"])
         self.assertEqual(start[0], 85)
 
+    def test_a_start_moved_at_its_position_is_checked_after_the_pre_capacity_publish(self):
+        # The pre-capacity publish can't check a schema stepped at the same position (it has
+        # no table); noted, it made the reader's own publish skip the check that refuses a
+        # start whose schema is no successor of the one published there (312).
+        bridge = FakeBridge()
+        other = self.connector(bridge)
+        connector = self.connector(bridge)
+        table = connector._table("app.orders", {})
+        checkpoint = dict(_stream_offset(90), pipeline_scope=connector._pipeline_scope())
+        other._publish_upsert_channel_start(
+            other._table("app.orders", {}), 90, "2" * 32, _schema_fingerprint(table),
+            checkpoint["pipeline_scope"],
+        )
+
+        connector._publish_checkpoint_channel_start_before_capacity("app.orders", checkpoint, {})
+        with self.assertRaisesRegex(InformixError, "Conflicting Informix upsert start"):
+            connector._publish_upsert_channel_start(
+                table, 90, checkpoint["schema_id"], checkpoint["schema_fingerprint"],
+                checkpoint["pipeline_scope"],
+            )
+
     def test_numbers_past_eighty_digits_and_long_literals_keep_their_digits(self):
         # A DECIMAL(p) with no scale runs from 1E-130 to 1E+126: rounding one to a whole
         # number takes over a hundred digits, more than the context these ran under.
@@ -13153,6 +13174,34 @@ class LakeflowContractTests(unittest.TestCase):
                 floor.assert_not_called()
                 self.assertNotIn("commit_lsn", offset)
 
+    def test_a_resnapshot_wait_counts_up_and_each_range_replays_as_empty(self):
+        # A resnapshot wait returns its retry offset, not raises it past the reset that
+        # clears counters after a read: the count went 1, absent, 1, and from a start of
+        # advisory fields alone the end was {}, a range a replay can't take (message 1).
+        bridge = FakeBridge()
+        bridge.minimum = 91
+        bridge.now = 150
+        options = {"snapshot.mode": "auto_snapshot"}
+        connector = self.connector(bridge)
+        table = connector._table("app.orders", {})
+        connector._publish_upsert_channel_start(
+            table, 90, "1" * 32, _schema_fingerprint(table), connector._pipeline_scope()
+        )
+        offset, counts = {}, []
+        for _ in range(3):
+            _, waited = connector.read_table_deletes("app.orders", offset, options)
+            self.assertTrue(waited)
+            self.assertTrue(informix_module._range_emits_nothing(offset, waited))
+            counts.append(waited.get("trigger_boundary_retry_count"))
+            offset = waited
+        self.assertEqual(counts, [1, 2, 3])
+
+        # A wait entered with another advisory field keeps its count, and drops that field.
+        checkpoint = {**_stream_offset(90), "pipeline_scope": "f" * 32, "capacity_retry_count": 1}
+        _, waiting = self.connector(bridge).read_table_deletes("app.orders", checkpoint, options)
+        self.assertEqual(waiting.get("trigger_boundary_retry_count"), 1)
+        self.assertNotIn("capacity_retry_count", waiting)
+
     def test_an_auto_snapshot_delete_seed_reads_the_live_layout(self):
         # The resnapshot ran under the live layout; a delete reader whose cached table
         # predates a column added since still finds the boundary rather than failing on
@@ -16381,6 +16430,44 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(attempts["n"], 3)
         self.assertIsNotNone(offset)
+
+    def test_stream_retries_a_reconnect_cut_in_its_tls_handshake_or_lookup(self):
+        # A TLS handshake cut short (SSLEOFError), a failed name lookup and an unreachable
+        # route are OSErrors but not ConnectionErrors: they ended the read at once. A
+        # certificate that fails verification is configuration, and still does.
+        import ssl
+
+        for errors, tried in (
+            (
+                [
+                    ssl.SSLEOFError(8, "EOF occurred in violation of protocol"),
+                    socket.gaierror(-2, "Name or service not known"),
+                    OSError(errno.EHOSTUNREACH, "No route to host"),
+                ],
+                4,
+            ),
+            ([ssl.SSLCertVerificationError(1, "certificate verify failed")], 1),
+        ):
+            with self.subTest(first=type(errors[0]).__name__, tried=tried):
+                bridge = FakeBridge()
+                bridge.reset_transport = lambda: None
+                attempts = {"n": 0}
+                real = bridge.read_changes
+
+                def failing_then_back(*args, _errors=errors, _attempts=attempts, _real=real):
+                    _attempts["n"] += 1
+                    if _attempts["n"] <= len(_errors):
+                        raise _errors[_attempts["n"] - 1]
+                    return _real(*args)
+
+                bridge.read_changes = failing_then_back
+                with mock.patch.object(time, "sleep"):
+                    if tried == 1:
+                        with self.assertRaises(OSError):
+                            self.connector(bridge).read_table("app.orders", _stream_offset(), {})
+                    else:
+                        self.connector(bridge).read_table("app.orders", _stream_offset(), {})
+                self.assertEqual(attempts["n"], tried)
 
     def test_stream_raises_after_connection_drop_retries_exhausted(self):
         # A persistent drop must still fail rather than loop forever. After the
@@ -27946,6 +28033,48 @@ class UnloadHelperTests(unittest.TestCase):
         )
         self.assertEqual(records, [b"1|a|", b"2|b|", b"3|c|", b"4|d|"])
 
+    def test_iter_gzip_unl_records_refuses_a_file_cut_inside_a_member(self):
+        # zlib checks a member's CRC and length only at its trailer: a file cut before it
+        # gave the rows it held and ended clean, so a short upload lost the rest silently.
+        whole = gzip.compress(b"".join(b"r-%03d|\n" % i for i in range(200)))
+        second = whole + gzip.compress(b"x|\n")
+        for cut in (whole[:-8], whole[:-3], whole[: len(whole) // 2], second[:-4]):
+            with self.subTest(size=len(cut)):
+                with self.assertRaisesRegex(InformixError, "inside a compressed member"):
+                    list(
+                        informix_module._iter_gzip_unl_records(
+                            self._reader(cut), len(cut), chunk_bytes=7, path="/x.unl.gz"
+                        )
+                    )
+
+    def test_iter_gzip_unl_records_takes_zero_padding_after_a_member(self):
+        # gzip itself skips NULs after a member; a fresh decompressor failed on them.
+        compressed = gzip.compress(b"1|a|\n") + b"\0" * 9 + gzip.compress(b"2|b|\n") + b"\0" * 3
+        for chunk_bytes in (1, 4, 64):
+            records = list(
+                informix_module._iter_gzip_unl_records(
+                    self._reader(compressed), len(compressed), chunk_bytes=chunk_bytes
+                )
+            )
+            self.assertEqual(records, [b"1|a|", b"2|b|"], chunk_bytes)
+
+    def test_unl_readers_refuse_a_file_shorter_than_planned(self):
+        # A read that comes back empty before the planned end: the file was replaced by a
+        # shorter one, and the split's rest was dropped as if the file had ended.
+        data = b"1|a|\n2|b|\n"
+        compressed = gzip.compress(data)
+        cases = (
+            lambda: informix_module._iter_unl_records(
+                self._reader(data), 0, len(data) + 5, path="/x.unl"
+            ),
+            lambda: informix_module._iter_gzip_unl_records(
+                self._reader(compressed), len(compressed) + 5, path="/x.unl"
+            ),
+        )
+        for case in cases:
+            with self.assertRaisesRegex(InformixError, "short of the"):
+                list(case())
+
 
 class _MountFilesApi:
     """A Files REST client serving the mount's bytes, as the staging transport would. A
@@ -30701,6 +30830,10 @@ class RowFilterTests(_TableOptionTestCase):
     def test_invalid_filters_fail(self):
         float_table = _wide_table()
         float_table["columns"][2]["type_name"] = "FLOAT"
+        smallfloat_table = _wide_table()
+        smallfloat_table["columns"][2]["type_name"] = "SMALLFLOAT"
+        time_table = _wide_table()
+        time_table["columns"][2].update(type_name="DATETIME", length=(6 << 8) | 10)
         nvarchar_table = _wide_table()
         nvarchar_table["columns"][1]["type_name"] = "NVARCHAR"
         nchar_table = _wide_table()
@@ -30712,7 +30845,14 @@ class RowFilterTests(_TableOptionTestCase):
             ("extra = 'x'", None, "with a string value"),
             ("extra = 1 extra", None, "unexpected"),
             ("extra ~ 1", None, "unexpected character"),
-            ("extra = 1.5", float_table, "cannot filter on FLOAT"),
+            ("extra = 1.5", time_table, "cannot filter on DATETIME"),
+            ("extra = 0.123456789012345678", float_table, "more than 17 significant digits"),
+            ("extra > 0." + "0" * 130 + "1", float_table, "outside what a FLOAT compares"),
+            ("extra > 1" + "0" * 39, smallfloat_table, "outside what a SMALLFLOAT compares"),
+            ("extra < 0." + "0" * 40 + "1", smallfloat_table, "outside what a SMALLFLOAT"),
+            ("ABS(extra) > 1", float_table, "cannot apply ABS to a FLOAT value"),
+            ("NVL(extra, 0) > 1", smallfloat_table, "cannot apply NVL to a SMALLFLOAT value"),
+            ("extra LIKE '1%'", float_table, "only apply LIKE to a string column"),
             ("value > 'a'", nvarchar_table, "only test NVARCHAR column value for equality"),
             ("value BETWEEN 'a' AND 'b'", nchar_table, "only test NCHAR column value for"),
             ("id = DATE '2024-02-30'", None, "valid calendar"),
@@ -30720,6 +30860,54 @@ class RowFilterTests(_TableOptionTestCase):
             with self.subTest(text):
                 with self.assertRaisesRegex((InformixError, ValueError), message):
                     self.filtered_table(text, raw)
+
+    def test_float_filters_compare_as_informix_does(self):
+        # Checked on Informix 14.10 for <, <=, >, >=, =, <>, BETWEEN and IN: a FLOAT
+        # compares as doubles, the literal read as one; a SMALLFLOAT in single precision,
+        # the literal through a double to 32 bits. Python compared the widened value with
+        # the exact decimal, so a SMALLFLOAT holding 0.1 failed "= 0.1", which Informix passes.
+        for type_name, cases in (
+            (
+                "FLOAT",
+                (
+                    ("extra = 0.3", 0.1 + 0.2, False),
+                    ("extra > 0.3", 0.1 + 0.2, True),
+                    ("extra = 0.1", 0.1, True),
+                    ("extra IN (0.1, 7)", 0.1, True),
+                    ("extra BETWEEN 0.1 AND 0.3", 0.1, True),
+                ),
+            ),
+            (
+                "SMALLFLOAT",
+                (
+                    ("extra = 0.1", informix_module._float32(0.1), True),
+                    ("extra > 0.1", informix_module._float32(0.1), False),
+                    ("extra = 0.3", informix_module._float32(0.3), True),
+                    ("extra = 0.33333334", informix_module._float32(1 / 3), True),
+                    ("extra NOT IN (0.1)", informix_module._float32(0.1), False),
+                    # A .unl file writes a SMALLFLOAT with 9 digits.
+                    ("extra = 0.1", 0.100000001, True),
+                    ("extra <= 0.1", 0.100000001, True),
+                ),
+            ),
+        ):
+            raw = _wide_table()
+            raw["columns"][2]["type_name"] = type_name
+            for text, value, expected in cases:
+                with self.subTest(type_name=type_name, text=text, value=value):
+                    table = self.filtered_table(text, raw)
+                    predicate = informix_module._row_filter_predicate(table)
+                    self.assertIs(
+                        informix_module._row_filter_matches(predicate, {"extra": value}), expected
+                    )
+        raw = _wide_table()
+        raw["columns"][2]["type_name"] = "FLOAT"
+        table = self.filtered_table("extra IN (0.1, 7) OR extra BETWEEN -1.5 AND 0.3", raw)
+        # In the exponent form the comparisons were checked in.
+        self.assertEqual(
+            informix_module._row_filter_sql(table),
+            "(extra IN (1e-1, 7e+0)) OR (extra BETWEEN -1.5e+0 AND 3e-1)",
+        )
 
     def test_the_filter_renders_as_informix_sql(self):
         raw = _wide_table()
@@ -31347,6 +31535,61 @@ class ColumnTransformTests(_TableOptionTestCase):
                 with self.assertRaisesRegex(InformixError, message):
                     keyed._table("app.orders", {"transform_columns": raw})
 
+    def test_a_function_on_a_column_it_cannot_take_names_the_type(self):
+        # An INTEGER may widen to FLOAT, which no numeric function takes: the restart said
+        # "cannot apply ABS to a other value".
+        columns = {"amount": informix_module.Column("amount", "FLOAT")}
+        for operand, message in (
+            (("call", "ABS", ["amount"]), "cannot apply ABS to a FLOAT value"),
+            (("call", "ROUND", [("call", "NULLIFY", ["amount"])]), "ROUND to a FLOAT value"),
+        ):
+            with self.assertRaisesRegex(InformixError, message):
+                informix_module._expression_kind(
+                    operand, columns, "transform_columns", "app.orders", filtering=False
+                )
+
+    def test_an_advisory_offset_with_a_bad_capacity_count_is_refused(self):
+        # The other eight advisory fields were checked before the offset collapsed to {};
+        # a malformed capacity_retry_count went unseen, as _validated_offset only sees {}.
+        effective = informix_module.InformixLakeflowConnect._effective_start_offset
+        for value in (-1, True, "2"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    effective({"capacity_retry_count": value})
+        self.assertEqual(effective({"capacity_retry_count": 2}), {})
+
+    def test_the_connection_staging_sweep_runs_at_the_gc_interval(self):
+        # The touch comes at a quarter of the retention where that is shorter; the
+        # staging sweep's interval is state.gc.interval.hours, as documented.
+        scope = "11111111-2222-3333-4444-555555555555_@_66666666-7777-8888-9999-000000000000"
+        connector = self.connector(
+            FakeBridge(), **{"state.gc.retention.days": "1", "state.gc.interval.hours": "12"}
+        )
+        connector.set_registration_scope(scope)
+        table = connector._table("app.orders", {})
+        connector._state_op_with_reconnect = lambda call, operation: 0
+        with mock.patch.object(connector, "_maybe_sweep_connection_staging") as sweep:
+            connector._touch_table_state(table)
+        sweep.assert_called_once_with(12 * 3600)
+
+    def test_the_compare_tool_keeps_a_lone_carriage_return_in_its_record(self):
+        # read_text translated a value's \r into a record end; UNLOAD (and the connector)
+        # end records on \n only.
+        from databricks.labs.community_connector.sources.informix import (
+            compare_live_data_test_tool as tool,
+        )
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = pathlib.Path(folder)
+            (root / "t.unl").write_bytes(b"1|a\rb|\n2|c|\n")
+            columns = ["k", "v"]
+            destination = [{"k": "1", "v": "a\rb"}, {"k": "2", "v": "c"}]
+            result = tool.compare_table(
+                "t", root / "t.unl", destination, columns, dict.fromkeys(columns, "STRING"),
+                ["k"], root / "t.dest.unl",
+            )
+        self.assertEqual((result["missing_rows"], result.get("extra_rows")), (0, 0))
+
     def test_hash_digests_numbers_in_one_form(self):
         # A hashed INTEGER key widened to DECIMAL or FLOAT keeps its digest, and a
         # variable-scale DECIMAL hashes the same from a file ("1.5") and CDC ("1.50").
@@ -31410,6 +31653,37 @@ class ColumnTransformTests(_TableOptionTestCase):
         self.assertEqual(str(number(Decimal("7"), money, {})), "7.00")
         bigint = column({"name": "n", "type_name": "BIGINT"})
         self.assertIs(type(number(Decimal("7"), bigint, {})), int)
+
+    def test_nvl_on_a_float_falls_back_as_its_values_are(self):
+        # NVL and COALESCE took no FLOAT, though they only stand a literal in for a NULL:
+        # the fallback lands as the column's values do, a SMALLFLOAT's in its 32 bits.
+        number = informix_module._number_for_column
+        column = informix_module.Column.parse
+        double = number(Decimal("0.1"), column({"name": "f", "type_name": "FLOAT"}), {})
+        single = number(Decimal("0.1"), column({"name": "s", "type_name": "SMALLFLOAT"}), {})
+        self.assertEqual((type(double), double), (float, 0.1))
+        self.assertEqual(single, informix_module._float32(0.1))
+        for type_name in ("FLOAT", "SMALLFLOAT"):
+            raw = _wide_table()
+            raw["columns"][2]["type_name"] = type_name
+            bridge = FakeBridge()
+            bridge.tables = [raw]
+            connector = self.connector(bridge)
+            for transform in ("NVL(extra, 1.5)", "COALESCE(extra, -2)", "NULLIFY(extra)"):
+                with self.subTest(type_name=type_name, transform=transform):
+                    connector._table(
+                        "app.orders", {"transform_columns": json.dumps({"extra": transform})}
+                    )
+            for transform, message in (
+                ("NVL(extra, 'x')", "where it takes a number"),
+                ("NVL(extra, 0.123456789012345678)", "more than 17 significant digits"),
+                ("ROUND(extra, 1)", f"cannot apply ROUND to a {type_name} value"),
+            ):
+                with self.subTest(type_name=type_name, transform=transform):
+                    with self.assertRaisesRegex(InformixError, message):
+                        connector._table(
+                            "app.orders", {"transform_columns": json.dumps({"extra": transform})}
+                        )
 
     def test_numeric_transforms_return_the_type_their_column_arrives_as(self):
         # The schema keeps the column's type, so ROUND, TRUNC, ABS and MOD hand back the

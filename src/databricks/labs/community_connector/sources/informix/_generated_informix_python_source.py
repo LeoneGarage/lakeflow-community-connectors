@@ -2262,6 +2262,11 @@ def register_lakeflow_source(spark):
                                 f"{method} files {volume_path}: the server did not honour the "
                                 f"byte range (HTTP {response.status})"
                             )
+                        # Short of its Content-Length: a sized read returns what came before
+                        # the connection dropped and raises nothing, as a whole read does, so a
+                        # split took the bytes it got for the end of its range. Retried below.
+                        if getattr(response, "length", None):
+                            raise http.client.IncompleteRead(body, response.length)
                         return body
                 except urllib.error.HTTPError as error:
                     # An expired or revoked token: replace it once and retry at once.
@@ -2834,12 +2839,17 @@ def register_lakeflow_source(spark):
 
         def collect_unused_projects(self, retention_days: int, interval_hours: float) -> int:
             # Docstring: Delete inactive, auto-named connector projects once per scan interval.
+            #
+            # The caller's claim in Lakebase spaces the runs an interval apart. This process-wide
+            # check only keeps the process's other connections to the workspace from repeating a
+            # run one of them just made, so it waits half an interval: at a whole one, a claim
+            # won a few milliseconds short of it by this process's clock was spent with no run.
 
             if self._options.get("lakebase.project.id", "").strip():
                 return 0
             now = time.monotonic()
             cache_key = self._options.get("lakebase.workspace.host", "workspace")
-            if now - self._project_gc_checked.get(cache_key, float("-inf")) < interval_hours * 3600:
+            if now - self._project_gc_checked.get(cache_key, float("-inf")) < interval_hours * 1800:
                 return 0
             self._project_gc_checked[cache_key] = now
             # Housekeeping on the read path, run a day apart by default: a listing that fails
@@ -5100,6 +5110,20 @@ def register_lakeflow_source(spark):
     # to a closed peer, a read timeout. read_exact raises SqliTransportError only for a clean
     # end of stream.
     _CONNECTION_LOSS = (ConnectionError, TimeoutError, ssl.SSLError)
+    _UNREACHABLE_ERRNOS = frozenset({errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN})
+
+
+    def reconnectable_error(error: BaseException) -> bool:
+        # Docstring: Whether an in-place reconnect may retry ``error``: a lost connection, or a
+        # connect refused, reset or timed out, a TLS handshake cut short, a name lookup or a
+        # route that failed while the network or the listener recovers. connect() raises these
+        # as they are. Not a certificate that failed verification: that is configuration.
+
+        if isinstance(error, ssl.SSLCertVerificationError):
+            return False
+        return isinstance(error, (SqliProtocolError, socket.gaierror, *_CONNECTION_LOSS)) or (
+            isinstance(error, OSError) and error.errno in _UNREACHABLE_ERRNOS
+        )
 
 
     def _raise_connection_loss(error: BaseException) -> None:
@@ -5294,8 +5318,7 @@ def register_lakeflow_source(spark):
                 or (end <= 10 and separator)
             ):
                 raise ValueError("TIME string does not match its Informix DATETIME qualifier")
-            qualifier_sql = expected[0] if start == end else f"{expected[0]} TO {expected[-1]}"
-            return f"DATETIME({value}) {qualifier_sql}"
+            return f"DATETIME({value}) {expected[0]} TO {expected[-1]}"
         parts = value.split(":")
         if len(parts) != len(expected):
             raise ValueError("partial Informix DATETIME does not match its qualifier")
@@ -5321,8 +5344,9 @@ def register_lakeflow_source(spark):
             else:
                 separator = ":"
             payload += separator + component
-        qualifier_sql = expected[0] if start == end else f"{expected[0]} TO {expected[-1]}"
-        return f"DATETIME({payload}) {qualifier_sql}"
+        # TO even for one field: Informix takes DATETIME(2024) YEAR TO YEAR, and fails
+        # DATETIME(2024) YEAR with -201 (checked on 14.10).
+        return f"DATETIME({payload}) {expected[0]} TO {expected[-1]}"
 
 
     def datetime_order_preserving_cast(column: str, qualifier: int) -> str | None:
@@ -12688,6 +12712,10 @@ def register_lakeflow_source(spark):
     # change a row's membership without any change event to carry it.
     _STRING_KINDS = ("string", "nstring")
     _VALUE_KINDS = ("string", "nstring", "number", "bool", "date", "timestamp")
+    # FLOAT and SMALLFLOAT: a row_filter compares them bare, as Informix does (see
+    # _float_literal), and of the functions only NVL, COALESCE, HASH and NULLIFY in a transform
+    # take them; the numeric ones' twins were not checked against Informix on binary floats.
+    _FLOAT_KINDS = ("float", "smallfloat")
     _DATE_KINDS = ("date", "timestamp")
     _EXPRESSION_FUNCTIONS = {
         "UPPER": (_STRING_KINDS, (), "same", True),
@@ -12712,8 +12740,8 @@ def register_lakeflow_source(spark):
         "DAY": (_DATE_KINDS, (), "number", True),
         "WEEKDAY": (_DATE_KINDS, (), "number", True),
         "MASK": (_STRING_KINDS, ("number?", "string?"), "string", False),
-        "HASH": ((*_VALUE_KINDS, "other"), (), "string", False),
-        "NULLIFY": ((*_VALUE_KINDS, "other"), (), "same", False),
+        "HASH": ((*_VALUE_KINDS, *_FLOAT_KINDS, "other"), (), "string", False),
+        "NULLIFY": ((*_VALUE_KINDS, *_FLOAT_KINDS, "other"), (), "same", False),
     }
 
 
@@ -12775,7 +12803,11 @@ def register_lakeflow_source(spark):
         kind = _expression_kind(
             arguments[0], columns, option, table_name, filtering=filtering, options=options
         )
-        if kind not in inputs:
+        floating = kind in _FLOAT_KINDS and name in ("NVL", "COALESCE") and not filtering
+        if kind not in inputs and not floating:
+            # A column no function reads, such as a FLOAT (an INTEGER may widen to one), by type.
+            if kind in ("other", *_FLOAT_KINDS):
+                kind = columns[_expression_column(arguments[0])].type_name
             # 101: Option '{}' cannot apply {} to a {} value
             raise InformixError(_m(101, option, name, kind))
         literals = arguments[1:]
@@ -12787,10 +12819,14 @@ def register_lakeflow_source(spark):
         for expected, literal in zip(literal_kinds, literals):
             expected = expected.rstrip("?")
             if expected == "same":
-                expected = "string" if kind == "nstring" else kind
+                expected = {"nstring": "string", "float": "number", "smallfloat": "number"}.get(
+                    kind, kind
+                )
             if literal[0] != expected:
                 # 103: Option '{}' gives {} a {} where it takes a {}
                 raise InformixError(_m(103, option, name, literal[0], expected))
+            if floating:
+                _float_literal(literal[1], kind, option, _expression_text(operand))
         if name in ("NVL", "COALESCE") and not filtering and kind == "number":
             # A transform's fallback lands in the column's own type (see _fallback_value), so
             # an integer column, or an integer-result function, takes a whole number only.
@@ -13139,6 +13175,10 @@ def register_lakeflow_source(spark):
 
         if column.type_name in _INTEGER_RANKS:
             return int(value)
+        if column.type_name in _UNLOAD_FLOAT_TYPES:
+            # As the column's own values: a SMALLFLOAT's 32 bits, so HASH reads its digits alike.
+            smallfloat = column.type_name in {"SMALLFLOAT", "REAL"}
+            return _float32(float(value)) if smallfloat else float(value)
         if column.type_name in {"DECIMAL", "NUMERIC", "MONEY"}:
             if _is_variable_scale_decimal(column):
                 return _coerce_variable_decimal_value(
@@ -13429,6 +13469,8 @@ def register_lakeflow_source(spark):
         name = column.type_name.split("(", 1)[0].strip()
         if name in _ROW_FILTER_NUMERIC_TYPES:
             return "number"
+        if name in _UNLOAD_FLOAT_TYPES:
+            return "smallfloat" if name in {"SMALLFLOAT", "REAL"} else "float"
         if name in _ROW_FILTER_STRING_TYPES:
             return "nstring" if name in {"NCHAR", "NVARCHAR"} else "string"
         if name in {"BOOLEAN", "BOOL"}:
@@ -13506,7 +13548,9 @@ def register_lakeflow_source(spark):
                     raise InformixError(_m(114, _ROW_FILTER_OPTION, described, name))
                 return
             literals = node[3] if tag == "in" else (node[3],) if tag == "cmp" else node[3:5]
-            expected = "string" if kind == "nstring" else kind
+            expected = {"nstring": "string", "float": "number", "smallfloat": "number"}.get(
+                kind, kind
+            )
             for literal in literals:
                 if literal[0] != expected:
                     raise InformixError(
@@ -13518,6 +13562,8 @@ def register_lakeflow_source(spark):
                     )
                 if kind == "timestamp":
                     _row_filter_datetime_sql(literal[1], column)
+                if kind in _FLOAT_KINDS:
+                    _float_literal(literal[1], kind, _ROW_FILTER_OPTION, name)
             ordered = tag == "between" or (tag == "cmp" and node[2] not in ("=", "<>"))
             if ordered and kind in ("nstring", "bool"):
                 raise InformixError(
@@ -13580,7 +13626,8 @@ def register_lakeflow_source(spark):
         def literal(value: tuple, column: Column) -> str:
             kind, item = value
             if kind == "number":
-                return format(item, "f")
+                # A FLOAT's in the exponent form the comparisons were checked in on Informix.
+                return format(item, "e" if _row_filter_kind(column) in _FLOAT_KINDS else "f")
             if kind == "string":
                 return "'" + item.replace("'", "''") + "'"
             if kind == "bool":
@@ -13724,6 +13771,13 @@ def register_lakeflow_source(spark):
         elif kind == "timestamp" and isinstance(value, datetime) and value.tzinfo is not None:
             # The decoder tags year-1 values UTC only so PySpark accepts them.
             value = value.replace(tzinfo=None)
+        elif kind == "float":
+            # As Informix compares: the literal read as a double, against the value's.
+            literal = float(literal)
+        elif kind == "smallfloat":
+            # In single precision, as Informix compares a SMALLFLOAT: the literal through a
+            # double to 32 bits, against the value's 32 bits (a .unl file gives 9 digits of it).
+            value, literal = _float32(value), _float32(float(literal))
         if op == "=":
             return value == literal
         if op == "<>":
@@ -13735,6 +13789,43 @@ def register_lakeflow_source(spark):
         if op == ">":
             return value > literal
         return value >= literal
+
+
+    def _float32(value: float) -> float:
+        # Docstring: ``value`` rounded to the nearest 32-bit float, as a Python float.
+
+        return struct.unpack("f", struct.pack("f", value))[0]
+
+
+    def _float_literal(value: Decimal, kind: str, option: str, name: str) -> None:
+        # Docstring: Refuse a number a FLOAT or SMALLFLOAT operand ``name`` cannot take exactly.
+        #
+        # Informix reads a literal into a double correctly rounded but for one within about
+        # 1e-16 of a step of halfway between two (30 or more digits) and at the bottom of the
+        # double range, so 17 digits, which name any double, and the range of an Informix
+        # DECIMAL literal; a SMALLFLOAT compares its 32 bits, so a normal one of those (checked
+        # live on 14.10 for <, <=, >, >=, =, <>, BETWEEN and IN).
+
+        digits = len("".join(map(str, value.as_tuple().digits)).strip("0"))
+        if digits > 17:
+            # 480: Option '{}' gives {} the number {}, which has more than 17 significant digits; a
+            # FLOAT or SMALLFLOAT takes at most 17, which name any of its values
+            raise InformixError(_m(480, option, name, value))
+        if kind == "smallfloat":
+            low, high = "1.17549435e-38", "3.40282347e38"
+            try:
+                # Informix refuses one past the largest (1222), and a subnormal.
+                rounded = abs(_float32(float(value)))
+                fits = not value or 1.1754943508222875e-38 <= rounded < math.inf
+            except OverflowError:
+                fits = False
+        else:
+            low, high = "1e-130", "1e125"
+            fits = not value or Decimal(low) <= abs(value) <= Decimal(high)
+        if not fits:
+            # 481: Option '{}' gives {} the number {}, outside what a {} compares exactly: 0, or a
+            # magnitude from {} to {}
+            raise InformixError(_m(481, option, name, value, kind.upper(), low, high))
 
 
     def _validated_volume_location(location: str, option_name: str, options: dict[str, str]) -> str:
@@ -18955,22 +19046,8 @@ def register_lakeflow_source(spark):
             # bookkeeping there too, and duplicating the list let them drift.
             retry_fields = _OFFSET_ADVISORY_FIELDS
             if start_offset and set(start_offset) <= retry_fields:
-                if "shared_state_retry_count" in start_offset:
-                    _shared_state_retry_count(start_offset)
-                if "dropped_mount_retry_count" in start_offset:
-                    _dropped_mount_retry_count(start_offset)
-                if "trigger_boundary_retry_count" in start_offset:
-                    _trigger_boundary_retry_count(start_offset)
-                if "schema_transition_retry_count" in start_offset:
-                    _schema_transition_retry_count(start_offset)
-                if "schema_node_fallback_retry_count" in start_offset:
-                    _schema_node_fallback_retry_count(start_offset)
-                if "capacity_pressure" in start_offset:
-                    _capacity_pressure(start_offset)
-                if "backlog_rank" in start_offset:
-                    _backlog_rank_value(start_offset)
-                if "backlog_streak" in start_offset:
-                    _backlog_streak(start_offset)
+                # Checked as _validated_offset checks them, which never sees them once dropped.
+                _checked_advisory_fields(start_offset)
                 return {}
             return start_offset
 
@@ -18994,7 +19071,14 @@ def register_lakeflow_source(spark):
                 # guard must start over rather than carry a flapping mount's history
                 # toward the cap.
                 end_offset.pop("dropped_mount_retry_count", None)
-                end_offset.pop("trigger_boundary_retry_count", None)
+                # Kept where this read raised it: a resnapshot wait (_resnapshot_retry_offset)
+                # returns, not raises past this reset as the other waits do. Dropped, its count
+                # went 1, absent, 1, and from a start of advisory fields alone the end was {},
+                # a range a replay cannot take (1).
+                if _trigger_boundary_retry_count(end_offset) <= _trigger_boundary_retry_count(
+                    start_offset
+                ):
+                    end_offset.pop("trigger_boundary_retry_count", None)
                 end_offset.pop("schema_transition_retry_count", None)
                 # Deliberately NOT reset here, unlike every counter above. Those reset
                 # because the read succeeded at the thing they counted failures of; a
@@ -19765,6 +19849,9 @@ def register_lakeflow_source(spark):
                 return start_offset, seeded
             if seeded in scopes:
                 return unmarked, None
+            # A resnapshot floor that replaced none kept the target as a seed beside none found it,
+            # so its None stands for that seed's "": the position goes on, as one marked with a
+            # kept snapshot does, and doesn't skip the deletes the kept rows need.
             if scopes[0] and start_offset[_SEED_FLOOR_FIELD] not in [scope or "" for scope in scopes]:
                 return self._replaced_floor_seed(table, start_offset, unmarked, record, table_options)
             if replaying:
@@ -24656,7 +24743,9 @@ def register_lakeflow_source(spark):
 
             _delimiter, escape = self._unl_field_format(table_options)
             escape_byte = _unl_escape_byte(escape, _client_encoding(self.options))
-            return _iter_gzip_unl_records(self._unl_read_chunk(path), size, escape=escape_byte)
+            return _iter_gzip_unl_records(
+                self._unl_read_chunk(path), size, escape=escape_byte, path=path
+            )
 
         def _shape_unl_records(
             self,
@@ -24716,9 +24805,9 @@ def register_lakeflow_source(spark):
                     continue
                 read_chunk = self._unl_read_chunk(path)
                 if _unl_file_is_gzip(read_chunk):
-                    records = _iter_gzip_unl_records(read_chunk, size, escape=escape_byte)
+                    records = _iter_gzip_unl_records(read_chunk, size, escape=escape_byte, path=path)
                 else:
-                    records = _iter_unl_records(read_chunk, 0, size, escape=escape_byte)
+                    records = _iter_unl_records(read_chunk, 0, size, escape=escape_byte, path=path)
                 for raw in records:
                     row = _shape_unl_record(
                         raw,
@@ -24790,10 +24879,11 @@ def register_lakeflow_source(spark):
             start = int(partition["start_byte"])
             end = int(partition["end_byte"])
             escape_byte = _unl_escape_byte(escape, encoding)
+            path = partition["path"]
             if partition.get("gzip"):
-                records = _iter_gzip_unl_records(read_chunk, end, escape=escape_byte)
+                records = _iter_gzip_unl_records(read_chunk, end, escape=escape_byte, path=path)
             else:
-                records = _iter_unl_records(read_chunk, start, end, escape=escape_byte)
+                records = _iter_unl_records(read_chunk, start, end, escape=escape_byte, path=path)
             for raw in records:
                 row = _shape_unl_record(
                     raw,
@@ -25089,8 +25179,10 @@ def register_lakeflow_source(spark):
                     return self._bridge.read_changes(captures, restart, timeout_seconds, max_records)
                 except ConnectionCapacityUnavailable:
                     raise
-                # A reconnect refused or timed out while the listener recovers, too.
-                except (SqliProtocolError, ConnectionError, TimeoutError) as error:
+                # A reconnect that failed while the network or the listener recovers, too.
+                except (SqliProtocolError, OSError) as error:
+                    if not reconnectable_error(error):
+                        raise
                     lease_lost = getattr(self._bridge, "_connection_lease_lost", None)
                     if lease_lost is not None and lease_lost.is_set():
                         # The drop is a deliberate lease-loss shutdown, not a blip.
@@ -25467,7 +25559,9 @@ def register_lakeflow_source(spark):
                     return thunk()
                 except ConnectionCapacityUnavailable:
                     raise
-                except (SqliProtocolError, ConnectionError, TimeoutError) as error:
+                except (SqliProtocolError, OSError) as error:
+                    if not reconnectable_error(error):
+                        raise
                     lease_lost = getattr(self._bridge, "_connection_lease_lost", None)
                     if lease_lost is not None and lease_lost.is_set():
                         # The drop is a deliberate lease-loss shutdown, not a blip.
@@ -27017,25 +27111,28 @@ def register_lakeflow_source(spark):
             )
             self._validate_immutable_record_header(winner, "channel-start", exposed)
             winner_start = self._immutable_lsn(winner, "start_lsn", exposed)
-            moved = (
-                table is not None
-                and winner_start == start_lsn
-                and (winner.get("schema_id") != schema_id or winner.get("fingerprint") != fingerprint)
+            moved = winner_start == start_lsn and (
+                winner.get("schema_id") != schema_id or winner.get("fingerprint") != fingerprint
+            )
+            stepped_off = (
+                moved
+                and table is not None
+                and not self._schema_descends_from(
+                    table, schema_id, fingerprint, winner.get("schema_id")
+                )
             )
             if (
                 winner.get("scope") != scope
                 or winner.get("table") != native
                 or winner_start > start_lsn
-                or (
-                    moved
-                    and not self._schema_descends_from(
-                        table, schema_id, fingerprint, winner.get("schema_id")
-                    )
-                )
+                or stepped_off
             ):
                 # 312: Conflicting Informix upsert start boundary for '{}' in update scope '{}'
                 raise InformixError(_m(312, exposed, scope))
-            self._noted_upsert_starts[record_key] = (start_lsn, schema_id)
+            if table is not None or not moved:
+                # Not noted while a schema at the same position is unchecked: the reader's own
+                # publish, after this pre-capacity one, checks it, and noted it was skipped.
+                self._noted_upsert_starts[record_key] = (start_lsn, schema_id)
             # After the start, as _full_refresh_delete_seed announces before it looks for one.
             self._note_upsert_start(f"{base}/own-start/{self._pipeline_id(scope)}", native, start)
 
@@ -27689,7 +27786,9 @@ def register_lakeflow_source(spark):
             if deleted:
                 # 322: Collected {} stale Informix Lakebase state records
                 logging.getLogger(__name__).info(_m(322, deleted))
-            self._maybe_sweep_connection_staging(touch_seconds)
+            # At the interval, as documented: the touch's quarter-retention cadence is the state
+            # sweep's need, not the staging sweep's, which keeps a retention of its own.
+            self._maybe_sweep_connection_staging(interval_hours * 3600)
             project_retention_days = _state_gc_project_settings(self.options)
             if project_retention_days is not None:
                 state = getattr(self, "_lakebase_state", None)
@@ -29278,6 +29377,7 @@ def register_lakeflow_source(spark):
         *,
         chunk_bytes: int = _UNL_SCAN_CHUNK_BYTES,
         escape: bytes = _UNL_DEFAULT_ESCAPE_BYTE,
+        path: str = "",
     ) -> Iterator[bytes]:
         # Docstring: Yield the raw record bytes (no trailing newline) whose bytes lie in ``[start,
         # end)``.
@@ -29286,13 +29386,16 @@ def register_lakeflow_source(spark):
         # after a record terminator, so this reads the range and splits it on unescaped
         # ``\\n`` (see _unl_find_record_end); an escaped newline stays inside its record.
         # Streaming/constant-memory. A final unterminated record (end of file) is yielded.
+        # A file that ends before ``end`` fails (479): it is shorter than it was planned at.
 
         offset = start
         buffer = b""
         while offset < end:
             chunk = read_chunk(offset, min(chunk_bytes, end - offset))
             if not chunk:
-                break
+                # 479: .unl snapshot file {} ended at byte {}, short of the {} planned; the extract
+                # changed under a running snapshot -- run a full refresh
+                raise InformixError(_m(479, path, offset, end))
             offset += len(chunk)
             buffer += chunk
             records, buffer = _unl_split_records(buffer, escape)
@@ -29316,6 +29419,7 @@ def register_lakeflow_source(spark):
         *,
         chunk_bytes: int = _UNL_SCAN_CHUNK_BYTES,
         escape: bytes = _UNL_DEFAULT_ESCAPE_BYTE,
+        path: str = "",
     ) -> Iterator[bytes]:
         # Docstring: Yield raw record bytes from a gzip-compressed `.unl` file (whole file, streaming).
         #
@@ -29325,27 +29429,41 @@ def register_lakeflow_source(spark):
         # yield records. Constant memory -- only one compressed window, the current
         # decompressed run, and the trailing partial record are held. Concatenated gzip
         # members (``cat a.gz b.gz``) are handled by starting a fresh decompressor from each
-        # member's trailing ``unused_data``. A final unterminated record is yielded. An empty
-        # extract (gzip of no rows) yields nothing.
+        # member's trailing ``unused_data``; zero bytes after a member are padding, as gzip
+        # takes them. A final unterminated record is yielded. An empty extract (gzip of no
+        # rows) yields nothing. A file that ends inside a member fails (478): zlib checks a
+        # member's CRC and length only at its trailer, and gives a cut one's rows without error.
 
         decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
         offset = 0
         tail = b""
+        in_member = False
         while offset < size:
             compressed = read_chunk(offset, min(chunk_bytes, size - offset))
             if not compressed:
-                break
+                # 479: .unl snapshot file {} ended at byte {}, short of the {} planned; the extract
+                # changed under a running snapshot -- run a full refresh
+                raise InformixError(_m(479, path, offset, size))
             offset += len(compressed)
             while compressed:
+                if not in_member:
+                    compressed = compressed.lstrip(b"\0")
+                    in_member = bool(compressed)
+                    if not in_member:
+                        break
                 tail += decompressor.decompress(compressed)
                 if not decompressor.eof:
                     break
                 # Member finished; its leftover bytes begin the next concatenated member.
                 compressed = decompressor.unused_data
                 decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                in_member = False
             records, tail = _unl_split_records(tail, escape)
             yield from records
-        tail += decompressor.flush()
+        if in_member:
+            # 478: gzip snapshot file {} ends inside a compressed member, before its trailer: the
+            # file is cut short (an incomplete copy or upload); replace it with the whole extract
+            raise InformixError(_m(478, path))
         records, tail = _unl_split_records(tail, escape)
         yield from records
         if tail:
@@ -30568,29 +30686,32 @@ def register_lakeflow_source(spark):
         return int(snapshot["page_index"]), int(snapshot.get("record_index", 0))
 
 
+    def _checked_advisory_fields(offset: dict[str, Any]) -> dict[str, Any]:
+        # Docstring: A copy of ``offset`` with each advisory field it holds checked by its own
+        # validator, which raises on a malformed value; one list for every caller.
+
+        result = dict(offset)
+        for name, check in (
+            ("shared_state_retry_count", _shared_state_retry_count),
+            ("dropped_mount_retry_count", _dropped_mount_retry_count),
+            ("trigger_boundary_retry_count", _trigger_boundary_retry_count),
+            ("schema_transition_retry_count", _schema_transition_retry_count),
+            ("schema_node_fallback_retry_count", _schema_node_fallback_retry_count),
+            ("capacity_retry_count", _capacity_retry_count),
+            ("capacity_pressure", _capacity_pressure),
+            ("backlog_rank", _backlog_rank_value),
+            ("backlog_streak", _backlog_streak),
+        ):
+            if name in result:
+                result[name] = check(result)
+        return result
+
+
     def _validated_offset(offset: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(offset, dict):
             # 387: Informix offset must be a dictionary
             raise ValueError(_m(387))
-        result = dict(offset)
-        if "shared_state_retry_count" in result:
-            result["shared_state_retry_count"] = _shared_state_retry_count(result)
-        if "dropped_mount_retry_count" in result:
-            result["dropped_mount_retry_count"] = _dropped_mount_retry_count(result)
-        if "trigger_boundary_retry_count" in result:
-            result["trigger_boundary_retry_count"] = _trigger_boundary_retry_count(result)
-        if "schema_transition_retry_count" in result:
-            result["schema_transition_retry_count"] = _schema_transition_retry_count(result)
-        if "schema_node_fallback_retry_count" in result:
-            result["schema_node_fallback_retry_count"] = _schema_node_fallback_retry_count(result)
-        if "capacity_retry_count" in result:
-            result["capacity_retry_count"] = _capacity_retry_count(result)
-        if "capacity_pressure" in result:
-            result["capacity_pressure"] = _capacity_pressure(result)
-        if "backlog_rank" in result:
-            result["backlog_rank"] = _backlog_rank_value(result)
-        if "backlog_streak" in result:
-            result["backlog_streak"] = _backlog_streak(result)
+        result = _checked_advisory_fields(offset)
         if result.get("version") != _OFFSET_VERSION:
             # 388: Informix offset version {!r} is unsupported; run a full refresh with this connector
             # version

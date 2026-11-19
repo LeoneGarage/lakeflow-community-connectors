@@ -2007,6 +2007,45 @@ class WireTextDecodeTests(unittest.TestCase):
             cursor.char("utf-8")
 
 
+class PartialDatetimeLiteralTests(unittest.TestCase):
+    def test_a_single_field_qualifier_still_says_to(self):
+        # Informix takes DATETIME(2024) YEAR TO YEAR and fails DATETIME(2024) YEAR with
+        # -201 (checked on 14.10), the form a one-field key's keyset literal had.
+        from databricks.labs.community_connector.sources.informix.sqli import (
+            _partial_datetime_sql,
+        )
+
+        self.assertEqual(_partial_datetime_sql("YEAR=2024", 0x0000), "DATETIME(2024) YEAR TO YEAR")
+        self.assertEqual(_partial_datetime_sql("10", 0x0606), "DATETIME(10) HOUR TO HOUR")
+        self.assertEqual(
+            _partial_datetime_sql("DAY=05:HOUR=10", 0x0406), "DATETIME(05 10) DAY TO HOUR"
+        )
+
+    def test_reconnects_retry_network_failures_only(self):
+        import errno
+        import socket
+
+        from databricks.labs.community_connector.sources.informix.sqli import (
+            reconnectable_error,
+        )
+
+        for error in (
+            ssl.SSLEOFError(8, "EOF"),
+            socket.gaierror(-2, "Name or service not known"),
+            OSError(errno.ENETUNREACH, "Network is unreachable"),
+            ConnectionResetError(54, "reset"),
+            TimeoutError("timed out"),
+        ):
+            self.assertTrue(reconnectable_error(error), error)
+        for error in (
+            ssl.SSLCertVerificationError(1, "certificate verify failed"),
+            OSError(errno.ENOTCONN, "Transport endpoint is not connected"),
+            PermissionError(1, "Operation not permitted"),
+            ValueError("x"),
+        ):
+            self.assertFalse(reconnectable_error(error), error)
+
+
 class DatetimeResultSizeTests(unittest.TestCase):
     def test_a_datetime_result_is_sized_by_its_qualifier(self):
         # With the qualifier in extended_id, encoded_length's low byte is not the
