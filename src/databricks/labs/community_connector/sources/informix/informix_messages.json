@@ -480,5 +480,6 @@
 "gzip snapshot file {} ends inside a compressed member, before its trailer: the file is cut short (an incomplete copy or upload); replace it with the whole extract",
 ".unl snapshot file {} ended at byte {}, short of the {} planned; the extract changed under a running snapshot -- run a full refresh",
 "Option '{}' gives {} the number {}, which has more than 17 significant digits; a FLOAT or SMALLFLOAT takes at most 17, which name any of its values",
-"Option '{}' gives {} the number {}, outside what a {} compares exactly: 0, or a magnitude from {} to {}"
+"Option '{}' gives {} the number {}, outside what a {} compares exactly: 0, or a magnitude from {} to {}",
+"Informix schema change for '{}' widened {} to FLOAT, which row_filter compares with {}: as a FLOAT the comparison gives another answer for some values, and rows already landed under the old one would stay; write {} there instead, which gives every value the column held the same answer as both types, or run a full refresh"
 ]

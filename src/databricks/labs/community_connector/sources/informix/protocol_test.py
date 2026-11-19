@@ -2042,8 +2042,32 @@ class PartialDatetimeLiteralTests(unittest.TestCase):
             OSError(errno.ENOTCONN, "Transport endpoint is not connected"),
             PermissionError(1, "Operation not permitted"),
             ValueError("x"),
+            # A login refused, past its deadline, or a type the client can't decode: it
+            # fails the same way again, five times over.
+            SqliUnsupportedAuthentication("Informix login failed"),
+            SqliDescriptorNotImplemented("result type 99 is unsupported"),
         ):
             self.assertFalse(reconnectable_error(error), error)
+        self.assertTrue(reconnectable_error(SqliProtocolError("truncated SQLI stream")))
+
+
+class OutOfRangeValueTests(unittest.TestCase):
+    def test_a_value_past_its_type_is_a_protocol_error(self):
+        # A DATE past the calendar raised OverflowError and a DECIMAL past its precision
+        # decimal.InvalidOperation, neither of them the protocol error a reused log record
+        # (message 11) or a broken session is told by.
+        from databricks.labs.community_connector.sources.informix.cdc_protocol import decode_row
+
+        date = ColumnDescriptor("d", "DATE")
+        with self.assertRaisesRegex(CdcProtocolError, "column 'd'"):
+            decode_row(memoryview(struct.pack(">i", 0x7FFFFFFF)), [date])
+        money = ColumnDescriptor("m", "MONEY", precision=4, scale=2)
+        with self.assertRaisesRegex(CdcProtocolError, "column 'm'"):
+            decode_row(memoryview(bytes([0xFF, 0x63, 0x63])), [money])
+        with self.assertRaisesRegex(SqliProtocolError, "result column 'd'"):
+            _decode_result_value(
+                struct.pack(">i", 0x7FFFFFFF), ResultColumn("d", 0, 7, 4, 0), "utf-8"
+            )
 
 
 class DatetimeResultSizeTests(unittest.TestCase):

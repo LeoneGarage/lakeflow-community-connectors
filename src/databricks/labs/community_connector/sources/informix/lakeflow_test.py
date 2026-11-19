@@ -1923,7 +1923,11 @@ class LakeflowContractTests(unittest.TestCase):
             self.assertEqual(shape_delete.__code__.co_qualname, "_shape_delete")
         self.assertEqual(shape_delete.__annotations__, {})
         self.assertEqual(table.__qualname__, "Table")
-        self.assertEqual(table.parse.__qualname__, "Table.parse")
+        # A function's own qualname is its name, which cloudpickle writes a copy of for each
+        # (the class prefixes came to some 13 KB); its code keeps the whole one.
+        self.assertEqual(table.parse.__qualname__, "parse")
+        if sys.version_info >= (3, 11):
+            self.assertEqual(table.parse.__code__.co_qualname, "Table.parse")
         # A docstring has two copies, the function's __doc__ and its code's first constant;
         # both go (the framework's interface methods held some 15 KB of them).
         interface = next(
@@ -7175,6 +7179,31 @@ class LakeflowContractTests(unittest.TestCase):
         ):
             connector.is_partitioned("app.orders")
 
+    def test_the_partitioned_reader_lookup_retries_network_failures_only(self):
+        # A certificate that fails verification, a login refused, a CA file it can't read:
+        # retried four times like a drop, though each fails the same way again.
+        import ssl
+
+        from databricks.labs.community_connector.sources.informix.sqli import (
+            SqliUnsupportedAuthentication,
+        )
+
+        for error in (
+            ssl.SSLCertVerificationError(1, "certificate verify failed"),
+            SqliUnsupportedAuthentication("Informix login failed"),
+            PermissionError(1, "Operation not permitted"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                connector = self._partitioned_connector()
+                lookup = mock.Mock(side_effect=error)
+                connector._registration_table = lookup
+                with (
+                    mock.patch.object(informix_module.time, "sleep"),
+                    self.assertRaises(type(error)),
+                ):
+                    connector.is_partitioned("app.orders")
+                self.assertEqual(lookup.call_count, 1)
+
     def test_pages_staged_under_another_flows_scope_are_cleaned_from_there(self):
         # A table.migration relocation serves pages staged under the capturing flow's scope:
         # the stream offset it ends on names that scope, and the cleanup looks there.
@@ -7218,9 +7247,14 @@ class LakeflowContractTests(unittest.TestCase):
             mock.patch.object(
                 connector,
                 "_rebound_incremental_block",
-                side_effect=lambda t, block, exprs: seen.append(exprs) or dict(block),
+                side_effect=lambda t, block, exprs: seen.append(exprs) or {**block, "done": True},
             ),
-            mock.patch.object(connector, "_read_incremental_step", return_value=(iter(()), {})),
+            mock.patch.object(
+                connector,
+                "_read_stream",
+                return_value=(iter(()), {"schema_fingerprint": _schema_fingerprint(table)}),
+            ),
+            mock.patch.object(connector, "_refresh_table_schema", return_value=table),
         ):
             connector._read_incremental(table, start, {})
         self.assertEqual(seen, [{"id": "expr(id)"}])
@@ -30414,6 +30448,31 @@ class SchemaEvolutionTests(_TableOptionTestCase):
         list(rows)
         self.assertNotEqual(resumed["schema_id"], checkpoint["schema_id"])
 
+    def test_a_key_widened_to_float_is_refused_before_a_foreign_bound_is_read(self):
+        # Each schema change restarts the pipeline in a new update, whose first batch
+        # recaptured the copy's bound before its stream read reached the schema step: the
+        # bound's query met the changed table (on a composite key it bound a float, which
+        # connector SQL takes none of) and failed there, not on 468, and recorded no refusal
+        # for the delete reader, which waited for one until its deadline.
+        options = {"snapshot.mode": "incremental", "snapshot.page.size": "1"}
+        bridge = FakeBridge()
+        _, checkpoint = self.connector(bridge).read_table("app.orders", {}, options)
+        self.assertIn("incremental", checkpoint, "the copy must still be in progress")
+        bridge.tables[0]["columns"][0]["type_name"] = "FLOAT"
+        bridge.now = 120
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 120}]
+        next_update = self.connector(bridge)
+        next_update.set_registration_scope(hashlib.sha256(b"the next update").hexdigest()[:32])
+
+        with mock.patch.object(
+            bridge, "max_primary_key", side_effect=AssertionError("bound read first")
+        ):
+            with self.assertRaisesRegex(InformixError, "became FLOAT"):
+                rows, _ = next_update.read_table("app.orders", checkpoint, options)
+                list(rows)
+        table = next_update._table("app.orders", options)
+        self.assertIn("FLOAT", next_update._schema_rejection(table, checkpoint["schema_id"]))
+
     def test_a_copy_refusing_a_recorded_step_records_why_for_its_delete_reader(self):
         # A reader not copying recorded the step to a FLOAT key first. The copy's reader then
         # refused the recorded step (468) without recording why, and its delete reader, which
@@ -30908,6 +30967,125 @@ class RowFilterTests(_TableOptionTestCase):
             informix_module._row_filter_sql(table),
             "(extra IN (1e-1, 7e+0)) OR (extra BETWEEN -1.5e+0 AND 3e-1)",
         )
+
+    def test_a_filter_number_can_carry_an_exponent(self):
+        # The README and message 481 give FLOAT bounds as 1e-130 and 1e125, which the lexer
+        # refused ("unexpected 'e'"), so a small one took 130 zeros.
+        raw = _wide_table()
+        raw["columns"][2]["type_name"] = "FLOAT"
+        table = self.filtered_table("extra > 1.5e-5 AND extra < 2E+3", raw)
+        self.assertEqual(table.row_filter, "(extra > 0.000015) AND (extra < 2000)")
+        predicate = informix_module._row_filter_predicate(table)
+        self.assertTrue(informix_module._row_filter_matches(predicate, {"extra": 0.5}))
+        with self.assertRaisesRegex(InformixError, "outside what a FLOAT compares"):
+            self.filtered_table("extra > 1e-131", raw)
+        for text in ("extra > 1e", "extra > 1e5x", "extra > 1e1000"):
+            with self.subTest(text=text):
+                with self.assertRaisesRegex((InformixError, ValueError), "unexpected"):
+                    self.filtered_table(text, raw)
+
+    def test_a_filtered_column_widened_to_float_needs_a_full_refresh_where_it_compares_otherwise(
+        self,
+    ):
+        # A SMALLFLOAT holding 0.1 equals 0.1 in 32 bits; widened to FLOAT it holds
+        # 0.10000000149011612, which doesn't, so its later changes left the filter and a
+        # delete of the landed row was dropped. A number exact in both types compares alike,
+        # and an integer column's whole values compare alike unless a whole number lies
+        # between the number and its double.
+        # The message names a number to write instead, which the rewrite then takes (see
+        # test_a_filter_rewritten_to_numbers_that_answer_alike_needs_no_full_refresh).
+        regraded = informix_module._float_filter_regraded
+        compatible = informix_module._ensure_compatible_schema_change
+        for old, text, suggested in (
+            ("SMALLFLOAT", "extra = 0.1", "0.10000000149011612"),
+            (
+                "SMALLFLOAT",
+                "extra <= 0.3 OR extra IN (7, 0.2)",
+                "0.30000001192092896 for 0.3 and 0.20000000298023224 for 0.2",
+            ),
+            ("SMALLFLOAT", "extra = 0.5 AND extra BETWEEN -2.25 AND 3", None),
+            ("INTEGER", "extra > 0.1", None),
+            ("INTEGER", "extra = 2.9999999999999999", "2.5"),
+            ("SMALLINT", "extra < -2.9999999999999999", "-2.5"),
+            # Past any INTEGER, so it answers every one as before.
+            ("INTEGER", "extra BETWEEN 1 AND 9007199254740993", None),
+            ("FLOAT", "extra = 0.1", None),
+        ):
+            with self.subTest(old=old, text=text):
+                before, after = _wide_table(), _wide_table()
+                before["columns"][2]["type_name"] = old
+                after["columns"][2]["type_name"] = "FLOAT"
+                previous = self.filtered_table(text, before)
+                current = self.filtered_table(text, after)
+                found = regraded(previous, current)
+                self.assertEqual(found and found[2], suggested)
+                if suggested is None:
+                    continue
+                with self.assertRaisesRegex(
+                    InformixError, f"widened extra to FLOAT.*write {suggested} there instead"
+                ):
+                    compatible(previous, current)
+                rewritten = text
+                for pair in suggested.split(" and "):
+                    replacement, _, number = pair.partition(" for ")
+                    rewritten = rewritten.replace(number or str(found[1]), replacement, 1)
+                compatible(previous, self.filtered_table(rewritten, after))
+
+    def test_a_filter_rewritten_to_numbers_that_answer_alike_needs_no_full_refresh(self):
+        # Changing row_filter needed a full refresh even where each changed number gives every
+        # value the column can hold the answer the old one gave: the rows already landed
+        # still match as they did.
+        alike = informix_module._filter_rewritten_alike
+        for type_name, old, new, same in (
+            ("INTEGER", "extra >= 8", "extra >= 7.5", True),
+            ("INTEGER", "extra >= 8", "extra >= 8.5", False),
+            ("INTEGER", "extra > 8", "extra > 8.9", True),
+            ("INTEGER", "extra < 3", "extra < 2.1", True),
+            ("INTEGER", "extra <= 3", "extra <= 2.9", False),
+            ("INTEGER", "extra = 2.5", "extra = 7.5", True),
+            ("INTEGER", "extra IN (1, 2.5)", "extra IN (1, 3.5)", True),
+            ("INTEGER", "extra BETWEEN 1 AND 9", "extra BETWEEN 0.5 AND 9.5", True),
+            ("INTEGER", "extra >= 8", "extra > 7", False),
+            ("INTEGER", "extra >= 8 AND id = 1", "extra >= 7.5 AND id = 2", False),
+            ("SMALLFLOAT", "extra = 0.1", "extra = 0.10000000149011612", True),
+            ("SMALLFLOAT", "extra = 0.1", "extra = 0.1000001", False),
+            ("FLOAT", "extra < 0.1", "extra < 0.10000000000000001", True),
+            ("FLOAT", "extra < 0.1", "extra < 0.1000000000000001", False),
+            ("VARCHAR", "extra = 'a'", "extra = 'b'", False),
+        ):
+            with self.subTest(type_name=type_name, old=old, new=new):
+                raw = _wide_table()
+                raw["columns"][2]["type_name"] = type_name
+                previous, current = self.filtered_table(old, raw), self.filtered_table(new, raw)
+                self.assertIs(alike(previous, current), same)
+        bridge = _ProjectingBridge()
+        connector, checkpoint = self.stream(bridge, self.FILTER)
+        bridge.now = 200
+        bridge.changes = [{"op": "TIMEOUT", "lsn": 200}]
+        list(connector.read_table("app.orders", checkpoint, {"row_filter": "extra >= 7.5"})[0])
+
+    def test_a_smallfloat_from_a_file_is_its_32_bits(self):
+        # UNLOAD writes a SMALLFLOAT with 9 digits; read as a double, 0.1 hashed apart
+        # from the same value on the SQLI and CDC paths.
+        unload = informix_module._unload_value
+        self.assertEqual(unload("0.100000001", "SMALLFLOAT"), informix_module._float32(0.1))
+        self.assertEqual(unload("0.1", "REAL"), informix_module._float32(0.1))
+        self.assertEqual(unload("0.30000000000000004", "FLOAT"), 0.1 + 0.2)
+        nan = unload("nan", "SMALLFLOAT")
+        self.assertNotEqual(nan, nan)
+        with self.assertRaisesRegex(InformixError, "not a finite number"):
+            unload("1e40", "SMALLFLOAT")
+
+    def test_the_compare_tool_reads_a_spark_float_in_32_bits(self):
+        # Spark's FLOAT, a SMALLFLOAT's type, prints 0.1 where UNLOAD writes 0.100000001.
+        from databricks.labs.community_connector.sources.informix import (
+            compare_live_data_test_tool as tool,
+        )
+
+        self.assertEqual(tool.normalize("0.100000001", "FLOAT"), tool.normalize("0.1", "FLOAT"))
+        double = tool.normalize("0.1", "DOUBLE")
+        self.assertNotEqual(double, tool.normalize("0.100000001", "DOUBLE"))
+        self.assertEqual(tool.normalize("-0.0", "FLOAT"), "0")
 
     def test_the_filter_renders_as_informix_sql(self):
         raw = _wide_table()

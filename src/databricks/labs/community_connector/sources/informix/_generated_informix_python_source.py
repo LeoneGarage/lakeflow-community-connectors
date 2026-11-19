@@ -891,7 +891,9 @@ def register_lakeflow_source(spark):
         for column in columns:
             try:
                 value, consumed = decode_value(payload[offset:], column, null_byte=null_byte)
-            except (CdcProtocolError, UnicodeDecodeError) as error:
+            except (CdcProtocolError, UnicodeDecodeError, ArithmeticError) as error:
+                # A DATE past the calendar (OverflowError) or a DECIMAL past its precision
+                # (decimal.InvalidOperation) are bytes of another row, as a bad length is.
                 # UnicodeDecodeError is raised by the text branches of decode_value
                 # and is not a CdcProtocolError, so catching only the latter let a
                 # bare codec error escape without naming the column or offset -- the
@@ -5117,9 +5119,14 @@ def register_lakeflow_source(spark):
         # Docstring: Whether an in-place reconnect may retry ``error``: a lost connection, or a
         # connect refused, reset or timed out, a TLS handshake cut short, a name lookup or a
         # route that failed while the network or the listener recovers. connect() raises these
-        # as they are. Not a certificate that failed verification: that is configuration.
+        # as they are. Not a certificate that failed verification, a login refused (bad
+        # credentials, a login deadline, a redirect not allowed) or a type it can't decode:
+        # those are configuration, and fail the same way again.
 
-        if isinstance(error, ssl.SSLCertVerificationError):
+        if isinstance(
+            error,
+            (ssl.SSLCertVerificationError, SqliUnsupportedAuthentication, SqliDescriptorNotImplemented),
+        ):
             return False
         return isinstance(error, (SqliProtocolError, socket.gaierror, *_CONNECTION_LOSS)) or (
             isinstance(error, OSError) and error.errno in _UNREACHABLE_ERRNOS
@@ -5455,7 +5462,13 @@ def register_lakeflow_source(spark):
         # The snapshot/query path decodes CHAR/VARCHAR/LVARCHAR itself (below), so apply the
         # NUL sanitizer here as the CDC path does in decode_value. Numeric/metadata results
         # are unaffected -- apply_null_byte only touches strings that contain a NUL.
-        return apply_null_byte(_decode_result_value_raw(data, column, encoding, pad_varchar), null_byte)
+        try:
+            raw = _decode_result_value_raw(data, column, encoding, pad_varchar)
+        except (ValueError, ArithmeticError) as error:
+            # The shared decoders' CdcProtocolError, a DATE past the calendar, a DECIMAL past
+            # its precision: a value that isn't what its descriptor says, so the session's.
+            raise SqliProtocolError(f"cannot decode result column {column.name!r}: {error}") from error
+        return apply_null_byte(raw, null_byte)
 
 
     def _decode_result_value_raw(
@@ -12647,8 +12660,8 @@ def register_lakeflow_source(spark):
     # every string type: case-sensitive, trailing blanks of the value and of the pattern
     # ignored, and an escape character (backslash unless ESCAPE names another) that makes
     # the next character literal. The SQL always spells the ESCAPE out, so the server's
-    # DEFAULTESCCHAR setting cannot change the meaning. FLOAT columns are rejected because
-    # binary floating point compares differently in SQL and Python. An UPDATE that moves a
+    # DEFAULTESCCHAR setting cannot change the meaning. FLOAT and SMALLFLOAT compare as
+    # Informix compares them (see _float_literal). An UPDATE that moves a
     # row into the filter is upserted and one that moves it out is deleted, so a keyed
     # target holds exactly the matching rows.
     _ROW_FILTER_KEYWORDS = frozenset(
@@ -12671,7 +12684,7 @@ def register_lakeflow_source(spark):
     _ROW_FILTER_LIKE_ESCAPE = "\\"
     _ROW_FILTER_LIKE_CACHE: dict[tuple[str, str], re.Pattern] = {}
     _ROW_FILTER_TOKEN = re.compile(
-        r"\s*(?:(?P<number>-?\d+(?:\.\d+)?)|(?P<string>'(?:[^']|'')*')"
+        r"\s*(?:(?P<number>-?\d+(?:\.\d+)?(?:[eE][+-]?\d{1,3}(?!\w))?)|(?P<string>'(?:[^']|'')*')"
         r"|(?P<op><>|!=|<=|>=|=|<|>)|(?P<punct>[(),])|(?P<word>[^\W\d][\w$]*)"
         # A column name in double quotes: one that holds "+" or ".", or is a word of SQL.
         r'|(?P<quoted>"(?:[^"]|"")+"))',
@@ -17580,15 +17593,15 @@ def register_lakeflow_source(spark):
                     with self._metadata_access():
                         table = self._registration_table(table_name, options)
                     return bool(_cdc_capable(table) or self._append_only_table(table, options))
-                except (SqliProtocolError, OSError):
+                except (SqliProtocolError, OSError) as error:
                     # A dropped connection, or a session the server refused (-25571, its
                     # connections used up while a pipeline starts), on a stream runner that
                     # starts cold: taken for a failed lookup, it left the flow on the simple
                     # reader for the whole update, and a file snapshot part-way through a serve
                     # then failed with 423, which asks for stream.partitioned=true. Retried as a
                     # snapshot read is; a source that stays down fails the flow, as its reads
-                    # would.
-                    if attempt >= _SNAPSHOT_RECONNECT_MAX_RETRIES:
+                    # would. Not a certificate, a login or a file error, which are no blip.
+                    if not reconnectable_error(error) or attempt >= _SNAPSHOT_RECONNECT_MAX_RETRIES:
                         raise
                     reset = getattr(self._bridge, "reset_transport", None)
                     if reset is not None:
@@ -21561,34 +21574,6 @@ def register_lakeflow_source(spark):
                 return self._begin_incremental(
                     table, None, options, pipeline_scope_override=pipeline_scope_override
                 )
-            incremental = checkpoint.get("incremental")
-            # A replay repeats a batch an earlier update logged, its change-log range and copy
-            # chunk alike, so it reads with the bound that batch had: the change log it repeats
-            # began before that bound was captured, and carries every row inserted above it.
-            # Captured again, a bound lowered by rows deleted at the table's top since ended the
-            # copy short of the cursor Spark logged, and the replay failed on every restart.
-            if (
-                isinstance(incremental, dict)
-                and self._replay_stop_lsn(options) is None
-                and self._incremental_bound_is_foreign(incremental)
-            ):
-                # A bound from an earlier update was captured before this update's CDC
-                # start, which would orphan rows inserted in between. Recapture it --
-                # and only it, since the cursor still names rows this table holds.
-                # 232: Informix incremental snapshot bound for '{}' was captured by scope={} but this
-                # update is scope={}; recapturing the snapshot bound so rows above a stale bound are not
-                # orphaned between the snapshot and the change stream
-                logging.getLogger(__name__).warning(
-                    _m(232, table.exposed_name, incremental.get("scope"), self._registration_scope),
-                )
-                # In the expressions the copy pages by, the checkpoint's own (see
-                # _next_incremental_chunk), not those today's options would give: with
-                # snapshot.incremental.datetime.as.string turned off mid-copy the bound was
-                # left stale, and turned on, recaptured in another space than the cursor.
-                checkpoint = dict(checkpoint)
-                checkpoint["incremental"] = self._rebound_incremental_block(
-                    table, incremental, dict(incremental.get("chunk_exprs") or {})
-                )
             return self._read_incremental_step(table, checkpoint, options)
 
         def _begin_incremental(
@@ -21827,6 +21812,33 @@ def register_lakeflow_source(spark):
                     {**end, "incremental": incremental}, checkpoint, True
                 )
             table = live
+            # A replay repeats a batch an earlier update logged, its change-log range and copy
+            # chunk alike, so it reads with the bound that batch had: the change log it repeats
+            # began before that bound was captured, and carries every row inserted above it.
+            # Captured again, a bound lowered by rows deleted at the table's top since ended the
+            # copy short of the cursor Spark logged, and the replay failed on every restart.
+            if self._replay_stop_lsn(options) is None and self._incremental_bound_is_foreign(
+                incremental
+            ):
+                # A bound from an earlier update was captured before this update's CDC
+                # start, which would orphan rows inserted in between. Recapture it --
+                # and only it, since the cursor still names rows this table holds. After the
+                # stream read, so a schema change the copy can't take is refused first (a key
+                # widened to FLOAT, 468, recorded for the delete reader): read before it, the
+                # bound's query met the changed table and failed on the float, or worse.
+                # 232: Informix incremental snapshot bound for '{}' was captured by scope={} but this
+                # update is scope={}; recapturing the snapshot bound so rows above a stale bound are not
+                # orphaned between the snapshot and the change stream
+                logging.getLogger(__name__).warning(
+                    _m(232, table.exposed_name, incremental.get("scope"), self._registration_scope),
+                )
+                # In the expressions the copy pages by, the checkpoint's own (see
+                # _next_incremental_chunk), not those today's options would give: with
+                # snapshot.incremental.datetime.as.string turned off mid-copy the bound was
+                # left stale, and turned on, recaptured in another space than the cursor.
+                incremental = self._rebound_incremental_block(
+                    table, incremental, dict(incremental.get("chunk_exprs") or {})
+                )
             if not incremental["done"]:
                 chunk_rows, incremental = self._next_incremental_chunk(table, incremental, options)
                 output.extend(chunk_rows)
@@ -29129,6 +29141,23 @@ def register_lakeflow_source(spark):
         pass
 
 
+    def _unload_float(text: str, type_name: str, single: bool) -> float:
+        # Docstring: An UNLOAD float field; a SMALLFLOAT's in its 32 bits, as SQLI and CDC give it,
+        # not the 9 digits UNLOAD writes (0.1 as 0.100000001): HASH read those digits, and a
+        # SMALLFLOAT key hashed apart from its CDC changes. A finite one past 32 bits is no
+        # SMALLFLOAT's.
+
+        value = float(text)
+        if not single or not math.isfinite(value):
+            return value
+        rounded = _float32(value) if abs(value) < 3.5e38 else math.inf
+        if not math.isfinite(rounded):
+            # 470: UNLOAD value {!r} in snapshot.source is not a finite number, which no
+            # Informix {} column holds
+            raise InformixError(_m(470, text, type_name))
+        return rounded
+
+
     def _unload_value(
         text: str, type_name: str, qualifier: int | None = None, scale: int | None = None
     ) -> Any:
@@ -29170,7 +29199,7 @@ def register_lakeflow_source(spark):
                 decimal_context.prec = 80
                 return value.quantize(Decimal(1).scaleb(-scale))
         if upper in _UNLOAD_FLOAT_TYPES:
-            return float(text)
+            return _unload_float(text, type_name, upper in {"SMALLFLOAT", "REAL"})
         if upper == "DATE":
             try:
                 return date.fromisoformat(text)
@@ -30358,6 +30387,112 @@ def register_lakeflow_source(spark):
                 raise InformixError(_m(468, column.name, current.exposed_name, column.type_name))
 
 
+    def _filter_parts(node: tuple):
+        # Docstring: A row_filter tree's shape, and each number or value compared with a bare
+        # column, in order: (shape, None) or (shape, (column, op, literal)), an IN value taken as
+        # an "=", a BETWEEN's bounds as ">=" and "<=".
+
+        tag = node[0]
+        if tag in ("and", "or", "not"):
+            yield (tag,), None
+            for child in node[1] if tag != "not" else (node[1],):
+                yield from _filter_parts(child)
+            yield (")",), None
+        elif tag in ("cmp", "in", "between") and isinstance(node[1], str):
+            literals = node[3] if tag == "in" else node[3:] if tag == "between" else (node[3],)
+            op = node[2] if tag == "cmp" else "="
+            ops = (">=", "<=") if tag == "between" else (op,) * len(literals)
+            yield (tag, node[1], node[2], len(literals)), None
+            for op, literal in zip(ops, literals):
+                yield (literal[0],), (node[1], op, literal)
+        else:
+            yield node, None
+
+
+    def _float_filter_regraded(previous: Table, current: Table) -> tuple | None:
+        # Docstring: The column of ``current``'s row_filter whose comparison a widening to FLOAT
+        # changes, its numbers that do, and what to write for each instead; or None. An integer
+        # compares exactly, a SMALLFLOAT in 32 bits and a FLOAT as doubles, so a number that
+        # isn't the same in both can split values the old comparison kept together (a
+        # SMALLFLOAT 0.1 equals 0.1; widened, it doesn't).
+
+        if current.row_filter is None:
+            return None
+        before = {column.name: column for column in previous.columns}
+        after = {column.name: _row_filter_kind(column) for column in current.columns}
+        found: dict[str, dict] = {}
+        for _, part in _filter_parts(_parse_row_filter(current.row_filter)):
+            column = part and before.get(part[0])
+            if not column or after.get(column.name) != "float" or part[2][0] != "number":
+                continue
+            value, kind = part[2][1], _row_filter_kind(column)
+            exact = float(value)
+            if kind == "smallfloat" and _float32(exact) != exact:
+                # The SMALLFLOAT the number stood for, exactly: a double, and 32 bits.
+                found.setdefault(column.name, {})[value] = repr(_float32(exact))
+            elif kind == "number":
+                # An integer's values are whole, and of its type's range: only one of those
+                # between the number and its double (2.9999999999999999 and 3) compares
+                # otherwise. Halfway between the whole numbers around it every comparison
+                # splits as the number did, and a double holds it exactly.
+                top = 32767 if _INTEGER_RANKS.get(column.type_name) == 1 else 2147483647
+                low, high = sorted((value, Decimal(exact)))
+                if low != high and max(math.ceil(low), -top) <= min(math.floor(high), top):
+                    found.setdefault(column.name, {})[value] = str(math.floor(value) + Decimal("0.5"))
+        if not found:
+            return None
+        # Every number of the first such column, so one edit takes them all.
+        name, numbers = next(iter(found.items()))
+        listed = " and ".join(map(str, numbers))
+        if len(numbers) == 1:
+            return name, listed, next(iter(numbers.values()))
+        return name, listed, " and ".join(f"{new} for {old}" for old, new in numbers.items())
+
+
+    def _number_alike(column: Column | None, op: str, old: tuple, new: tuple) -> bool:
+        # Docstring: Whether ``op`` with ``new`` gives every value ``column`` can hold the answer
+        # it gives with ``old``: a SMALLFLOAT's number one with the same 32 bits, a FLOAT's the
+        # same double, an integer's or fixed-scale DECIMAL's one between the same two values.
+
+        if old == new:
+            return True
+        if column is None or old[0] != "number" or new[0] != "number":
+            return False
+        kind = _row_filter_kind(column)
+        if kind in _FLOAT_KINDS:
+            fit = _float32 if kind == "smallfloat" else float
+            return fit(float(old[1])) == fit(float(new[1]))
+        if column.type_name in _INTEGER_RANKS:
+            scale = 0
+        elif kind == "number" and not _is_variable_scale_decimal(column):
+            scale = column.scale if column.scale is not None else 2 * (column.type_name == "MONEY")
+        else:
+            return False
+        # In steps of the column's smallest value, where its values are the whole numbers.
+        a, b = old[1].scaleb(scale), new[1].scaleb(scale)
+        if op in ("=", "<>"):
+            return a != a.to_integral_value() and b != b.to_integral_value()
+        rounding = math.ceil if op in (">=", "<") else math.floor
+        return rounding(a) == rounding(b)
+
+
+    def _filter_rewritten_alike(previous: Table, current: Table) -> bool:
+        # Docstring: Whether ``current``'s row_filter is ``previous``'s with only numbers compared
+        # with a column changed, each to one that gives every value it can hold, as ``previous``
+        # types it, the same answer (_number_alike): the rows already landed match as they did.
+
+        if previous.row_filter is None or current.row_filter is None:
+            return False
+        columns = {column.name: column for column in previous.columns}
+        old = list(_filter_parts(_parse_row_filter(previous.row_filter)))
+        new = list(_filter_parts(_parse_row_filter(current.row_filter)))
+        return len(old) == len(new) and all(
+            a[0] == b[0]
+            and (a[1] == b[1] or bool(a[1]) and _number_alike(columns.get(a[1][0]), *a[1][1:], b[1][2]))
+            for a, b in zip(old, new)
+        )
+
+
     def _ensure_compatible_schema_change(
         previous: Table,
         current: Table,
@@ -30556,9 +30691,18 @@ def register_lakeflow_source(spark):
             # 382: '{}' / '{}' changed for '{}'; run a full refresh so every row is read under the new
             # selection
             raise InformixError(_m(382, _INCLUDE_COLUMNS_OPTION, _EXCLUDE_COLUMNS_OPTION, name))
-        if previous.row_filter != current.row_filter:
+        if previous.row_filter != current.row_filter and not _filter_rewritten_alike(
+            previous, current
+        ):
             # 383: '{}' changed for '{}'; run a full refresh so every row is read under the new filter
             raise InformixError(_m(383, _ROW_FILTER_OPTION, name))
+        regraded = _float_filter_regraded(previous, current)
+        if regraded:
+            # 482: Informix schema change for '{}' widened {} to FLOAT, which row_filter compares with
+            # {}: as a FLOAT the comparison gives another answer for some values, and rows already
+            # landed under the old one would stay; write {} there instead, which gives every value
+            # the column held the same answer as both types, or run a full refresh
+            raise InformixError(_m(482, name, regraded[0], regraded[1], regraded[2]))
         if (
             previous.column_transforms != current.column_transforms
             and not _transforms_cleanup_only(previous, current)
@@ -31185,7 +31329,11 @@ def register_lakeflow_source(spark):
                     ):
                         code = code.replace(co_consts=(None, *code.co_consts[1:]))
                     value.__code__ = code
-                    value.__qualname__ = short(value.__qualname__)
+                    # Its name alone: cloudpickle writes a function's own copy of it, beside its
+                    # code's (which tracebacks and the code keep whole), and the class prefix of
+                    # every method came to some 13 KB. Pickling by reference looks a function up
+                    # by it and checks that the object found is this one, so it can't mistake it.
+                    value.__qualname__ = value.__name__
                     value.__annotations__ = {}
                     value.__doc__ = None
                 # Shortened or not: a hook made from code already shortened (a reader's

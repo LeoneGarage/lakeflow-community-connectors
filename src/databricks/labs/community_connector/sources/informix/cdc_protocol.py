@@ -252,7 +252,9 @@ def decode_row(
     for column in columns:
         try:
             value, consumed = decode_value(payload[offset:], column, null_byte=null_byte)
-        except (CdcProtocolError, UnicodeDecodeError) as error:
+        except (CdcProtocolError, UnicodeDecodeError, ArithmeticError) as error:
+            # A DATE past the calendar (OverflowError) or a DECIMAL past its precision
+            # (decimal.InvalidOperation) are bytes of another row, as a bad length is.
             # UnicodeDecodeError is raised by the text branches of decode_value
             # and is not a CdcProtocolError, so catching only the latter let a
             # bare codec error escape without naming the column or offset -- the

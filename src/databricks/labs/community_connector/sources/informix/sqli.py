@@ -750,9 +750,14 @@ def reconnectable_error(error: BaseException) -> bool:
     # Docstring: Whether an in-place reconnect may retry ``error``: a lost connection, or a
     # connect refused, reset or timed out, a TLS handshake cut short, a name lookup or a
     # route that failed while the network or the listener recovers. connect() raises these
-    # as they are. Not a certificate that failed verification: that is configuration.
+    # as they are. Not a certificate that failed verification, a login refused (bad
+    # credentials, a login deadline, a redirect not allowed) or a type it can't decode:
+    # those are configuration, and fail the same way again.
 
-    if isinstance(error, ssl.SSLCertVerificationError):
+    if isinstance(
+        error,
+        (ssl.SSLCertVerificationError, SqliUnsupportedAuthentication, SqliDescriptorNotImplemented),
+    ):
         return False
     return isinstance(error, (SqliProtocolError, socket.gaierror, *_CONNECTION_LOSS)) or (
         isinstance(error, OSError) and error.errno in _UNREACHABLE_ERRNOS
@@ -1088,7 +1093,13 @@ def _decode_result_value(
     # The snapshot/query path decodes CHAR/VARCHAR/LVARCHAR itself (below), so apply the
     # NUL sanitizer here as the CDC path does in decode_value. Numeric/metadata results
     # are unaffected -- apply_null_byte only touches strings that contain a NUL.
-    return apply_null_byte(_decode_result_value_raw(data, column, encoding, pad_varchar), null_byte)
+    try:
+        raw = _decode_result_value_raw(data, column, encoding, pad_varchar)
+    except (ValueError, ArithmeticError) as error:
+        # The shared decoders' CdcProtocolError, a DATE past the calendar, a DECIMAL past
+        # its precision: a value that isn't what its descriptor says, so the session's.
+        raise SqliProtocolError(f"cannot decode result column {column.name!r}: {error}") from error
+    return apply_null_byte(raw, null_byte)
 
 
 def _decode_result_value_raw(

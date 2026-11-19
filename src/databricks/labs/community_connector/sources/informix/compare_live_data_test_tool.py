@@ -26,8 +26,10 @@ import decimal
 import hashlib
 import hmac
 import json
+import math
 import pathlib
 import shlex
+import struct
 import subprocess
 import tarfile
 import tempfile
@@ -495,7 +497,14 @@ def normalize(value: Any, data_type: str) -> str | None:
     text = str(value)
     if not text and data_type != "STRING":
         return None
-    if data_type.startswith("DECIMAL") or data_type in {"FLOAT", "DOUBLE"}:
+    if data_type == "FLOAT":
+        # Spark's FLOAT is 32 bits, a SMALLFLOAT's: UNLOAD writes it with 9 digits
+        # (0.100000001) and Spark with as few as name it (0.1), so both through 32 bits.
+        number = float(text)
+        if math.isfinite(number):
+            number = struct.unpack("f", struct.pack("f", number))[0]
+        return "0" if number == 0 else repr(number)
+    if data_type.startswith("DECIMAL") or data_type == "DOUBLE":
         # Past the default context's 28 digits, which rounded a DECIMAL(32) or (38) value
         # and let two that differ compare equal; and one zero, which a FLOAT also writes
         # as -0.0.

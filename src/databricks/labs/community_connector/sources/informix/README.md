@@ -903,7 +903,14 @@ without a full refresh:
   also become `FLOAT`, except where a function other than `NVL`, `COALESCE`, `HASH` and
   `NULLIFY` reads the column, in a `row_filter` or a transform: the others don't take a
   `FLOAT`, so the connector fails with a message naming the type until that changes. A
-  `row_filter` compares the widened column as a `FLOAT` (see [Row filtering](#row-filtering)).
+  `row_filter` compares the widened column as a `FLOAT` (see [Row filtering](#row-filtering)),
+  so where that answers otherwise for one of its numbers, the widening fails until that
+  number changes or a full refresh runs: a `SMALLFLOAT` compared with a number its 32 bits
+  don't hold exactly (`= 0.1`), or an integer with one a whole number lies between it and its
+  double (`2.9999999999999999`). The message names the number to write instead, one that
+  gives every value the column held the same answer as both types (`0.10000000149011612`, the
+  `SMALLFLOAT` 0.1 exactly, or `2.5`), and the filter changed to it needs no full refresh
+  (see [Row filtering](#row-filtering)).
   Key columns may widen too. These change the
   destination column's type, so the pipeline must allow it: set
   `"pipelines.enableTypeWidening": "true"` in the pipeline's `configuration` (Databricks
@@ -1574,7 +1581,7 @@ on change images. That limits it to:
 - **Operators:** `=`, `<>` (or `!=`), `<`, `<=`, `>`, `>=`, `[NOT] IN (...)`,
   `[NOT] BETWEEN ... AND ...`, `[NOT] LIKE '...' [ESCAPE '...']`, `IS [NOT] NULL`,
   `AND`, `OR`, `NOT`, and parentheses.
-- **Values:** numbers, `'quoted strings'` (double a quote to include one), `TRUE` and
+- **Values:** numbers (an exponent too, as in `1.5e-5`), `'quoted strings'` (double a quote to include one), `TRUE` and
   `FALSE`, `DATE 'YYYY-MM-DD'`, and `TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.ffffff]'`. A
   `TIMESTAMP` can't be more precise than the column's `DATETIME` qualifier.
 - **Columns:** numeric, `CHAR`, `NCHAR`, `VARCHAR`, `LVARCHAR`, `NVARCHAR`, `BOOLEAN`,
@@ -1631,7 +1638,12 @@ on change images. That limits it to:
 
 Changing the filter on a running table fails closed until a full refresh, since rows
 already landed were selected under the old one. Formatting-only edits, such as spacing,
-keyword case, or `!=` for `<>`, don't count as changes.
+keyword case, or `!=` for `<>`, don't count as changes. Nor does changing only numbers
+compared with a column to ones that give every value it can hold the same answer: on an
+integer column `extra >= 8` to `extra >= 7.5` or `extra = 2.5` to `extra = 7.5`, on a
+fixed-scale `DECIMAL` the same in steps of its scale, on a `SMALLFLOAT` a number to one with
+the same 32 bits (`0.1` to `0.10000000149011612`, the value they hold), and on a `FLOAT` to one
+with the same double.
 
 ### Snapshot modes
 
