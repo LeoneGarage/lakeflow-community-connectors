@@ -1593,7 +1593,11 @@ on change images. That limits it to:
 - **Columns:** numeric, `CHAR`, `NCHAR`, `VARCHAR`, `LVARCHAR`, `NVARCHAR`, `BOOLEAN`,
   `DATE`, and `DATETIME YEAR TO DAY` or finer. Each value must match its column's type.
   A number has at most 32 significant digits: Informix reads only the first 32 of a
-  longer one, so the snapshot would filter otherwise than the stream.
+  longer one, so the snapshot would filter otherwise than the stream. Under
+  `string.null.byte` `null` or `empty`, a string holding a NUL byte is filtered as it
+  lands (as NULL, or without the NUL), as the stream filters it. Informix SQL can't find a
+  NUL, so a snapshot row that Informix's own filter leaves out stays out until the
+  stream's next change to it. A filter or transform can't hold a NUL itself.
 - **`FLOAT` and `SMALLFLOAT`:** compared as Informix compares them, which was checked on
   Informix 14.10 for every operator and `IN`: a `FLOAT` as a double against the number
   read as a double, so `0.1 + 0.2` doesn't equal `0.3`; a `SMALLFLOAT` in single

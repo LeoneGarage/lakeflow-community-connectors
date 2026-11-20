@@ -3264,6 +3264,29 @@ class LakeflowContractTests(unittest.TestCase):
             self.assertEqual(set(names.values()) - {1}, set(), f"seed {seed}")
         self.assertGreater(repaired, 15)
 
+    def test_a_moved_row_lookup_cut_at_its_limit_is_refused(self):
+        # Read by index value alone, an index value of more rows than the limit was cut,
+        # and a row whose other copy sat past it passed for found where it was.
+        source = _KeyedIndexScanSource(random_module.Random(9003), transactions=60)
+        raw = _table(primary_keys=())
+        raw["columns"].append({"name": "note", "type_name": "VARCHAR", "length": 20})
+        table = dataclasses.replace(
+            Table.parse(raw, "demo"), primary_keys=("value",), key_only_from_option=True
+        )
+        read = source.rows_by_values
+
+        def padded(*args):
+            rows = read(*args)
+            return rows + [dict(rows[0]) for _ in range(51)] if rows else rows
+
+        source.rows_by_values = padded
+        with (
+            mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0),
+            mock.patch.object(informix_module, "_INDEX_SCAN_KEY_ROWS", 50),
+            self.assertRaisesRegex(InformixError, "more than 50 rows under one index value"),
+        ):
+            self._index_scan(source, 3, table=table, options={"append.only.ingestion": "true"})
+
     def test_long_moved_rows_are_looked_up_a_few_to_a_query(self):
         # A lookup's values are sent as text within the statement, which Informix bounds.
         # Rows with long key values go fewer to a query, and one too long to send at all
@@ -3928,6 +3951,42 @@ class LakeflowContractTests(unittest.TestCase):
                 informix_module._row_filter_literal_text(("number", Decimal(literal))),
                 literal,
             )
+
+    def test_a_filter_or_transform_holding_a_nul_is_refused(self):
+        # Informix SQL can't be given one: the snapshot failed on it after the stream had
+        # taken the filter, and a transform could put one in a landed string.
+        table = Table.parse(_table(), "demo")
+        with self.assertRaisesRegex(ValueError, "NUL character"):
+            informix_module._apply_row_filter(table, "value <> 'a\x00'")
+        with self.assertRaisesRegex(ValueError, "NUL character"):
+            informix_module._column_transforms(
+                {"transform_columns": '{"value": "REPLACE(value, \'a\', \'\\u0000\')"}'}
+            )
+
+    def test_a_snapshot_filters_a_string_as_it_lands(self):
+        # Informix filters the string it holds; under string.null.byte=null one holding a
+        # NUL lands as NULL, which the stream's filter, and a file snapshot's, then leave
+        # out: the snapshot took the row and the stream dropped its changes.
+        options = {"row_filter": "value IS NOT NULL"}
+        for mode, landed in (("null", [2]), ("keep", [1, 2])):
+            with self.subTest(mode=mode):
+                bridge = FakeBridge()
+                bridge.rows = [{"id": 1, "value": None}, {"id": 2, "value": "x"}]
+                connector = self.connector(
+                    bridge, registration_scope=f"landed-{mode}", **{"string.null.byte": mode}
+                )
+                rows, _ = connector.read_table("app.orders", {}, dict(options))
+                self.assertEqual([row["id"] for row in rows], landed)
+        # Pages none of whose rows pass leave no gap.
+        consumed = []
+        table = informix_module._apply_row_filter(Table.parse(_table(), "demo"), "value > 'a'")
+        consume = informix_module._filtered_pages(
+            lambda lsn, index, rows: consumed.append((index, len(rows))),
+            informix_module._row_filter_predicate(table),
+        )
+        for index, page in enumerate(([{"id": 1, "value": None}], [{"id": 2, "value": "x"}])):
+            consume(9, index, page)
+        self.assertEqual(consumed, [(0, 1)])
 
     def test_a_filter_number_past_32_significant_digits_is_refused(self):
         # Informix reads only the first 32 (live-checked: 12345.000000000000000000000000000001
@@ -6205,6 +6264,32 @@ class LakeflowContractTests(unittest.TestCase):
             "scope",
             {"demo.app.orders": "demo:app.orders"},
         )
+
+    def test_a_spill_run_a_savepoint_rollback_took_back_whole_is_not_named(self):
+        # Named, a table the transaction left with no change failed an index-ordered scan's
+        # stream (433); its pages are deleted instead.
+        deleted = []
+        spill = informix_module._CdcSpill(
+            1,
+            lambda *args: None,
+            lambda *args: deleted.append(args[1]),
+            {"demo.app.orders": "layout", "demo.app.items": "layout"},
+            "scope",
+            {"demo.app.orders": "demo:app.orders", "demo.app.items": "demo:app.items"},
+        )
+
+        def change(table, lsn):
+            row = {"id": lsn}
+            return {"op": "INSERT", "tx_id": 7, "lsn": lsn, "table": table, "row": row}
+
+        with mock.patch.object(informix_module, "_CDC_SPILL_PAGE_RECORDS", 1):
+            spill.start(7, 10, [change("demo.app.orders", 11)])
+            spill.add(change("demo.app.items", 13))
+            spill.discard(7, 12)
+            spill.add(change("demo.app.orders", 15))
+            spilled = spill.finish(7, 20)
+        self.assertEqual([part["table"] for part in spilled], ["demo.app.orders"])
+        self.assertEqual(len(deleted), 1)
 
     def test_spilled_changes_stop_counting_toward_cdc_max_poll_bytes(self):
         # The changes a transaction held before it spilled leave the poll's records, so they
@@ -30081,6 +30166,30 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
                 "app.orders", {}, {"snapshot.source": source, "snapshot.boundary.lsn": "50"}
             )
             list(rows)
+
+    def test_unl_boundary_is_named_where_it_was_given_and_not_kept_for_initial_only(self):
+        # Message 266 named snapshot.boundary.lsn for a manifest's boundary. initial_only
+        # reads no log after the extract, so a boundary the log recycled past failed it
+        # for nothing; and an append-only table refuses initial_only, read directly too.
+        bridge = FakeBridge()
+        bridge.minimum = 60
+        source = self._source("1|a|\n")
+        self._manifest(source, "55")
+        with self.assertRaisesRegex(InformixError, "_manifest.json boundary_lsn=55"):
+            rows, _ = self.connector(bridge).read_table(
+                "app.orders", {}, {"snapshot.source": source}
+            )
+            list(rows)
+        options = {"snapshot.source": source, "snapshot.mode": "initial_only"}
+        rows, offset = self.connector(bridge).read_table("app.orders", {}, dict(options))
+        self.assertEqual([row["id"] for row in rows], [1])
+        self.assertEqual(offset["commit_lsn"], "55")
+        connector = self.connector(FakeBridge())
+        table = connector._table("app.orders", {})
+        with self.assertRaisesRegex(ValueError, "supports only snapshot.mode=initial"):
+            connector._pin_unl_boundary(
+                table, {**options, "append.only.ingestion": "true"}, connector._pipeline_scope()
+            )
 
     def test_unl_boundary_lsn_above_current_fails_closed(self):
         source = self._source("1|a|\n")

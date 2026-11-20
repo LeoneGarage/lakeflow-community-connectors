@@ -927,7 +927,14 @@ def _connector_sql(sql: str, parameters: tuple, encoding: str = "utf-8") -> str:
             escaped = value.replace("'", "''")
             # Counted as sent: in UTF-8 a Latin-1 database's accented value was twice its
             # size, and before doubling its quotes a value of many was half of it.
-            if "\0" in value or len(escaped.encode(encoding)) > 32767:
+            if "\0" in value:
+                # A key or bound value holding one, under string.null.byte=keep.
+                raise ValueError(
+                    "Informix SQL cannot be given a string holding a NUL byte, as a key or "
+                    "bound value of this read does: set string.null.byte=empty, or for a table "
+                    "with no key snapshot.scan=cursor"
+                )
+            if len(escaped.encode(encoding)) > 32767:
                 raise ValueError("unsafe connector SQL string literal")
             literal = "'" + escaped + "'"
         else:

@@ -6839,6 +6839,10 @@ class _RowFilterParser:
         self.tokens: list[tuple[str, str]] = []
         self.index = 0
         text = text.strip()
+        if "\x00" in text:
+            # Informix SQL can't be given one: a filter's snapshot failed on it after the
+            # stream had taken it, and a transform could put one in a landed string.
+            self.fail("it holds a NUL character")
         position = 0
         while position < len(text):
             match = _ROW_FILTER_TOKEN.match(text, position)
@@ -7305,6 +7309,33 @@ def _row_filter_sql(table: Table) -> str | None:
         return f"{name} {negation}BETWEEN {low} AND {high}"
 
     return render(_parse_row_filter(table.row_filter))
+
+
+def _filter_column_names(node: tuple):
+    # Docstring: The columns a row_filter tree reads.
+
+    if node[0] in ("and", "or"):
+        for child in node[1]:
+            yield from _filter_column_names(child)
+    elif node[0] == "not":
+        yield from _filter_column_names(node[1])
+    else:
+        yield _expression_column(node[1])
+
+
+def _filtered_pages(consume: Callable, predicate: tuple) -> Callable:
+    # Docstring: ``consume`` given only the rows of each page that pass ``predicate``, its
+    # pages numbered on without a gap where none does.
+
+    kept = [0]
+
+    def consumer(lsn: int, _index: int, rows: list) -> None:
+        rows = [row for row in rows if _row_filter_matches(predicate, row)]
+        if rows:
+            consume(lsn, kept[0], rows)
+            kept[0] += 1
+
+    return consumer
 
 
 def _row_filter_predicate(table: Table, encoding: str = "latin-1") -> tuple | None:
@@ -8248,6 +8279,7 @@ class _CdcSpill:
                 "pages": 0,
                 "rows": [],
                 "bytes": 0,
+                "first": int(record["lsn"]),
                 "last": 0,
                 "discarded": [],
                 "ops": set(),
@@ -8296,10 +8328,17 @@ class _CdcSpill:
         _begin, parts = self._open.pop(tx_id)
         spilled = []
         for table, part in parts.items():
+            native = self._natives.get(table, table)
+            if not part["rows"] and any(
+                low <= part["first"] and part["last"] <= high for low, high in part["discarded"]
+            ):
+                # A rollback to a savepoint took back every change of the run: named, a
+                # table with none failed an index-ordered scan's stream (433).
+                self._delete(native, part["run"])
+                continue
             if part["rows"]:
                 self._flush(table, part)
             if part["pages"]:
-                native = self._natives.get(table, table)
                 if self._commit is not None and commit_lsn is not None:
                     self._commit(native, part["run"], commit_lsn)
                 spilled.append(
@@ -15652,7 +15691,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         stamp = chunk_lsn if chunk_lsn is not None else 0
         commit_time = self._source_utc_time()
         shaped = [
-            _shape_snapshot(row, stamp, table, options, commit_time=commit_time) for row in cleaned
+            _shape_snapshot(row, stamp, table, options, commit_time=commit_time)
+            for row in self._landed_rows(table, cleaned)
         ]
         result = dict(incremental)
         result["chunk_lsn"] = str(stamp)
@@ -16060,6 +16100,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 else None
             )
             page_consumer = pipeline.submit if pipeline is not None else stage_page
+            landed = self._landed_predicate(table)
+            if landed is not None:
+                page_consumer = _filtered_pages(page_consumer, landed)
             try:
                 snapshot_lsn, rows = (
                     (snapshot_lsn, [])
@@ -16129,7 +16172,10 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 if page_count:
                     # 256: Consistent snapshot bridge returned rows after consuming pages
                     raise InformixError(_m(256))
-                stage_page(snapshot_lsn, 0, rows)
+                if landed is not None:
+                    _filtered_pages(stage_page, landed)(snapshot_lsn, 0, rows)
+                else:
+                    stage_page(snapshot_lsn, 0, rows)
             retained_bytes = _deep_size(rows) if max_bytes else 0
             if max_bytes and retained_bytes > max_bytes:
                 # 53: Initial snapshot exceeds snapshot.max.bytes={}
@@ -17159,14 +17205,28 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 filled: set[str] = set()
                 for by, value_sets in queries:
                     batch: dict[str, list] = {}
-                    for row in bridge.rows_by_values(
+                    rows_read = bridge.rows_by_values(
                         table.identity,
                         names,
                         by,
                         value_sets,
                         isolation,
                         _INDEX_SCAN_KEY_ROWS + 1,
-                    ):
+                    )
+                    if len(rows_read) > _INDEX_SCAN_KEY_ROWS:
+                        # Cut at the limit, a copy of a row past it went unseen, and a row
+                        # found once passed for found where it was.
+                        # 433: The index-ordered snapshot of a keyless table does not
+                        # support {} on '{}'; set snapshot.scan=cursor to read the table
+                        # without index order
+                        raise InformixError(
+                            _m(
+                                433,
+                                f"more than {_INDEX_SCAN_KEY_ROWS} rows under one index value",
+                                table.exposed_name,
+                            )
+                        )
+                    for row in rows_read:
                         batch.setdefault(_index_scan_row_key(row, table, options), []).append(row)
                     for name, rows_found in batch.items():
                         # Informix compares character values without their trailing
@@ -17898,6 +17958,31 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self._validate_schema_node_winner(schema_winner, schema, table)
         return str(schema["id"])
 
+    def _landed_predicate(self, table: Table) -> tuple | None:
+        # Docstring: row_filter as the stream and a file snapshot apply it, to the value that
+        # lands, for an SQL snapshot's rows; None where Informix's own filter is that.
+        #
+        # Informix filters a string by what it holds, and under string.null.byte=null or
+        # empty one holding a NUL lands as NULL or without it: a row the snapshot took that
+        # its filter then leaves out, whose changes the stream dropped (an orphan in the
+        # target). Informix SQL cannot find a NUL (CHR(0) ends a string there,
+        # live-checked), so a row it left out stays out until the stream's next change.
+
+        if table.row_filter is None or _null_byte_mode(self.options) == "keep":
+            return None
+        strings = {c.name for c in table.columns if _row_filter_kind(c) in _STRING_KINDS}
+        if not strings.intersection(_filter_column_names(_parse_row_filter(table.row_filter))):
+            return None
+        return _row_filter_predicate(table, _database_encoding(self.options))
+
+    def _landed_rows(self, table: Table, rows: list) -> list:
+        # Docstring: ``rows`` of an SQL snapshot read that pass _landed_predicate.
+
+        predicate = self._landed_predicate(table)
+        if predicate is None:
+            return rows
+        return [row for row in rows if _row_filter_matches(predicate, row)]
+
     def _pin_unl_boundary(
         self, table: Table, options: dict[str, str], pipeline_scope: str
     ) -> tuple[Table, str, int]:
@@ -17913,6 +17998,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # the durable records are elected/immutable, so a speculative ``latest_offset``
         # re-call is idempotent.
 
+        if self._snapshot_mode(options) == "initial_only" and self._append_only_table(
+            table, options
+        ):
+            # As registration refuses it: read directly, the partitioned reader served the
+            # extract and then streamed the log.
+            # 274: Append-only table '{}' supports only snapshot.mode=initial or
+            # snapshot.mode=cdc_only
+            raise ValueError(_m(274, table.exposed_name))
         boundary = self._resolve_unl_boundary_lsn(options, self._table_snapshot_source(options))
         if boundary is None:
             high_water = self._initial_lsn(table, scope=pipeline_scope)
@@ -17930,14 +18023,22 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             return table, schema_id, high_water
         minimum = self._bridge.minimum_lsn()
         current = self._bridge.current_lsn()
-        if not minimum <= boundary <= current:
+        # initial_only reads no log after the extract: a boundary the log has recycled past
+        # leaves it no gap.
+        if boundary > current or (
+            boundary < minimum and self._snapshot_mode(options) != "initial_only"
+        ):
             # 266: {}={} for '{}' is outside the retained/current log range [{}, {}]: below the
             # minimum means the logical log recycled past it (gap); above current is invalid.
             # Re-extract at a retained position.
             raise InformixError(
                 _m(
                     266,
-                    _SNAPSHOT_BOUNDARY_LSN_OPTION,
+                    # Named where it was given: the manifest's, with no option set.
+                    _SNAPSHOT_BOUNDARY_LSN_OPTION
+                    if options.get(_SNAPSHOT_BOUNDARY_LSN_OPTION)
+                    or self.options.get(_SNAPSHOT_BOUNDARY_LSN_OPTION)
+                    else f"{_SNAPSHOT_MANIFEST_NAME} boundary_lsn",
                     boundary,
                     table.exposed_name,
                     minimum,
@@ -18813,6 +18914,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if len(rows) > limit:
             # 276: Snapshot-only table {} exceeds snapshot.max.rows={}
             raise InformixError(_m(276, table.exposed_name, limit))
+        rows = self._landed_rows(table, rows)
         lsn = self._snapshot_read_with_reconnect(
             self._bridge.current_lsn, table=table, operation="end"
         )

@@ -198,6 +198,12 @@ class FrameTests(unittest.TestCase):
         )
         self.assertEqual(decode_value(memoryview(b"\0\0\0"), column), (None, 3))
 
+    def test_a_sql_string_holding_a_nul_names_the_way_round(self):
+        # A key or bound value holding one, under string.null.byte=keep: the read failed
+        # with no word of what to change.
+        with self.assertRaisesRegex(ValueError, "string.null.byte=empty"):
+            _sqli._connector_sql("SELECT 1 WHERE k > ?", ("a\x00b",))
+
     def test_a_packed_decimal_past_its_type_is_refused(self):
         # The wire has room for digits the type doesn't hold: the exponent byte past the
         # integer digits, the last byte past the scale. Rounded, or let through to fail in
