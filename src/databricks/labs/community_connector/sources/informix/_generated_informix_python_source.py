@@ -2708,7 +2708,9 @@ def register_lakeflow_source(spark):
             # distributed to every reader process is not one that can create roles.
             self._user_id = STATE_ROLE
             self._password = options.get("lakebase.password", "").strip()
-            self._admin_password = options.get("lakebase.admin_password", "").strip()
+            # As given, as the Informix password is: it signs in an admin role set up outside,
+            # whose password can begin or end with a blank (only "" is unset, see _options_set).
+            self._admin_password = options.get("lakebase.admin_password", "")
             self._facts: dict[str, Any] | None = None
             self._token: str | None = None
             self._token_minted_at = 0.0
@@ -5330,8 +5332,8 @@ def register_lakeflow_source(spark):
                     # A key or bound value holding one, under string.null.byte=keep.
                     raise ValueError(
                         "Informix SQL cannot be given a string holding a NUL byte, as a key or "
-                        "bound value of this read does: set string.null.byte=empty, or for a table "
-                        "with no key snapshot.scan=cursor"
+                        "index value this read pages on does: set snapshot.scan=cursor, which "
+                        "reads the table without paging on them"
                     )
                 if len(escaped.encode(encoding)) > 32767:
                     raise ValueError("unsafe connector SQL string literal")
@@ -5751,6 +5753,9 @@ def register_lakeflow_source(spark):
         _input: BinaryIO | None = field(default=None, init=False, repr=False)
         _output: BinaryIO | None = field(default=None, init=False, repr=False)
         _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+        # The columns string.null.byte changed a value of in the last statement's rows, which
+        # the bridge doesn't page on (see PurePythonInformixBridge._unaltered).
+        altered: set[str] = field(default_factory=set, init=False, repr=False)
 
         def connect(self) -> "InformixSqliClient":
             if not self.server_name:
@@ -6046,6 +6051,8 @@ def register_lakeflow_source(spark):
                 or self._output is None
             ):
                 raise SqliProtocolError("SQLI database session is not open")
+            # Each statement's own: see altered.
+            self.altered = set()
             return self._input, self._output
 
         def _ca_file_context(self, deadline: float) -> ssl.SSLContext:
@@ -6561,9 +6568,11 @@ def register_lakeflow_source(spark):
                             f"tuple column {column.name!r} slice [{start}:{limit}] is shorter "
                             f"than its {width}-byte width"
                         )
-                result[column.name] = _decode_result_value(
-                    payload[start:limit], column, self._text_encoding, padded, self.null_byte
-                )
+                value = _decode_result_value(payload[start:limit], column, self._text_encoding, padded)
+                result[column.name] = apply_null_byte(value, self.null_byte)
+                if result[column.name] is not value:
+                    # A key or index value it changed is one the bridge can't page on.
+                    self.altered.add(column.name)
                 cursor = limit
             return result
 
@@ -10166,6 +10175,7 @@ def register_lakeflow_source(spark):
                     ),
                     tuple(values or ()),
                 )
+                self._unaltered(keys, identity)
             return [
                 dict(row) if isinstance(row, dict) else dict(zip(columns, row, strict=True))
                 for row in rows
@@ -10742,6 +10752,7 @@ def register_lakeflow_source(spark):
                     else (int(self.options.get("snapshot.max.bytes", "0")) or None)
                 ),
             )
+            self._unaltered(primary_keys, identity)
             return [
                 dict(row)
                 if isinstance(row, dict)
@@ -10775,6 +10786,18 @@ def register_lakeflow_source(spark):
                     ),
                 )
             return cache[(owner, name)]
+
+        def _unaltered(self, keys, identity) -> None:
+            # Docstring: Refuse the last read's rows when string.null.byte changed a value of the
+            # ``keys`` they page on or are looked up by: Informix holds 'a\x00z', and paging on
+            # from 'az' skipped every row up to it ('ab' too), or, descending, read it again.
+
+            altered = sorted(set(keys) & getattr(self.transport, "altered", set()))
+            if altered:
+                # 486: Informix table '{}' holds a NUL byte in key or index column {}, which
+                # string.null.byte={} changes, so the read can't page on or look up the value
+                # Informix holds; set snapshot.scan=cursor to read the table without paging on it
+                raise InformixError(_m(486, identity, ", ".join(altered), self._null_byte))
 
         @contextlib.contextmanager
         def _repeatable_read_transaction(self, isolation: str = "REPEATABLE READ"):
@@ -10951,6 +10974,7 @@ def register_lakeflow_source(spark):
             # transaction, and the shared locks of a sort-bound scan, open to the next one.
             with self._repeatable_read_transaction():
                 rows = self.transport.execute(sql, ())
+                self._unaltered(primary_keys, identity)
             if not rows:
                 return None
             row = rows[0]
@@ -11008,6 +11032,7 @@ def register_lakeflow_source(spark):
                         f"FROM {table_ref}{where} ORDER BY {term} {fetch_order}"
                     )
                     rows = self.transport.execute(sql, tuple(params))
+                    self._unaltered([key], table_ref)
                     if not rows:
                         # No row at the first column means the table (or filtered set)
                         # is empty. A later column cannot come up empty under the
@@ -25498,24 +25523,35 @@ def register_lakeflow_source(spark):
             limit = self._table_int_option(options, "snapshot.max.rows", 0, minimum=0)
             if limit == 0:
                 limit = 100000
-            rows = self._snapshot_read_with_reconnect(
-                lambda: self._bridge.snapshot_page(
+
+            def read() -> list[dict[str, Any]]:
+                # In one transaction at the table's snapshot.isolation, as an initial snapshot
+                # reads: bare, it took the session's isolation and timeout and, in an ANSI
+                # database, left its locks held. The limit counts the rows that land, which a
+                # NUL byte can take out of the row_filter (see _landed_rows).
+                landed: list[dict[str, Any]] = []
+
+                def consume(_lsn, _index, page) -> None:
+                    landed.extend(self._landed_rows(table, page))
+                    if len(landed) > limit:
+                        # 276: Snapshot-only table {} exceeds snapshot.max.rows={}
+                        raise InformixError(_m(276, table.exposed_name, limit))
+
+                self._bridge.consistent_snapshot(
                     table.identity,
                     [c.name for c in table.columns],
                     (),
-                    None,
                     limit + 1,
+                    0,
                     self._table_int_option(options, "snapshot.max.bytes", 0, minimum=0),
+                    page_consumer=consume,
                     snapshot_filter=_snapshot_predicate(_snapshot_filter(options), table),
-                ),
-                table=table,
-                operation="snapshot read",
-            )
+                    isolation=self._snapshot_isolation(options),
+                )
+                return landed
+
+            rows = self._snapshot_read_with_reconnect(read, table=table, operation="snapshot read")
             table = self._refresh_table_schema(table, fingerprint)
-            if len(rows) > limit:
-                # 276: Snapshot-only table {} exceeds snapshot.max.rows={}
-                raise InformixError(_m(276, table.exposed_name, limit))
-            rows = self._landed_rows(table, rows)
             lsn = self._snapshot_read_with_reconnect(
                 self._bridge.current_lsn, table=table, operation="end"
             )

@@ -996,9 +996,11 @@ connection:
         connector already trims real CHAR padding -- but many downstream consumers
         cannot store it. null (default): a string containing any NUL becomes NULL
         (honest and detectable rather than silently altered). empty: strip the NUL
-        characters, preserving the rest. keep: pass it through unchanged. Note a
-        key column (promoted unique index or primary.keys) is required non-null, so
-        prefer empty if text key columns may carry a NUL. Accepts null/empty/keep.
+        characters, preserving the rest. keep: pass it through unchanged. A key or
+        index value holding a NUL can't be paged on under any mode (Informix SQL can't
+        be given it, and under null or empty the value read isn't the one it holds), so
+        a snapshot paging on one fails: set snapshot.scan=cursor for that table, with
+        keep for a key column. Accepts null/empty/keep.
 
     - name: primary.key.from.unique.index
       type: string

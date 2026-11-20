@@ -3582,6 +3582,7 @@ class PurePythonInformixBridge:
                 ),
                 tuple(values or ()),
             )
+            self._unaltered(keys, identity)
         return [
             dict(row) if isinstance(row, dict) else dict(zip(columns, row, strict=True))
             for row in rows
@@ -4158,6 +4159,7 @@ class PurePythonInformixBridge:
                 else (int(self.options.get("snapshot.max.bytes", "0")) or None)
             ),
         )
+        self._unaltered(primary_keys, identity)
         return [
             dict(row)
             if isinstance(row, dict)
@@ -4191,6 +4193,18 @@ class PurePythonInformixBridge:
                 ),
             )
         return cache[(owner, name)]
+
+    def _unaltered(self, keys, identity) -> None:
+        # Docstring: Refuse the last read's rows when string.null.byte changed a value of the
+        # ``keys`` they page on or are looked up by: Informix holds 'a\x00z', and paging on
+        # from 'az' skipped every row up to it ('ab' too), or, descending, read it again.
+
+        altered = sorted(set(keys) & getattr(self.transport, "altered", set()))
+        if altered:
+            # 486: Informix table '{}' holds a NUL byte in key or index column {}, which
+            # string.null.byte={} changes, so the read can't page on or look up the value
+            # Informix holds; set snapshot.scan=cursor to read the table without paging on it
+            raise InformixError(_m(486, identity, ", ".join(altered), self._null_byte))
 
     @contextlib.contextmanager
     def _repeatable_read_transaction(self, isolation: str = "REPEATABLE READ"):
@@ -4367,6 +4381,7 @@ class PurePythonInformixBridge:
         # transaction, and the shared locks of a sort-bound scan, open to the next one.
         with self._repeatable_read_transaction():
             rows = self.transport.execute(sql, ())
+            self._unaltered(primary_keys, identity)
         if not rows:
             return None
         row = rows[0]
@@ -4424,6 +4439,7 @@ class PurePythonInformixBridge:
                     f"FROM {table_ref}{where} ORDER BY {term} {fetch_order}"
                 )
                 rows = self.transport.execute(sql, tuple(params))
+                self._unaltered([key], table_ref)
                 if not rows:
                     # No row at the first column means the table (or filtered set)
                     # is empty. A later column cannot come up empty under the
@@ -18914,24 +18930,35 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         limit = self._table_int_option(options, "snapshot.max.rows", 0, minimum=0)
         if limit == 0:
             limit = 100000
-        rows = self._snapshot_read_with_reconnect(
-            lambda: self._bridge.snapshot_page(
+
+        def read() -> list[dict[str, Any]]:
+            # In one transaction at the table's snapshot.isolation, as an initial snapshot
+            # reads: bare, it took the session's isolation and timeout and, in an ANSI
+            # database, left its locks held. The limit counts the rows that land, which a
+            # NUL byte can take out of the row_filter (see _landed_rows).
+            landed: list[dict[str, Any]] = []
+
+            def consume(_lsn, _index, page) -> None:
+                landed.extend(self._landed_rows(table, page))
+                if len(landed) > limit:
+                    # 276: Snapshot-only table {} exceeds snapshot.max.rows={}
+                    raise InformixError(_m(276, table.exposed_name, limit))
+
+            self._bridge.consistent_snapshot(
                 table.identity,
                 [c.name for c in table.columns],
                 (),
-                None,
                 limit + 1,
+                0,
                 self._table_int_option(options, "snapshot.max.bytes", 0, minimum=0),
+                page_consumer=consume,
                 snapshot_filter=_snapshot_predicate(_snapshot_filter(options), table),
-            ),
-            table=table,
-            operation="snapshot read",
-        )
+                isolation=self._snapshot_isolation(options),
+            )
+            return landed
+
+        rows = self._snapshot_read_with_reconnect(read, table=table, operation="snapshot read")
         table = self._refresh_table_schema(table, fingerprint)
-        if len(rows) > limit:
-            # 276: Snapshot-only table {} exceeds snapshot.max.rows={}
-            raise InformixError(_m(276, table.exposed_name, limit))
-        rows = self._landed_rows(table, rows)
         lsn = self._snapshot_read_with_reconnect(
             self._bridge.current_lsn, table=table, operation="end"
         )

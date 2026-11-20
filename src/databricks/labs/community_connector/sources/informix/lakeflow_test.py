@@ -1438,7 +1438,8 @@ class LakeflowContractTests(unittest.TestCase):
             with self.subTest(cdc=cdc):
                 bridge = FakeBridge()
                 bridge.tables = [_table(cdc=cdc)]
-                name = "consistent_snapshot" if cdc else "snapshot_page"
+                # A snapshot-only table's read, too.
+                name = "consistent_snapshot"
                 original, current, armed = getattr(bridge, name), bridge.current_lsn, []
 
                 def reading(*args, _original=original, _armed=armed, **kwargs):
@@ -8566,6 +8567,45 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(rows, [{"id": 1}])
         self.assertEqual(bridge.transport.maximum, 1234)
+
+    def test_a_key_value_string_null_byte_changed_is_not_paged_on_or_looked_up(self):
+        # Informix holds 'a\x00z': paging on from the 'az' string.null.byte=empty read
+        # skipped every row up to it ('ab' too), descending read it again, and a lookup of
+        # it found none; under null it was taken for a NULL. Another column's is no matter.
+        class AlteringTransport:
+            def __init__(self, altered):
+                self.altered, self.next = set(), altered
+
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                self.altered = set(self.next)
+                return [{"id": "az", "v": "x", "__chunk_ts": "t"}]
+
+        def bridge(altered):
+            live = object.__new__(PurePythonInformixBridge)
+            live.options = {}
+            live._null_byte = "empty"
+            live.transport = AlteringTransport(altered)
+            live._repeatable_read_transaction = lambda *_: contextlib.nullcontext()
+            live.boundary_lsn = lambda: 5
+            return live
+
+        columns = ["id", "v"]
+        reads = {
+            "page": lambda live: live.snapshot_page("demo.app.t", columns, ["id"], None, 2),
+            "chunk": lambda live: live.snapshot_chunk("demo.app.t", columns, ["id"], None, 2),
+            "key rows": lambda live: live.key_rows("demo.app.t", columns, ["id"], ["az"], "RR"),
+            "max key": lambda live: live.max_primary_key("demo.app.t", ["id"]),
+            "chunked max key": lambda live: live.max_primary_key(
+                "demo.app.t", ["id", "ts"], chunk_exprs={"ts": "TO_CHAR(ts)"}
+            ),
+        }
+        for name, read in reads.items():
+            with self.subTest(read=name):
+                with self.assertRaisesRegex(
+                    InformixError, "key or index column id, which string.null.byte=empty"
+                ):
+                    read(bridge({"id"}))
+                read(bridge({"v"}))
 
     def test_a_tables_snapshot_max_bytes_bounds_its_pages_over_the_connections(self):
         # The incremental copy's chunks were read with no limit of their own, so the
@@ -17182,7 +17222,7 @@ class LakeflowContractTests(unittest.TestCase):
     def test_snapshot_only_rechecks_schema_after_query(self):
         bridge = FakeBridge()
         bridge.tables = [_table(cdc=False)]
-        original = bridge.snapshot_page
+        original = bridge.consistent_snapshot
 
         def changing_snapshot(*args, **kwargs):
             rows = original(*args, **kwargs)
@@ -17191,11 +17231,28 @@ class LakeflowContractTests(unittest.TestCase):
             )
             return rows
 
-        bridge.snapshot_page = changing_snapshot
+        bridge.consistent_snapshot = changing_snapshot
         connector = self.connector(bridge)
 
         with self.assertRaisesRegex(InformixError, "schema changed"):
             connector.read_table("app.orders", {}, {})
+
+    def test_a_snapshot_only_read_is_a_snapshot_and_counts_the_rows_that_land(self):
+        # It read bare: at the session's isolation and timeout, and in an ANSI database
+        # with its implicit transaction left open. And snapshot.max.rows counted the rows
+        # read, before a NUL byte took any out of the row_filter (see _landed_rows).
+        bridge = FakeBridge()
+        bridge.tables = [_table(cdc=False)]
+        options = {"snapshot.max.rows": "1", "row_filter": "value = 'a'"}
+
+        rows, _ = self.connector(bridge).read_table(
+            "app.orders", {}, {**options, "snapshot.isolation": "repeatable_read"}
+        )
+
+        self.assertEqual([row["id"] for row in rows], [1])
+        self.assertEqual(bridge.snapshot_isolations, ["REPEATABLE READ"])
+        with self.assertRaisesRegex(InformixError, "exceeds snapshot.max.rows=1"):
+            self.connector(bridge).read_table("app.orders", {}, {"snapshot.max.rows": "1"})
 
     def test_snapshot_only_applies_table_byte_limit(self):
         bridge = FakeBridge()

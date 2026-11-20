@@ -1386,7 +1386,9 @@ class LakebaseState:
         # distributed to every reader process is not one that can create roles.
         self._user_id = STATE_ROLE
         self._password = options.get("lakebase.password", "").strip()
-        self._admin_password = options.get("lakebase.admin_password", "").strip()
+        # As given, as the Informix password is: it signs in an admin role set up outside,
+        # whose password can begin or end with a blank (only "" is unset, see _options_set).
+        self._admin_password = options.get("lakebase.admin_password", "")
         self._facts: dict[str, Any] | None = None
         self._token: str | None = None
         self._token_minted_at = 0.0

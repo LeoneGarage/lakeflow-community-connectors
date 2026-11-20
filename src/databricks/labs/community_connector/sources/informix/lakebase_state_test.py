@@ -1758,6 +1758,13 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         api.request.assert_any_call("DELETE", "/api/2.0/postgres/projects/informix-state-old")
         connection.close.assert_called_once()
 
+    def test_the_admin_password_is_taken_as_given(self):
+        # It signs in an admin role set up outside, as the Informix password does: stripped,
+        # one beginning or ending with a blank failed provisioning's sign-in.
+        state = lakebase_state.LakebaseState({"lakebase.admin_password": " pw\t"}, "current")
+        self.assertEqual(state._admin_password, " pw\t")
+        self.assertEqual(lakebase_state.LakebaseState({}, "current")._admin_password, "")
+
     def test_an_unused_project_is_swept_with_the_admin_password_where_one_is_set(self):
         # Provisioning connects with lakebase.admin_password where one is set; the sweep
         # minted an OAuth token instead and gave it as that role's password, so where

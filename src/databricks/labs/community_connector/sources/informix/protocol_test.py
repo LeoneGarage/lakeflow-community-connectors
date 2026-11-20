@@ -201,7 +201,8 @@ class FrameTests(unittest.TestCase):
     def test_a_sql_string_holding_a_nul_names_the_way_round(self):
         # A key or bound value holding one, under string.null.byte=keep: the read failed
         # with no word of what to change.
-        with self.assertRaisesRegex(ValueError, "string.null.byte=empty"):
+        # Not string.null.byte=empty, which changes the value paged on (see _unaltered).
+        with self.assertRaisesRegex(ValueError, "set snapshot.scan=cursor"):
             _sqli._connector_sql("SELECT 1 WHERE k > ?", ("a\x00b",))
 
     def test_a_packed_decimal_past_its_type_is_refused(self):
@@ -1707,6 +1708,28 @@ class SqliPacketTests(unittest.TestCase):
         )
 
         self.assertEqual(client._read_tuple(description), {"text": "hello", "enabled": True})
+
+    def test_a_value_string_null_byte_changes_is_told_by_its_column(self):
+        # The bridge pages on and looks up the values read: one changed is not the value
+        # Informix holds, so its column is named for the bridge to refuse (see _unaltered).
+        payload = b"a\x00b " + b"abcd"
+        description = ResultDescription(
+            2,
+            8,
+            len(payload),
+            (ResultColumn("code", 0, 0, 0, 4), ResultColumn("name", 4, 0, 0, 4)),
+        )
+        for mode, row, altered in (
+            ("empty", {"code": "ab", "name": "abcd"}, {"code"}),
+            ("null", {"code": None, "name": "abcd"}, {"code"}),
+            ("keep", {"code": "a\x00b", "name": "abcd"}, set()),
+        ):
+            with self.subTest(mode=mode):
+                client = InformixSqliClient("host", 9088, "db", "user", "password")
+                client.null_byte = mode
+                client._input = io.BytesIO(struct.pack(">hi", 0, len(payload)) + payload)
+                self.assertEqual(client._read_tuple(description), row)
+                self.assertEqual(client.altered, altered)
 
     def test_padded_varchar_beside_an_lvarchar_is_length_prefixed(self):
         # A live server sends a tuple holding an LVARCHAR or BOOLEAN in the variable

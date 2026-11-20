@@ -931,8 +931,8 @@ def _connector_sql(sql: str, parameters: tuple, encoding: str = "utf-8") -> str:
                 # A key or bound value holding one, under string.null.byte=keep.
                 raise ValueError(
                     "Informix SQL cannot be given a string holding a NUL byte, as a key or "
-                    "bound value of this read does: set string.null.byte=empty, or for a table "
-                    "with no key snapshot.scan=cursor"
+                    "index value this read pages on does: set snapshot.scan=cursor, which "
+                    "reads the table without paging on them"
                 )
             if len(escaped.encode(encoding)) > 32767:
                 raise ValueError("unsafe connector SQL string literal")
@@ -1352,6 +1352,9 @@ class InformixSqliClient:
     _input: BinaryIO | None = field(default=None, init=False, repr=False)
     _output: BinaryIO | None = field(default=None, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    # The columns string.null.byte changed a value of in the last statement's rows, which
+    # the bridge doesn't page on (see PurePythonInformixBridge._unaltered).
+    altered: set[str] = field(default_factory=set, init=False, repr=False)
 
     def connect(self) -> "InformixSqliClient":
         if not self.server_name:
@@ -1647,6 +1650,8 @@ class InformixSqliClient:
             or self._output is None
         ):
             raise SqliProtocolError("SQLI database session is not open")
+        # Each statement's own: see altered.
+        self.altered = set()
         return self._input, self._output
 
     def _ca_file_context(self, deadline: float) -> ssl.SSLContext:
@@ -2162,9 +2167,11 @@ class InformixSqliClient:
                         f"tuple column {column.name!r} slice [{start}:{limit}] is shorter "
                         f"than its {width}-byte width"
                     )
-            result[column.name] = _decode_result_value(
-                payload[start:limit], column, self._text_encoding, padded, self.null_byte
-            )
+            value = _decode_result_value(payload[start:limit], column, self._text_encoding, padded)
+            result[column.name] = apply_null_byte(value, self.null_byte)
+            if result[column.name] is not value:
+                # A key or index value it changed is one the bridge can't page on.
+                self.altered.add(column.name)
             cursor = limit
         return result
 
