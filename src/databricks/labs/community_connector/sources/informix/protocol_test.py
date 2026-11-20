@@ -433,6 +433,13 @@ class FrameTests(unittest.TestCase):
         two_byte = ResultColumn("enabled", 0, 45, 0, 2)
         self.assertIsNone(_decode_result_value(b"\xff", one_byte, "utf-8"))
         self.assertIsNone(_decode_result_value(b"\x00\xff", two_byte, "utf-8"))
+        # A null flag first, as a change record has: 01 00 read as False, the stream's NULL.
+        self.assertIsNone(_decode_result_value(b"\x01\x00", two_byte, "utf-8"))
+        self.assertIs(_decode_result_value(b"\x00\x01", two_byte, "utf-8"), True)
+        self.assertIs(_decode_result_value(b"\x00\x00", two_byte, "utf-8"), False)
+        for data in (b"\xff\x01", b"\x00\x00\x01"):
+            with self.subTest(data=data), self.assertRaises(SqliProtocolError):
+                _decode_result_value(data, two_byte, "utf-8")
         self.assertIs(_decode_result_value(b"t", one_byte, "utf-8", True), True)
         self.assertIs(_decode_result_value(b"f", one_byte, "utf-8", True), False)
         with self.assertRaisesRegex(SqliProtocolError, "invalid BOOLEAN"):

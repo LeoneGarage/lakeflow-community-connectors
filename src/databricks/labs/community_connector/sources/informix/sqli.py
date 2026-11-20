@@ -1199,29 +1199,43 @@ def _decode_result_value_raw(
     if kind == 14:
         return decode_interval(memoryview(data), column.encoded_length)[0]
     if kind == 45:
-        if len(data) >= 5:
-            envelope_size = struct.unpack_from(">i", data, 1)[0]
-            if envelope_size < 0 or envelope_size + 5 != len(data):
-                raise SqliProtocolError("BOOLEAN envelope length does not match tuple column")
-            null_marker = data[0]
-            if null_marker == 1:
-                if envelope_size != 0:
-                    raise SqliProtocolError("null BOOLEAN has a non-empty payload")
-                return None
-            if null_marker != 0:
-                raise SqliProtocolError(f"invalid BOOLEAN envelope null marker {null_marker}")
-            data = data[5:]
-        if not data:
-            raise SqliProtocolError("truncated BOOLEAN result")
-        marker = struct.unpack_from(">b", data, 1 if len(data) >= 2 else 0)[0]
-        if marker == -1:
-            return None
-        if marker in {1, ord("t"), ord("T")}:
-            return True
-        if marker in {0, ord("f"), ord("F")}:
-            return False
-        raise SqliProtocolError(f"invalid BOOLEAN result marker {marker}")
+        return _decode_boolean_result(data)
     raise SqliDescriptorNotImplemented(f"ordinary Informix result type {kind} is unsupported")
+
+
+def _decode_boolean_result(data: bytes) -> bool | None:
+    # Docstring: A BOOLEAN result value: one marker byte, a null flag and the marker, or
+    # either in a variable envelope.
+
+    if len(data) >= 5:
+        envelope_size = struct.unpack_from(">i", data, 1)[0]
+        if envelope_size < 0 or envelope_size + 5 != len(data):
+            raise SqliProtocolError("BOOLEAN envelope length does not match tuple column")
+        null_marker = data[0]
+        if null_marker == 1:
+            if envelope_size != 0:
+                raise SqliProtocolError("null BOOLEAN has a non-empty payload")
+            return None
+        if null_marker != 0:
+            raise SqliProtocolError(f"invalid BOOLEAN envelope null marker {null_marker}")
+        data = data[5:]
+    if not data or len(data) > 2:
+        raise SqliProtocolError(f"BOOLEAN result of {len(data)} bytes")
+    if len(data) == 2:
+        # A null flag, then the marker, as a change record holds one: read past, a NULL
+        # (01 00) landed as False here and as NULL from the stream.
+        if data[0] == 1:
+            return None
+        if data[0] != 0:
+            raise SqliProtocolError(f"invalid BOOLEAN null flag {data[0]}")
+    marker = struct.unpack_from(">b", data, len(data) - 1)[0]
+    if marker == -1:
+        return None
+    if marker in {1, ord("t"), ord("T")}:
+        return True
+    if marker in {0, ord("f"), ord("F")}:
+        return False
+    raise SqliProtocolError(f"invalid BOOLEAN result marker {marker}")
 
 
 def _datetime_qualifier(column: ResultColumn) -> int:

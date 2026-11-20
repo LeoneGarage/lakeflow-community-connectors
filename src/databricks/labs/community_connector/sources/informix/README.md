@@ -903,9 +903,9 @@ without a full refresh:
   precision grows, up to precision 38), and an integer to a fixed-scale `DECIMAL`,
   `NUMERIC`, or `MONEY` with at least 10 integer digits (`SMALLINT`, `INTEGER`) or 20
   (`BIGINT`, `INT8`), such as `INTEGER` to `DECIMAL(12,2)`. `SMALLINT` and `INTEGER` may
-  also become `FLOAT`, except where a function other than `NVL`, `COALESCE`, `HASH` and
-  `NULLIFY` reads the column, in a `row_filter` or a transform: the others don't take a
-  `FLOAT`, so the connector fails with a message naming the type until that changes. A
+  also become `FLOAT`, except where a function reads the column in a `row_filter`, or
+  one other than `NVL`, `COALESCE`, `HASH` and `NULLIFY` in a transform: those don't take
+  a `FLOAT`, so the connector fails with a message naming the type until that changes. A
   `row_filter` compares the widened column as a `FLOAT` (see [Row filtering](#row-filtering)),
   so where that answers otherwise for one of its numbers, the widening fails until that
   number changes or a full refresh runs: a `SMALLFLOAT` compared with a number its 32 bits
@@ -1592,6 +1592,8 @@ on change images. That limits it to:
   `TIMESTAMP` can't be more precise than the column's `DATETIME` qualifier.
 - **Columns:** numeric, `CHAR`, `NCHAR`, `VARCHAR`, `LVARCHAR`, `NVARCHAR`, `BOOLEAN`,
   `DATE`, and `DATETIME YEAR TO DAY` or finer. Each value must match its column's type.
+  A number has at most 32 significant digits: Informix reads only the first 32 of a
+  longer one, so the snapshot would filter otherwise than the stream.
 - **`FLOAT` and `SMALLFLOAT`:** compared as Informix compares them, which was checked on
   Informix 14.10 for every operator and `IN`: a `FLOAT` as a double against the number
   read as a double, so `0.1 + 0.2` doesn't equal `0.3`; a `SMALLFLOAT` in single

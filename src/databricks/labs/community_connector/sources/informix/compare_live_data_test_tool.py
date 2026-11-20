@@ -517,14 +517,15 @@ def normalize(value: Any, data_type: str) -> str | None:
     text = str(value)
     if not text and data_type != "STRING":
         return None
-    if data_type == "FLOAT":
-        # Spark's FLOAT is 32 bits, a SMALLFLOAT's: UNLOAD writes it with 9 digits
-        # (0.100000001) and Spark with as few as name it (0.1), so both through 32 bits.
+    if data_type in ("FLOAT", "DOUBLE"):
+        # UNLOAD writes a float with every digit it has, 9 for a SMALLFLOAT (0.100000001)
+        # and 17 for a FLOAT (0.10000000000000001), Spark with as few as name it (0.1):
+        # both by the number they name, Spark's FLOAT (a SMALLFLOAT's) through 32 bits.
         number = float(text)
-        if math.isfinite(number):
+        if data_type == "FLOAT" and math.isfinite(number):
             number = struct.unpack("f", struct.pack("f", number))[0]
         return "0" if number == 0 else repr(number)
-    if data_type.startswith("DECIMAL") or data_type == "DOUBLE":
+    if data_type.startswith("DECIMAL"):
         # Past the default context's 28 digits, which rounded a DECIMAL(32) or (38) value
         # and let two that differ compare equal; and one zero, which a FLOAT also writes
         # as -0.0.

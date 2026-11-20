@@ -869,17 +869,21 @@ class _LaggingIndexScanSource(_IndexScanSource):
     reports no further than what it has handed over, as the demo server's does: its
     triggered lag runs to minutes."""
 
-    def __init__(self, random, delay, **kwargs):
+    def __init__(self, random, delay, busy=True, clock=None, **kwargs):
         super().__init__(random, **kwargs)
         self.delay, self.polls, self.shows_at = delay, 0, {}
+        # A busy server: other tables' writes move the log on between polls. ``clock``, a
+        # list, has its time moved on by each poll.
+        self.busy, self.ticks = busy, clock
 
     def read_changes(
         self, captures, start, timeout, max_records, budget=None, until=None, seconds=None
     ):
         self.polls += 1
+        if self.ticks is not None:
+            self.ticks[0] += 10
         records = super().read_changes(captures, start, timeout, max_records, budget, until)
-        # A busy server: other tables' writes move the log on between polls.
-        self.lsn += self.PAGE
+        self.lsn += self.PAGE if self.busy else 0
         for record in self.log:
             if record["op"] == "COMMIT":
                 self.shows_at.setdefault(record["tx_id"], self.polls + self.delay)
@@ -888,6 +892,40 @@ class _LaggingIndexScanSource(_IndexScanSource):
             if record.get("tx_id") in late and record["op"] != "TIMEOUT":
                 return records[:at] + [{"op": "TIMEOUT", "lsn": record["lsn"] - 1}]
         return records
+
+
+class _ScriptedEndSource(_IndexScanSource):
+    """A keyless table on a log nothing else writes to, with a change committed while its
+    first page is read that Informix CDC hands over late: the scan's end gets an idle poll,
+    then three polls that read to their limit (10 s each), another idle one, and only then
+    the change."""
+
+    def __init__(self, clock):
+        super().__init__(random_module.Random(7), transactions=0, quiet=True)
+        self.ticks, self.polls, self.late = clock, 0, None
+
+    def snapshot_chunk(self, *args, **kwargs):
+        before, rows = super().snapshot_chunk(*args, **kwargs)
+        if self.late is None:
+            self.tx_id += 1
+            self.late = self.tx_id
+            self._write("BEGIN")
+            self.rows.append({"id": 1, "value": "late"})
+            self._write("INSERT", row={"id": 1, "value": "late"})
+            self._write("COMMIT")
+        return before, rows
+
+    def read_changes(
+        self, captures, start, timeout, max_records, budget=None, until=None, seconds=None
+    ):
+        self.ticks[0] += 10
+        self.polls += 1
+        if self.polls in (1, 5):
+            first = min(r["lsn"] for r in self.log if r["tx_id"] == self.late)
+            return [{"op": "TIMEOUT", "lsn": first - 1}]
+        if self.polls <= 4:
+            return []
+        return super().read_changes(captures, start, timeout, max_records, budget, until)
 
 
 class _KeyedIndexScanSource(_IndexScanSource):
@@ -2711,6 +2749,28 @@ class LakeflowContractTests(unittest.TestCase):
             self.assertEqual(+result, collections.Counter(source.rows_as_text()), f"seed {seed}")
             self.assertFalse(-result, f"seed {seed}")
 
+    def test_an_index_scan_waits_out_idleness_after_a_backlog_on_a_quiet_log(self):
+        # The wait on a log nothing has written to ran from the first idle poll, not from
+        # the last that brought changes: after a backlog read over more than the proof
+        # interval, the next idle poll ended it, and a change Informix CDC handed over
+        # after that reached the stream alone (438).
+        clock = [0.0]
+        source = _ScriptedEndSource(clock)
+        with mock.patch.object(informix_module.time, "monotonic", lambda: clock[0]):
+            boundary, staged, scan, connector, table = self._index_scan(source, 3)
+        self.assertGreater(source.polls, 5)
+        transactions = informix_module._transaction_batch(source.history(boundary))[0]
+        connector._read_snapshot_stage_manifest = lambda *_: scan
+        connector._offset_scopes = lambda checkpoint: ("scope", "scope")
+        kept = connector._drop_scanned_changes(
+            table, {"commit_lsn": str(boundary), "schema_id": "s"}, {}, transactions
+        )
+        result = collections.Counter(_IndexScanSource.text(row) for row in staged)
+        for tx in kept:
+            for record in tx.records:
+                result[_IndexScanSource.text(record["row"])] += 1
+        self.assertEqual(result, collections.Counter(source.rows_as_text()))
+
     def test_an_unproven_index_scan_end_is_taken_as_read_at_the_follow_limit(self):
         # A server whose checkpoints are further apart than the limit shows no more: the
         # idle poll is taken, as before, and not failed for a restart that would wait again.
@@ -3862,12 +3922,29 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(
             informix_module._apply_function("MOD", huge, ["7"], context), Decimal(int(huge) % 7)
         )
-        # A row_filter literal longer than the default context's 28 digits.
-        literal = Decimal("1234567890123456789012345678901234.5")
-        self.assertEqual(
-            informix_module._row_filter_literal_text(("number", literal)),
-            "1234567890123456789012345678901234.5",
+        # A row_filter literal longer than the default context's 28 digits, and than 200.
+        for literal in ("1234567890123456789012345678901234.5", "1." + "0" * 205 + "1"):
+            self.assertEqual(
+                informix_module._row_filter_literal_text(("number", Decimal(literal))),
+                literal,
+            )
+
+    def test_a_filter_number_past_32_significant_digits_is_refused(self):
+        # Informix reads only the first 32 (live-checked: 12345.000000000000000000000000000001
+        # > 12345 is false there), where the stream's filter compares the whole number: the
+        # snapshot and the stream filtered apart.
+        raw = _table()
+        raw["columns"].append(
+            {"name": "amount", "type_name": "DECIMAL", "precision": 32, "scale": 2}
         )
+        table = Table.parse(raw, "demo")
+        long = "12345.000000000000000000000000000001"
+        for row_filter in (f"amount > {long}", f"id IN (1, {long})", f"NVL(amount, {long}) > 1"):
+            with self.subTest(row_filter=row_filter):
+                with self.assertRaisesRegex(InformixError, "more than the 32 significant digits"):
+                    informix_module._apply_row_filter(table, row_filter)
+        informix_module._apply_row_filter(table, "amount > 123456789012345678901234567890.12")
+        informix_module._apply_row_filter(table, "amount > 1.50000000000000000000000000000000000")
 
     def test_pad_varchar_is_read_under_the_name_spark_hands_it_on_as(self):
         # Spark lowercases option keys. The reader's own options answer to either form,
@@ -27724,6 +27801,16 @@ class UnloadHelperTests(unittest.TestCase):
 
         apply('{"big": "NVL(big, -9223372036854775808)"}')
         apply('{"qty": "NVL(qty, -2147483648)"}')
+        # Only as the value that lands: under ABS, -2^31 became 2^31, which an INT column
+        # can't hold, and failed in Spark on the first NULL.
+        for transforms in (
+            '{"qty": "ABS(NVL(qty, -2147483648))"}',
+            '{"qty": "ROUND(ABS(NVL(qty, -2147483648)), 0)"}',
+            '{"big": "ABS(NVL(big, -9223372036854775808))"}',
+        ):
+            with self.subTest(transforms=transforms):
+                with self.assertRaisesRegex(InformixError, "more than a"):
+                    apply(transforms)
         for transforms in (
             '{"big": "NVL(big, -9223372036854775809)"}',
             '{"qty": "NVL(qty, -2147483649)"}',
@@ -31457,6 +31544,11 @@ class RowFilterTests(_TableOptionTestCase):
         self.assertNotEqual(nan, nan)
         with self.assertRaisesRegex(InformixError, "not a finite number"):
             unload("1e40", "SMALLFLOAT")
+        # A number past a double's range read as infinity, which passed for "inf".
+        for text, type_name in (("1e400", "SMALLFLOAT"), ("-1e400", "FLOAT")):
+            with self.subTest(text=text), self.assertRaisesRegex(InformixError, "not a finite"):
+                unload(text, type_name)
+        self.assertEqual(unload("-inf", "FLOAT"), float("-inf"))
 
     def test_the_compare_tool_reads_a_spark_float_in_32_bits(self):
         # Spark's FLOAT, a SMALLFLOAT's type, prints 0.1 where UNLOAD writes 0.100000001.
@@ -31468,6 +31560,12 @@ class RowFilterTests(_TableOptionTestCase):
         double = tool.normalize("0.1", "DOUBLE")
         self.assertNotEqual(double, tool.normalize("0.100000001", "DOUBLE"))
         self.assertEqual(tool.normalize("-0.0", "FLOAT"), "0")
+        # And a FLOAT by its double: UNLOAD writes 17 digits, Spark as few as name it.
+        self.assertEqual(tool.normalize("0.10000000000000001", "DOUBLE"), double)
+        self.assertEqual(
+            tool.normalize("1.0E10", "DOUBLE"), tool.normalize("10000000000", "DOUBLE")
+        )
+        self.assertEqual(tool.normalize("-0.0", "DOUBLE"), "0")
 
     def test_the_filter_renders_as_informix_sql(self):
         raw = _wide_table()

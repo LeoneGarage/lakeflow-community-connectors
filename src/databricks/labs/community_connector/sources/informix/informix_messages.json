@@ -482,5 +482,6 @@
 "Option '{}' gives {} the number {}, which has more than 17 significant digits; a FLOAT or SMALLFLOAT takes at most 17, which name any of its values",
 "Option '{}' gives {} the number {}, outside what a {} compares exactly: 0, or a magnitude from {} to {}",
 "Informix schema change for '{}' widened {} to FLOAT, which row_filter compares with {}: as a FLOAT the comparison gives another answer for some values, and rows already landed under the old one would stay; write {} there instead, which gives every value the column held the same answer as both types, or run a full refresh",
-"Informix CDC poll read its changes, but ending its session failed on a dropped or stalled connection; resetting the transport, which ends the session"
+"Informix CDC poll read its changes, but ending its session failed on a dropped or stalled connection; resetting the transport, which ends the session",
+"Option '{}' compares {} with {}, which has more than the 32 significant digits Informix reads of a number; the snapshot would filter otherwise than the stream"
 ]

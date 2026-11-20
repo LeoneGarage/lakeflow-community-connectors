@@ -6340,8 +6340,10 @@ def _expression_kind(
     *,
     filtering: bool,
     options: dict[str, str] | None = None,
+    outermost: bool = True,
 ) -> str:
     # Docstring: The kind ``operand`` evaluates to, failing on anything ill-typed.
+    # ``outermost`` is for the expression a transform lands as (see the NVL bounds).
     #
     # A column of a type a filter cannot compare has kind "other", which only HASH and
     # NULLIFY accept; in a filter such a column fails outright. ``options``, the table's,
@@ -6364,7 +6366,13 @@ def _expression_kind(
         # 100: Option '{}' cannot use {}, which only transform_columns applies
         raise InformixError(_m(100, option, name))
     kind = _expression_kind(
-        arguments[0], columns, option, table_name, filtering=filtering, options=options
+        arguments[0],
+        columns,
+        option,
+        table_name,
+        filtering=filtering,
+        options=options,
+        outermost=False,
     )
     floating = kind in _FLOAT_KINDS and name in ("NVL", "COALESCE") and not filtering
     if kind not in inputs and not floating:
@@ -6376,9 +6384,17 @@ def _expression_kind(
     literals = arguments[1:]
     required = sum(1 for expected in literal_kinds if not expected.endswith("?"))
     if not required <= len(literals) <= len(literal_kinds):
-        most = f" to {len(literal_kinds) + 1}" if required < len(literal_kinds) else ""
         # 102: Option '{}' gives {} {} argument(s); it takes {}{}
-        raise InformixError(_m(102, option, name, len(literals) + 1, required + 1, most))
+        raise InformixError(
+            _m(
+                102,
+                option,
+                name,
+                len(literals) + 1,
+                required + 1,
+                f" to {len(literal_kinds) + 1}" if required < len(literal_kinds) else "",
+            )
+        )
     for expected, literal in zip(literal_kinds, literals):
         expected = expected.rstrip("?")
         if expected == "same":
@@ -6437,7 +6453,13 @@ def _expression_kind(
         if (
             limit is not None
             and fallback.copy_abs() > limit
-            and not (isinstance(inner, (IntegerType, LongType)) and fallback == -limit - 1)
+            # Only as the value that lands: under ABS, -2^31 became 2^31, which an INT
+            # column can't hold, and failed in Spark.
+            and not (
+                outermost
+                and isinstance(inner, (IntegerType, LongType))
+                and fallback == -limit - 1
+            )
         ):
             # 450: Option '{}' gives {} the fallback {} for {}, which is more than a {}
             # column holds
@@ -7026,9 +7048,10 @@ def _parse_row_filter(text: str) -> tuple:
 def _row_filter_literal_text(literal: tuple) -> str:
     kind, value = literal
     if kind == "number":
-        # Not under the default context: its 28 digits would round a longer literal.
+        # Not under the default context: its 28 digits would round a longer literal, as
+        # any fixed precision would one longer than it.
         with localcontext() as decimal_context:
-            decimal_context.prec = 200
+            decimal_context.prec = max(200, len(value.as_tuple().digits))
             return format(value.normalize(), "f")
     if kind == "string":
         return "'" + value.replace("'", "''") + "'"
@@ -7144,6 +7167,7 @@ def _check_row_filter(tree: tuple, table: Table) -> None:
             for literal in _operand_literals(operand):
                 if literal[0] == "timestamp":
                     _row_filter_datetime_sql(literal[1], column)
+                _exact_literal(literal, name)
         if tag == "null":
             return
         if tag == "like":
@@ -7168,6 +7192,8 @@ def _check_row_filter(tree: tuple, table: Table) -> None:
                 _row_filter_datetime_sql(literal[1], column)
             if kind in _FLOAT_KINDS:
                 _float_literal(literal[1], kind, _ROW_FILTER_OPTION, name)
+            else:
+                _exact_literal(literal, name)
         ordered = tag == "between" or (tag == "cmp" and node[2] not in ("=", "<>"))
         if ordered and kind in ("nstring", "bool"):
             raise InformixError(
@@ -7178,6 +7204,21 @@ def _check_row_filter(tree: tuple, table: Table) -> None:
             )
 
     check(tree)
+
+
+def _exact_literal(literal: tuple, name: str) -> None:
+    # Docstring: Refuse a filter number Informix reads otherwise than the stream's filter:
+    # past 32 significant digits it reads only the first 32 (live-checked: 1.5 equals
+    # 1.50000000000000000000000000000000001), where the stream compares the whole number.
+
+    if literal[0] == "number":
+        with localcontext() as context:
+            context.prec = max(200, len(literal[1].as_tuple().digits))
+            if len(literal[1].normalize().as_tuple().digits) > 32:
+                # 484: Option '{}' compares {} with {}, which has more than the 32
+                # significant digits Informix reads of a number; the snapshot would filter
+                # otherwise than the stream
+                raise InformixError(_m(484, _ROW_FILTER_OPTION, name, literal[1]))
 
 
 def _operand_literals(operand: str | tuple):
@@ -16808,11 +16849,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 now = time.monotonic()
                 if idle and (quiet or now - began > _INDEX_SCAN_FOLLOW_SECONDS):
                     break
-                # From the first idle poll; the log moved, asked again a proof interval on.
+                # From the first idle poll since one that brought changes (late ones, on a
+                # log that hasn't moved, may have more behind them); the log moved, asked
+                # again a proof interval on.
                 idle_since = (
-                    now
-                    if idle
-                    and (idle_since is None or now - idle_since >= _INDEX_SCAN_PROOF_SECONDS)
+                    None
+                    if not idle
+                    else now
+                    if idle_since is None or now - idle_since >= _INDEX_SCAN_PROOF_SECONDS
                     else idle_since
                 )
                 if now - began > _INDEX_SCAN_FOLLOW_SECONDS:
@@ -22768,6 +22812,11 @@ def _unload_float(text: str, type_name: str, single: bool) -> float:
     # SMALLFLOAT's.
 
     value = float(text)
+    if math.isinf(value) and "inf" not in text.lower():
+        # A number past a double's range, read as infinity: 1e400 passed for "inf".
+        # 470: UNLOAD value {!r} in snapshot.source is not a finite number, which no
+        # Informix {} column holds
+        raise InformixError(_m(470, text, type_name))
     if not single or not math.isfinite(value):
         return value
     rounded = _float32(value) if abs(value) < 3.5e38 else math.inf
@@ -24092,7 +24141,7 @@ def _number_alike(column: Column | None, op: str, old: tuple, new: tuple) -> boo
     # the default context's 28 digits: in a DECIMAL(32,2) it made ...890.12 and ...890.99
     # one number, and a change that moved 87 values passed as no change.
     with localcontext() as context:
-        context.prec = 200
+        context.prec = max(200, len(old[1].as_tuple().digits), len(new[1].as_tuple().digits))
         a, b = old[1].scaleb(scale), new[1].scaleb(scale)
         if op in ("=", "<>"):
             return a != a.to_integral_value() and b != b.to_integral_value()
