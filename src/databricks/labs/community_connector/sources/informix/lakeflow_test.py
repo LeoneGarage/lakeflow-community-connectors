@@ -1319,6 +1319,30 @@ class LakeflowContractTests(unittest.TestCase):
             self.assertEqual(excluded.list_tables(), ["app.orders", "sysadmin.jobs"])
         warn.assert_not_called()
 
+    def test_a_left_out_table_is_selected_by_every_name_and_named_fails_its_own_way(self):
+        # Its database.owner.table name, the include and exclude lists' usual form, was not
+        # matched: a table so selected was left out silently, and one so excluded warned.
+        # Asked for by a name too odd to look up directly, it failed as unknown.
+        bridge = FakeBridge()
+        bridge.tables.append({"owner": "app", "name": "bad-name", "unreadable": "odd name"})
+
+        with self.assertLogs(informix_module.__name__, "WARNING") as logs:
+            selected = self.connector(bridge, **{"table.include.list": "demo.app.*"})
+            self.assertEqual(selected.list_tables(), ["app.audit", "app.orders"])
+        self.assertIn("odd name", "\n".join(logs.output))
+        with self.assertRaisesRegex(ValueError, "odd name"):
+            selected.get_table_schema('app."bad-name"', {})
+
+        with mock.patch.object(
+            informix_module.logging.getLogger(informix_module.__name__), "warning"
+        ) as warn:
+            # Delimited, as a Table names it.
+            excluded = self.connector(bridge, **{"table.exclude.list": 'demo.app."bad-name"'})
+            excluded.list_tables()
+            with self.assertRaisesRegex(ValueError, "Unknown or excluded"):
+                excluded.get_table_schema('app."bad-name"', {})
+        warn.assert_not_called()
+
     def test_worker_rejects_bridge_without_release_contract(self):
         class IncompleteBridge:
             @staticmethod
@@ -6323,6 +6347,75 @@ class LakeflowContractTests(unittest.TestCase):
         )
         self.assertEqual([part["table"] for part in spill.finish(8, 20)], ["demo.app.items"])
 
+    def test_a_spilled_transaction_holds_open_only_the_tables_it_still_changes(self):
+        # A SPILLING record stands in for a spilled table's changes. One for a table a
+        # rollback to a savepoint took back, before the spill or after it, held the table
+        # open (no drain, 286 at its schema transition) where its records would not have,
+        # and a table changed again after that got none.
+        captures = [
+            self._ORDERS_CAPTURE,
+            {
+                **self._ORDERS_CAPTURE,
+                "identity": "demo:app.items",
+                "logical_identity": "demo.app.items",
+            },
+        ]
+
+        def change(label, lsn):
+            return {"op": "INSERT", "tx_id": 7, "lsn": lsn, "label": label, "row": {"id": lsn}}
+
+        records = [
+            {"op": "BEGIN", "tx_id": 7, "lsn": 100},
+            change(1, 101),
+            {"op": "DISCARD", "tx_id": 7, "lsn": 101},
+            change(2, 102),
+            change(2, 103),  # spills it, the orders change taken back already
+            {"op": "DISCARD", "tx_id": 7, "lsn": 102},  # and now the items changes
+            change(1, 104),  # orders again
+            {"op": "TIMEOUT", "lsn": 105},
+        ]
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.transport = FakeCdcTransport([records])
+        bridge.cdc_spill = informix_module._CdcSpill(
+            1,
+            lambda *args: None,
+            lambda *args: None,
+            {},
+            "scope",
+            {c["logical_identity"]: c["identity"] for c in captures},
+        )
+        with (
+            mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
+            mock.patch.object(
+                informix_module, "decode_frame", side_effect=lambda frame, labels, **_: dict(frame)
+            ),
+        ):
+            returned = bridge.read_changes(captures, 90, 1, 256)
+        buffer = informix_module.TransactionBuffer()
+        for record in returned:
+            buffer.feed(record)
+
+        spilling = buffer.open[7].spilling
+        self.assertEqual([(r["table"], r["lsn"]) for r in spilling], [("demo.app.orders", 104)])
+
+    def test_a_rollback_to_a_savepoint_leaves_a_spill_part_what_is_left(self):
+        # Its bytes ended later pages early, and an unflushed part's operations, a DELETE's,
+        # had the delete channel read pages that hold inserts only.
+        pages = []
+        spill = informix_module._CdcSpill(
+            1, lambda *args: pages.append(len(args[4])), lambda *args: None, {}, "s", {}
+        )
+        wide = {"value": "x" * (20 << 20)}
+        spill.start(7, 100, [{"op": "INSERT", "tx_id": 7, "lsn": 101, "row": {"value": "a"}}])
+        spill.add({"op": "DELETE", "tx_id": 7, "lsn": 102, "row": wide})
+        spill.discard(7, 102)
+        spill.add({"op": "INSERT", "tx_id": 7, "lsn": 103, "row": wide})
+        spill.add({"op": "INSERT", "tx_id": 7, "lsn": 104, "row": {"value": "b"}})
+        (part,) = spill.finish(7)
+        self.assertEqual(pages, [3])
+        self.assertEqual(part["ops"], ["INSERT"])
+
     def test_a_spill_run_pages_alike_wherever_a_channel_began_to_spill(self):
         # The other channel's pages are kept, not written again, so a run's pages must not
         # depend on when a poll began to spill: one that began after a rollback to a
@@ -6810,36 +6903,44 @@ class LakeflowContractTests(unittest.TestCase):
         # A DATETIME-chunked key cannot use the stepwise equality prefix (no index
         # serves an order-preserving cast expression), so it stays a single
         # composite read with the FIRST_ROWS directive and the extended budget.
-        class TimedTransport:
-            def __init__(self):
-                self.socket_timeout = 30.0
-                self.timeouts = []
-                self.sql = None
-
-            def set_socket_timeout(self, timeout):
-                self.socket_timeout = timeout
-                self.timeouts.append(timeout)
-
-            def execute(self, sql, params):
-                assert self.socket_timeout == 300.0
-                assert params == ()
-                self.sql = sql
-                return [{"__chunk_ts": "2026-01-01"}]
-
-        transport = TimedTransport()
-        bridge = object.__new__(PurePythonInformixBridge)
-        bridge.options = {}
-        bridge.transport = transport
+        bridge = self._stepwise_bridge([[{"__chunk_ts": "2026-01-01"}]])
 
         result = bridge.max_primary_key(
             "demo.app.events", ["ts"], chunk_exprs={"ts": "TO_CHAR(ts)"}
         )
 
         self.assertEqual(result, ["2026-01-01"])
-        self.assertEqual(transport.timeouts, [300.0, 30.0])
-        self.assertIn("{+FIRST_ROWS(1)}", transport.sql)
-        self.assertIn("TO_CHAR(ts) AS __chunk_ts", transport.sql)
-        self.assertTrue(transport.sql.rstrip().endswith("ORDER BY TO_CHAR(ts) DESC"))
+        self.assertEqual(bridge.transport.timeouts, [300.0, 30.0])
+        ((sql, params),) = bridge.transport.selects
+        self.assertEqual(params, ())
+        self.assertIn("{+FIRST_ROWS(1)}", sql)
+        self.assertIn("TO_CHAR(ts) AS __chunk_ts", sql)
+        self.assertTrue(sql.rstrip().endswith("ORDER BY TO_CHAR(ts) DESC"))
+
+    def test_max_primary_key_datetime_chunk_reads_in_its_own_transaction(self):
+        # Bare, the sort-bound read ran at whatever isolation the session last had and, in
+        # an ANSI database, left its implicit transaction (and its locks) open.
+        statements = []
+
+        class AnsiTransport:
+            def execute(self, sql, parameters=()):
+                statements.append(sql.split()[0] if "is_ansi" not in sql else "probe")
+                return [{"is_ansi": 1}] if "is_ansi" in sql else [{"__chunk_ts": "2026-01-01"}]
+
+            def execute_command(self, sql):
+                statements.append(sql)
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.config = {"database": "demo"}
+        bridge.transport = AnsiTransport()
+
+        bridge.max_primary_key("demo.app.events", ["ts"], chunk_exprs={"ts": "TO_CHAR(ts)"})
+
+        self.assertEqual(
+            statements,
+            ["probe", "COMMIT WORK", "SET ISOLATION TO REPEATABLE READ", "SELECT", "COMMIT WORK"],
+        )
 
     def test_default_cdc_poll_byte_bound_skips_accounting(self):
         transport = FakeCdcTransport([[{"op": "TIMEOUT", "lsn": 100}]])
@@ -7419,13 +7520,13 @@ class LakeflowContractTests(unittest.TestCase):
 
     def test_a_shard_is_shared_only_under_the_same_decoding_and_staging(self):
         # Keyed by the database alone, a flow through a connection with another
-        # string.null.byte got changes decoded under the leader's.
-        keys = []
-        for mode in ("null", "keep", "null"):
+        # string.null.byte got changes decoded under the leader's; one with another user
+        # read through the leader's session, and one with spilling off got its spills.
+        def key(**options):
             connector = self.connector(
                 FakeBridge(),
                 shared_cdc=True,
-                **{"cdc.shared.session": "process", "string.null.byte": mode},
+                **{"cdc.shared.session": "process", "string.null.byte": "null", **options},
             )
             table = connector._table("app.orders", {})
             shard = mock.Mock()
@@ -7436,10 +7537,14 @@ class LakeflowContractTests(unittest.TestCase):
                 connector._shared_cdc_snapshot(
                     table, _stream_offset(), {}, False, connector._pipeline_scope()
                 )
-            keys.append(opened.call_args.args[0])
-        self.assertNotEqual(keys[0], keys[1])
-        self.assertEqual(keys[0], keys[2])
-        self.assertEqual(keys[0][1:], keys[1][1:])
+            return opened.call_args.args[0]
+
+        first = key()
+        self.assertEqual(key(), first)
+        for other in ({"string.null.byte": "keep"}, {"user": "reader"}, {"cdc.spill.records": "0"}):
+            with self.subTest(other=other):
+                self.assertNotEqual(key(**other), first)
+                self.assertEqual(key(**other)[1:], first[1:])
 
     def test_change_records_are_decoded_in_the_database_codeset(self):
         # A change record carries text as the database holds it, whatever the session's
@@ -27731,6 +27836,24 @@ class MixedDirectionKeyTests(unittest.TestCase):
         self.assertIsNone(bridge.key_index_directions("demo.app.t", ["c"]))
 
 
+    def test_key_index_directions_reads_a_positional_row_from_its_first_column(self):
+        # The index query selects part1..part16 alone, so part1 is column 0: read from
+        # column 1, a tuple row lost its first column and failed a 16-column index.
+        class CatalogTransport:
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                if "syscolumns" in sql:
+                    return [{"colname": f"c{n}", "colno": n} for n in range(1, 17)]
+                return [tuple(MixedDirectionKeyTests._pk_row(*range(1, 16), -16).values())]
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.config = {"database": "demo"}
+        bridge.transport = CatalogTransport()
+
+        columns = [f"c{n}" for n in range(1, 17)]
+        self.assertEqual(bridge.key_index_directions("demo.app.t", columns), [False] * 15 + [True])
+
+
 class NullByteOptionTests(unittest.TestCase):
     """The string.null.byte option resolves to null (default), empty, or keep, and the
     bridge threads the resolved mode into both decode paths."""
@@ -27977,6 +28100,63 @@ class UnloadHelperTests(unittest.TestCase):
         apply('{"vcol": "NVL(ROUND(vcol, 0), 100000000000000000000)"}', {})
         # A schema refresh, with no table options to go by, leaves the type unchecked.
         apply('{"vcol": "NVL(vcol, 100000000000000000000)"}', None)
+
+    def test_numbers_past_an_informix_decimal_are_refused_and_wide_ones_round(self):
+        # Under decimal.variable.type string or double an NVL fallback had no bound:
+        # ROUND(NVL(vcol, 1e250), 0) failed the first NULL rounding past 200 digits, and
+        # NVL(vcol, 1e400) landed an infinite DOUBLE. NVL(ROUND(vcol, 2), 1e100), in range,
+        # failed rounding at 80 digits. And a filter's 1e200, written out in full, is a
+        # literal Informix can't read.
+        columns = [
+            {"name": "id", "type_name": "INTEGER", "length": 4, "nullable": False},
+            {"name": "vcol", "type_name": "DECIMAL", "precision": 10, "scale": 255},
+        ]
+        table = Table.parse({**_table(), "columns": columns}, "demo")
+        for transform, kind in (
+            ("ROUND(NVL(vcol, 1e250), 0)", "string"),
+            ("NVL(vcol, 1e400)", "double"),
+            ("NVL(vcol, -1e-131)", "string"),
+        ):
+            with (
+                self.subTest(transform=transform),
+                self.assertRaisesRegex(InformixError, "Informix DECIMAL holds"),
+            ):
+                informix_module._apply_column_transforms(
+                    table,
+                    informix_module._column_transforms(
+                        {"transform_columns": json.dumps({"vcol": transform})}
+                    ),
+                    None,
+                    options={"decimal.variable.type": kind},
+                )
+        context = {
+            "columns": {"vcol": table.columns[1]},
+            "options": {"decimal.variable.type": "string"},
+        }
+        rounded = ("fn", "ROUND", ("vcol", ("number", Decimal(2))))
+        self.assertEqual(
+            informix_module._fallback_value(Decimal("1e100"), rounded, context),
+            "1" + "0" * 100 + ".00",
+        )
+        for text in ("id < 1e200", "id > 1e-131", "id IN (1, -2e126)"):
+            with (
+                self.subTest(text=text),
+                self.assertRaisesRegex(InformixError, "Informix DECIMAL holds"),
+            ):
+                informix_module._apply_row_filter(table, text)
+        informix_module._apply_row_filter(table, "id < 1e125 AND id > -1e-130")
+
+    def test_a_row_filter_written_out_past_8192_characters_is_refused_up_front(self):
+        # Its canonical form, which a schema refresh checks again, is fully parenthesised
+        # with its numbers written out (1e125 is 126 characters): accepted as given, a
+        # filter longer that way failed the refresh.
+        table = Table.parse(_table(), "demo")
+        text = " OR ".join(["id = 1e125"] * 80)
+        with self.assertRaisesRegex(ValueError, "8192 characters, as given or written out"):
+            informix_module._apply_row_filter(table, text)
+        kept = informix_module._apply_row_filter(table, " OR ".join(["id = 1e125"] * 50))
+        again = informix_module._apply_row_filter(table, kept.row_filter)
+        self.assertEqual(again.row_filter, kept.row_filter)
 
     def test_an_nvl_fallback_lands_as_the_inner_expression_does(self):
         # It was coerced to the column's own type: 10^20 for NVL(ROUND(vcol, 0), ...) went

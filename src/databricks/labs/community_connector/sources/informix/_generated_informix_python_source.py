@@ -10255,7 +10255,7 @@ def register_lakeflow_source(spark):
                 names: list[str] = []
                 directions: list[bool] = []
                 for position in range(16):
-                    part = int(_field(row, f"part{position + 1}", position + 1))
+                    part = int(_field(row, f"part{position + 1}", position))
                     if part == 0:
                         break  # key columns are contiguous; the rest is padding
                     column_name = by_number.get(abs(part))
@@ -10946,7 +10946,11 @@ def register_lakeflow_source(spark):
             if snapshot_filter:
                 sql += f" WHERE ({snapshot_filter})"
             sql += f" ORDER BY {order}"
-            rows = self._execute_with_snapshot_read_timeout(sql, ())
+            # In its own transaction, as each chunk and the stepwise read are: bare, it read at
+            # whatever isolation the session last had and, in an ANSI database, left its implicit
+            # transaction, and the shared locks of a sort-bound scan, open to the next one.
+            with self._repeatable_read_transaction():
+                rows = self.transport.execute(sql, ())
             if not rows:
                 return None
             row = rows[0]
@@ -11013,40 +11017,6 @@ def register_lakeflow_source(spark):
                     row = rows[0]
                     resolved.append(row[key] if isinstance(row, dict) else row[0])
                 return resolved
-
-        def _execute_with_snapshot_read_timeout(self, sql: str, params: tuple) -> list:
-            # Docstring: Run one read with the snapshot read-timeout budget, then restore it.
-            #
-            # The incremental-snapshot key bound can run a full scan + top-sort on a
-            # large table, so it must not be constrained by the bare ~30s transport
-            # default or a slow seed times out and crash-loops the stream on restart.
-
-            set_socket_timeout = getattr(self.transport, "set_socket_timeout", None)
-            previous_socket_timeout = getattr(self.transport, "socket_timeout", None)
-            if set_socket_timeout is not None:
-                set_socket_timeout(
-                    max(
-                        float(previous_socket_timeout or 30),
-                        float(
-                            self.options.get(
-                                "snapshot.read.timeout.seconds",
-                                str(_DEFAULT_SNAPSHOT_READ_TIMEOUT_SECONDS),
-                            )
-                        ),
-                    )
-                )
-            try:
-                return self.transport.execute(sql, params)
-            finally:
-                if set_socket_timeout is not None and previous_socket_timeout is not None:
-                    try:
-                        set_socket_timeout(float(previous_socket_timeout))
-                    except Exception:
-                        # 50: Failed to restore Informix max-key socket timeout
-                        logging.getLogger(__name__).warning(
-                            _m(50),
-                            exc_info=True,
-                        )
 
         @_serialized_sqli_operation
         def consistent_snapshot(
@@ -11291,10 +11261,8 @@ def register_lakeflow_source(spark):
                     records[begin + 1 :] = [r for r in later if r.get("tx_id") != tx_id]
                     own = [r for r in later if r.get("tx_id") == tx_id]
                     begin_lsn = int((records[begin] if begin >= 0 else own[0])["lsn"])
-                    for table in spill.start(tx_id, begin_lsn, own):
-                        records.append(
-                            {"op": "SPILLING", "tx_id": tx_id, "lsn": begin_lsn, "table": table}
-                        )
+                    for table, live in spill.start(tx_id, begin_lsn, own).items():
+                        records.append({"op": "SPILLING", "tx_id": tx_id, "lsn": live, "table": table})
                     open_transactions.release(tx_id)
                     retained_bytes -= held_bytes.pop(tx_id, 0)
 
@@ -13014,6 +12982,7 @@ def register_lakeflow_source(spark):
                 )
             )
             fallback = literals[0][1]
+            _decimal_literal(fallback, option, _expression_text(operand))
             if integral and fallback != fallback.to_integral_value():
                 # 104: Option '{}' gives {} the fallback {} for {}, which holds whole numbers only
                 raise InformixError(_m(104, option, name, fallback, column.name))
@@ -13365,7 +13334,8 @@ def register_lakeflow_source(spark):
         # the default half-even, NVL(ROUND(vcol, 0), 2.5) landed 2 where ROUND lands 3.
 
         with localcontext() as decimal_context:
-            decimal_context.prec = 80
+            # As _apply_function's: a DECIMAL(p) fallback of 1e100 at 2 places is 103 digits.
+            decimal_context.prec = 200
             return value.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
 
 
@@ -13811,6 +13781,18 @@ def register_lakeflow_source(spark):
                     # significant digits Informix reads of a number; the snapshot would filter
                     # otherwise than the stream
                     raise InformixError(_m(484, _ROW_FILTER_OPTION, name, literal[1]))
+            _decimal_literal(literal[1], _ROW_FILTER_OPTION, name)
+
+
+    def _decimal_literal(value: Decimal, option: str, name: str) -> None:
+        # Docstring: Refuse a number past an Informix DECIMAL's range. Written out in full, a
+        # filter's is a literal Informix can't read; an NVL fallback of 1e250 failed the first
+        # NULL as rounding past 200 digits, and 1e400 landed as an infinite DOUBLE.
+
+        if value and not Decimal("1e-130") <= value.copy_abs() <= Decimal("1e125"):
+            # 50: Option '{}' gives {} the number {}, outside what an Informix DECIMAL holds: 0,
+            # or a magnitude from 1e-130 to 1e125
+            raise InformixError(_m(50, option, name, value))
 
 
     def _operand_literals(operand: str | tuple):
@@ -13845,11 +13827,16 @@ def register_lakeflow_source(spark):
         if text is None or not str(text).strip():
             return table if table.row_filter is None else replace(table, row_filter=None)
         if len(str(text)) > 8192:
-            # 115: Option '{}' cannot exceed 8192 characters
+            # 115: Option '{}' cannot exceed 8192 characters, as given or written out in full
             raise ValueError(_m(115, _ROW_FILTER_OPTION))
         tree = _parse_row_filter(str(text))
         _check_row_filter(tree, table)
         canonical = _row_filter_text(tree)
+        if len(canonical) > 8192:
+            # The canonical form is what a schema refresh checks again: longer, it passed here
+            # and then failed the refresh.
+            # 115: Option '{}' cannot exceed 8192 characters, as given or written out in full
+            raise ValueError(_m(115, _ROW_FILTER_OPTION))
         return table if table.row_filter == canonical else replace(table, row_filter=canonical)
 
 
@@ -14705,6 +14692,9 @@ def register_lakeflow_source(spark):
             # DISCARD carries the rollback cutoff, not the forward position of the
             # DISCARD control record. It may legitimately precede the latest data LSN.
             self.records = [r for r in self.records if _lsn(r) < lsn]
+            # A SPILLING record is at its table's earliest change left (see _CdcSpill.start), so
+            # one at or past the savepoint holds the table open no longer, as no record would.
+            self.spilling = [r for r in self.spilling if _lsn(r) < lsn]
             if self.pending_before is not None and _lsn(self.pending_before) >= lsn:
                 self.pending_before = None
 
@@ -14806,6 +14796,16 @@ def register_lakeflow_source(spark):
         return f"{layout}-{begin}-{tx_id}-{hashlib.sha256(first.encode()).hexdigest()[:12]}"
 
 
+    def _spill_bytes(record: dict[str, Any]) -> int:
+        # Docstring: A change's weight on its page: wide text or byte columns end a page early,
+        # well inside the staged-page bound.
+
+        return 64 + sum(
+            len(value) if isinstance(value, (str, bytes, bytearray)) else 16
+            for value in (record.get("row") or {}).values()
+        )
+
+
     def _spill_run_consumed(record: dict[str, Any]) -> bool:
         # Docstring: Whether every channel a run's record requires has committed past it.
 
@@ -14840,9 +14840,9 @@ def register_lakeflow_source(spark):
         def holds(self, tx_id: int) -> bool:
             return tx_id in self._open
 
-        def start(self, tx_id: int, begin_lsn: int, records: list[dict[str, Any]]) -> list[str]:
+        def start(self, tx_id: int, begin_lsn: int, records: list[dict[str, Any]]) -> dict[str, int]:
             # Docstring: Start spilling a transaction with the changes it holds; return the tables
-            # it has a run for.
+            # with a change left, each at the earliest.
 
             self._open[tx_id] = (begin_lsn, {})
             # In order, a DISCARD where it came: a run's pages are its table's changes paged
@@ -14855,16 +14855,16 @@ def register_lakeflow_source(spark):
                     self.discard(tx_id, int(record["lsn"]))
                 else:
                     self.add(record)
-            return list(self._open[tx_id][1])
+            return {t: p["live"] for t, p in self._open[tx_id][1].items() if p["live"] is not None}
 
         def add(self, record: dict[str, Any]) -> bool:
-            # Docstring: Add one change; return whether it began its table's run.
+            # Docstring: Add one change; return whether it is its table's earliest left, so its
+            # run's first or the first after rollbacks took back the rest.
 
             tx_id = int(record.get("tx_id") or 0)
             begin, parts = self._open[tx_id]
             table = str(record.get("table") or "")
             part = parts.get(table)
-            began = part is None
             if part is None:
                 run = _spill_run(self._layouts.get(table, ""), begin, tx_id, record)
                 part = parts[table] = {
@@ -14885,13 +14885,10 @@ def register_lakeflow_source(spark):
             )
             part["ops"].add(record["op"])
             part["last"] = int(record["lsn"])
-            if part["live"] is None:
+            began = part["live"] is None
+            if began:
                 part["live"] = part["last"]
-            # Wide text or byte columns end a page early, well inside the staged-page bound.
-            part["bytes"] += 64 + sum(
-                len(value) if isinstance(value, (str, bytes, bytearray)) else 16
-                for value in (record.get("row") or {}).values()
-            )
+            part["bytes"] += _spill_bytes(record)
             if record["op"] != "BEFORE_UPDATE" and (
                 len(part["rows"]) >= _CDC_SPILL_PAGE_RECORDS or part["bytes"] >= 32 << 20
             ):
@@ -14908,6 +14905,11 @@ def register_lakeflow_source(spark):
         def discard(self, tx_id: int, lsn: int) -> None:
             for part in self._open[tx_id][1].values():
                 part["rows"] = [record for record in part["rows"] if int(record["lsn"]) < lsn]
+                # Of what is left: the taken back ended a page early, and named operations, a
+                # DELETE's, that a channel then read the pages for.
+                part["bytes"] = sum(map(_spill_bytes, part["rows"]))
+                if not part["pages"]:
+                    part["ops"] = {record["op"] for record in part["rows"]}
                 if part["pages"] and part["last"] >= lsn:
                     part["discarded"].append([lsn, part["last"]])
                 # A rollback takes back everything from its savepoint on, and changes come in
@@ -26228,13 +26230,16 @@ def register_lakeflow_source(spark):
             threads = self._shared_cdc_thread_count()
             shard_id = int(hashlib.sha256(table.native_identity.encode()).hexdigest(), 16) % threads
             # By what the shard's leader decodes, spills and reads the catalog under, too: a
-            # flow of the same database through a connection with others got the leader's.
+            # flow of the same database through a connection with others got the leader's. And
+            # by the user it captures as, so no flow reads through another user's session.
             key = (
                 self._lakebase_state_namespace()
                 + ":"
                 + hashlib.sha256(
                     repr(
                         [
+                            self.options.get("user"),
+                            self.options.get(_CDC_SPILL_RECORDS_OPTION),
                             _null_byte_mode(self.options),
                             _database_encoding(self.options),
                             getattr(self, "_snapshot_staging_location", None),
@@ -28384,6 +28389,7 @@ def register_lakeflow_source(spark):
         def _table_map(self, refresh: bool = False) -> dict[str, Table]:
             if self._tables is None or not self._tables_complete or refresh:
                 result: dict[str, Table] = {}
+                unreadable: dict[tuple, str] = {}
                 database = self.options.get("database", "")
                 for raw in self._bridge.list_tables():
                     # A table the connector can't read (a column type, or a name, it does not
@@ -28394,8 +28400,13 @@ def register_lakeflow_source(spark):
                             raise InformixError(raw["unreadable"])
                         table = Table.parse(raw, database)
                     except (InformixError, ValueError) as error:
-                        named = f"{raw.get('owner')}.{raw.get('name')}"
-                        if self._selected_names((f"{database}:{named}", named)):
+                        # Selected by the names a Table is (see _selected).
+                        owner, name = str(raw.get("owner")), str(raw.get("name"))
+                        at = str(raw.get("database") or database)
+                        named = _join_identity(owner, name)
+                        native = f"{at}:{_sql_identifier(owner)}.{_sql_identifier(name)}"
+                        if self._selected_names((_join_identity(at, owner, name), named, native)):
+                            unreadable[owner, name] = str(error)
                             # 485: Informix table '{}' is left out of the table list: {}
                             logging.getLogger(__name__).warning(_m(485, named, error))
                         continue
@@ -28405,6 +28416,7 @@ def register_lakeflow_source(spark):
                             raise InformixError(_m(331, table.exposed_name))
                         result[table.exposed_name] = table
                 self._tables = result
+                self._unreadable = unreadable
                 self._tables_complete = True
             return self._tables
 
@@ -28438,8 +28450,10 @@ def register_lakeflow_source(spark):
                 return self._apply_table_options(table, options)
             tables = self._table_map(refresh=refresh)
             if exposed not in tables:
+                # One the list left out, by what it can't read (a name too odd to look up).
+                unreadable = getattr(self, "_unreadable", {}).get(tuple(parts))
                 # 169: Unknown or excluded Informix table '{}'
-                raise ValueError(_m(169, exposed))
+                raise ValueError(unreadable or _m(169, exposed))
             return self._apply_table_options(tables[exposed], options)
 
 
