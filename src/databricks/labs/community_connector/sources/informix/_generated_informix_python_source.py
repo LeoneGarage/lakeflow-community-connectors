@@ -1055,6 +1055,33 @@ def register_lakeflow_source(spark):
 
 
     def decode_packed_decimal(data: bytes, precision: int, scale: int) -> Decimal | None:
+        # Docstring: A packed DECIMAL(precision, scale) (scale 0xFF: floating), refused when
+        # its digits don't fit the type. Informix stores no value that doesn't (a DECIMAL(4)
+        # of 1.23456 is 1.235, live-checked), but the wire has room for more: the exponent
+        # byte goes past the integer digits, the last byte past the scale. A record a reused
+        # log replays, read under this column's layout, fails on them (message 11), not
+        # rounded or past the type into Spark.
+
+        value = _packed_decimal_value(data, precision, scale)
+        if value is None:
+            return None
+        with localcontext() as context:
+            context.prec = 46
+            if scale == 0xFF:
+                if len(value.normalize().as_tuple().digits) > precision:
+                    raise CdcProtocolError(f"packed decimal {value} exceeds DECIMAL({precision})")
+                return value
+            result = None
+            if value.adjusted() < precision - scale:
+                result = value.quantize(Decimal(1).scaleb(-scale))
+            if result != value:
+                raise CdcProtocolError(f"packed decimal {value} exceeds DECIMAL({precision},{scale})")
+            return result
+
+
+    def _packed_decimal_value(data: bytes, precision: int, scale: int) -> Decimal | None:
+        # Docstring: The exact value of a packed decimal, every digit the wire holds.
+
         variable_scale = scale == 0xFF
         if not 1 <= precision <= 38 or not (variable_scale or 0 <= scale <= precision):
             raise UnsupportedCdcType(f"invalid DECIMAL({precision},{scale}) metadata")
@@ -1083,11 +1110,7 @@ def register_lakeflow_source(spark):
                 Decimal(digit) * (Decimal(100) ** (exponent - index - 1))
                 for index, digit in enumerate(digits)
             )
-            if not positive:
-                value = -value
-            if variable_scale:
-                return value
-            return value.quantize(Decimal(1).scaleb(-scale))
+            return value if positive else -value
 
 
     def datetime_size(qualifier: int) -> int:
@@ -1324,9 +1347,16 @@ def register_lakeflow_source(spark):
         total = (qualifier >> 8) & 0xFF
         size = (total + (fraction & 1) + 3) // 2
         _need(data, size)
-        value = decode_packed_decimal(bytes(data[:size]), total, fraction)
+        # Not decode_packed_decimal: the fields' grid puts more integer digits on the wire
+        # than the qualifier counts (HOUR TO MINUTE's 10:30 is 103000).
+        value = _packed_decimal_value(bytes(data[:size]), total, fraction)
         if value is None:
             return None, size
+        with localcontext() as context:
+            context.prec = 46
+            if value != value.quantize(Decimal(1).scaleb(-fraction)):
+                # Rounded, SECOND TO SECOND's 12.60 read as 13.
+                raise CdcProtocolError(f"INTERVAL holds digits below its fraction: {value}")
         negative = value < 0
         magnitude = -value if negative else value
         text = "-" if negative and magnitude else ""
@@ -5116,11 +5146,15 @@ def register_lakeflow_source(spark):
 
 
     # What no retry helps: a certificate that failed verification, a login refused (bad
-    # credentials, a login deadline, a redirect not allowed), a type the client can't decode.
+    # credentials, a login deadline, a redirect not allowed), a type the client can't decode,
+    # an ssl.ca.file path that names no file (see _ca_file_misnamed).
     CONFIGURATION_ERRORS = (
         ssl.SSLCertVerificationError,
         SqliUnsupportedAuthentication,
         SqliDescriptorNotImplemented,
+        FileNotFoundError,
+        IsADirectoryError,
+        NotADirectoryError,
     )
 
 
@@ -5639,6 +5673,20 @@ def register_lakeflow_source(spark):
     # How long a TLS connection waits before its first and second retry of reading
     # ssl.ca.file (twice this, the second time).
     _CA_FILE_RETRY_SECONDS = 0.5
+    # The FUSE mounts an ssl.ca.file can be read through, where a dropped mount can hide a file.
+    _FUSE_PATH_PREFIXES = ("/Volumes/", "/Workspace/", "/dbfs/")
+
+
+    def _ca_file_misnamed(error: OSError, path: str | None) -> bool:
+        # Docstring: Whether ``error`` reading ssl.ca.file says the path names no file, which
+        # no retry finds: a directory, or a file missing off a FUSE mount. Wrapped as a
+        # transport loss, each reconnect loop retried a typo for half a minute.
+
+        if isinstance(error, (IsADirectoryError, NotADirectoryError)):
+            return True
+        return isinstance(error, FileNotFoundError) and not str(path or "").startswith(
+            _FUSE_PATH_PREFIXES
+        )
 
 
     @dataclass(eq=False, repr=False)
@@ -5764,24 +5812,7 @@ def register_lakeflow_source(spark):
         ) -> None:
             context = self.ssl_context
             if self.tls and context is None:
-                # ssl.ca.file can sit on a Volume, read through its FUSE mount, which refuses
-                # a read now and then: a failed read is tried twice more, before the socket is
-                # opened. Contents that don't load (ssl.SSLError) fail at once.
-                for attempt in range(3):
-                    try:
-                        context = ssl.create_default_context(cafile=self.ca_file)
-                        break
-                    except ssl.SSLError:
-                        raise
-                    except OSError as error:
-                        if attempt == 2:
-                            # A transport loss, so a reconnect tries again: a mount dropped for
-                            # longer (ENOTCONN, seen on serverless) failed the stream reader's
-                            # lookup at once. The OSError stays the cause.
-                            raise SqliTransportError(
-                                f"ssl.ca.file could not be read: {error!r}"
-                            ) from error
-                        time.sleep(_CA_FILE_RETRY_SECONDS * (attempt + 1))
+                context = self._ca_file_context(deadline)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise SqliUnsupportedAuthentication("Informix login deadline exceeded")
@@ -5989,6 +6020,30 @@ def register_lakeflow_source(spark):
             ):
                 raise SqliProtocolError("SQLI database session is not open")
             return self._input, self._output
+
+        def _ca_file_context(self, deadline: float) -> ssl.SSLContext:
+            # Docstring: The TLS context, ssl.ca.file loaded. The file can sit on a Volume, read
+            # through its FUSE mount, which refuses a read now and then: a failed read is tried
+            # twice more, before the socket is opened, if the login deadline leaves the time.
+            # Contents that don't load (ssl.SSLError), or a path that names no file, fail at once.
+
+            attempt = 0
+            while True:
+                try:
+                    return ssl.create_default_context(cafile=self.ca_file)
+                except ssl.SSLError:
+                    raise
+                except OSError as error:
+                    if _ca_file_misnamed(error, self.ca_file):
+                        raise
+                    attempt += 1
+                    delay = _CA_FILE_RETRY_SECONDS * attempt
+                    if attempt == 3 or time.monotonic() + delay >= deadline:
+                        # A transport loss, so a reconnect tries again: a mount dropped for
+                        # longer (ENOTCONN, seen on serverless) failed the stream reader's
+                        # lookup at once. The OSError stays the cause.
+                        raise SqliTransportError(f"ssl.ca.file could not be read: {error!r}") from error
+                    time.sleep(delay)
 
         def set_socket_timeout(self, timeout: float) -> None:
             # Docstring: Update the timeout used by the live SQLI socket.
@@ -10217,26 +10272,32 @@ def register_lakeflow_source(spark):
 
             if time.monotonic() < getattr(self, "_utc_time_retry_at", 0.0):
                 return None
-            self._ensure_connected()
-            try:
-                row = self.transport.execute(
-                    "SELECT DBINFO('utc_current') AS utc FROM sysmaster:sysdual"
-                )[0]
-                return int(_field(row, "utc", 0))
-            except Exception as error:
-                lease_lost = getattr(self, "_connection_lease_lost", None)
-                if lease_lost is not None and lease_lost.is_set():
-                    # The slot's lease went: that is for the operation guard to report, not a
-                    # probe the source refused.
-                    raise
-                # The failed statement poisoned the SQLI client: drop the transport, keeping
-                # the slot, so the next statement reconnects rather than failing on it. A
-                # source that answered with an error isn't asked again for a while: the
-                # error may mean it can't run the probe, or only a lock timeout.
-                self.reset_transport()
-                if not isinstance(error, (SqliTransportError, OSError)):
-                    self._utc_time_retry_at = time.monotonic() + _UTC_TIME_REPROBE_SECONDS
-                return None
+            for attempt in range(2):
+                self._ensure_connected()
+                try:
+                    row = self.transport.execute(
+                        "SELECT DBINFO('utc_current') AS utc FROM sysmaster:sysdual"
+                    )[0]
+                    return int(_field(row, "utc", 0))
+                except Exception as error:
+                    lease_lost = getattr(self, "_connection_lease_lost", None)
+                    if lease_lost is not None and lease_lost.is_set():
+                        # The slot's lease went: that is for the operation guard to report, not
+                        # a probe the source refused.
+                        raise
+                    # The failed statement poisoned the SQLI client: drop the transport,
+                    # keeping the slot, so the next statement reconnects rather than failing on
+                    # it. A dropped connection is asked again at once: an index-ordered scan's
+                    # time of a key's last read, or of its end, was lost to one. A source that
+                    # answered with an error isn't asked again for a while: the error may mean
+                    # it can't run the probe, or only a lock timeout.
+                    self.reset_transport()
+                    if not isinstance(error, (SqliTransportError, OSError)):
+                        self._utc_time_retry_at = time.monotonic() + _UTC_TIME_REPROBE_SECONDS
+                        return None
+                    if attempt:
+                        return None
+            return None
 
         @_serialized_sqli_operation
         def prepare_initial_capture(self, identities: Sequence[str]) -> int:
@@ -11418,15 +11479,32 @@ def register_lakeflow_source(spark):
                         set_socket_timeout(float(previous_socket_timeout))
                     except Exception as error:
                         cleanup_errors.append(error)
-                active_error = sys.exc_info()[1]
                 if cleanup_errors:
-                    if active_error is None:
-                        # 60: Informix CDC session cleanup failed
-                        raise InformixError(_m(60)) from cleanup_errors[0]
-                    for error in cleanup_errors:
-                        add_informix_exception_note(
-                            active_error, f"Informix CDC cleanup also failed: {error}"
-                        )
+                    self._settle_poll_cleanup(cleanup_errors, sys.exc_info()[1])
+
+        def _settle_poll_cleanup(
+            self, cleanup_errors: list[BaseException], active_error: BaseException | None
+        ) -> None:
+            # Docstring: What a CDC poll's failed session teardown comes to: a note on the
+            # poll's own failure, or after a whole read a failure of its own (60) -- unless the
+            # connection dropped or stalled, which no reconnect loop retried (the 60 failed the
+            # flow). The session ends with the connection: it is dropped, keeping the slot, so
+            # the next poll reconnects, as a validation's teardown does (41), and the poll
+            # returns what it read.
+
+            if active_error is not None:
+                for error in cleanup_errors:
+                    add_informix_exception_note(
+                        active_error, f"Informix CDC cleanup also failed: {error}"
+                    )
+                return
+            if not all(_is_timeout_error(e) or reconnectable_error(e) for e in cleanup_errors):
+                # 60: Informix CDC session cleanup failed
+                raise InformixError(_m(60)) from cleanup_errors[0]
+            self.reset_transport()
+            # 483: Informix CDC poll read its changes, but ending its session failed on a
+            # dropped or stalled connection; resetting the transport, which ends the session
+            logging.getLogger(__name__).warning(_m(483), exc_info=cleanup_errors[0])
 
 
     # A variable that holds the bridge's class, so that tests can put another in its place.
@@ -11615,10 +11693,13 @@ def register_lakeflow_source(spark):
         # and the CDC polls are. A read advances nothing until it returns: the scan samples
         # the log around its reads, and sorts a poll's changes after it.
 
+        # The clock too: its reconnect, outside its own best-effort catch, failed a scan at the
+        # finish line on a blip after every page was read.
         _READS = frozenset(
             {
                 "boundary_lsn",
                 "current_lsn",
+                "current_utc_time",
                 "key_rows",
                 "read_changes",
                 "rows_by_values",
@@ -13181,17 +13262,42 @@ def register_lakeflow_source(spark):
             # A function can land in another type than its column (see _transform_spark_type),
             # and the fallback lands as the function's values do: ROUND(vcol, 0) is a
             # DECIMAL(38,0) where vcol is a DECIMAL(38,18), and 10^20 fits the one, not the
-            # other; ROUND(int_col, -3) can be a BIGINT.
+            # other; ROUND(int_col, -3) can be a BIGINT. So is ROUND's carry digit: under
+            # decimal(5,2), NVL(ROUND(vcol, 2), 1000) was checked against the DECIMAL(6,2)
+            # and then failed the first NULL against the column's decimal(5,2).
             inner = _transform_spark_type(operand, column, options)
             if isinstance(inner, (IntegerType, LongType)):
                 return int(literal)
-            if isinstance(inner, DecimalType) and inner.scale != getattr(
-                _spark_type(column, options), "scale", None
-            ):
+            places = None
+            if isinstance(inner, DecimalType) and inner != _spark_type(column, options):
+                places = inner.scale
+            elif isinstance(inner, StringType) and _is_variable_scale_decimal(column):
+                # As a string, at the places the function's values have: ROUND(vcol, 2)
+                # writes 12.30, so the fallback 12.3 must too, or HASH gave the two digests.
+                places = _number_text_places(operand)
+            if places is not None:
                 with localcontext() as decimal_context:
                     decimal_context.prec = 80
-                    return literal.quantize(Decimal(1).scaleb(-inner.scale))
+                    result = literal.quantize(Decimal(1).scaleb(-places))
+                if isinstance(inner, DecimalType):
+                    return result
+                return format(result or abs(result), "f")
         return _number_for_column(literal, column, options)
+
+
+    def _number_text_places(operand: str | tuple) -> int | None:
+        # Docstring: The places a number function's text values carry (see _apply_function):
+        # ROUND's and TRUNC's digits, none for MOD, ABS those of what it reads; None for the
+        # column's own text, which drops trailing zeros.
+
+        while not isinstance(operand, str):
+            _, name, arguments = operand
+            if name in ("ROUND", "TRUNC"):
+                return max(int(arguments[1][1]) if len(arguments) > 1 else 0, 0)
+            if name == "MOD":
+                return 0
+            operand = arguments[0]
+        return None
 
 
     def _number_for_column(value: Decimal, column: "Column", options: dict[str, str]) -> Any:
@@ -16471,17 +16577,6 @@ def register_lakeflow_source(spark):
             self._snapshot_staging_location = _validated_volume_location(
                 staging_location, "snapshot.staging.location", options
             )
-            self._snapshot_staging_retention_seconds = (
-                int(
-                    options.get(
-                        "snapshot.staging.retention.days",
-                        str(_DEFAULT_SNAPSHOT_STAGE_RETENTION_DAYS),
-                    )
-                )
-                * 24
-                * 60
-                * 60
-            )
             # Validate numeric configuration without opening a connection.
             for name, default, minimum in (
                 ("snapshot.page.size", str(_DEFAULT_SNAPSHOT_PAGE_SIZE), 1),
@@ -16548,6 +16643,18 @@ def register_lakeflow_source(spark):
                     raise ValueError(f"Option '{name}' must be a whole number") from error
                 if value < minimum:
                     raise ValueError(f"Option '{name}' must be >= {minimum}")
+            # After the check: before it, a retention of "abc" failed with int()'s own error.
+            self._snapshot_staging_retention_seconds = (
+                int(
+                    options.get(
+                        "snapshot.staging.retention.days",
+                        str(_DEFAULT_SNAPSHOT_STAGE_RETENTION_DAYS),
+                    )
+                )
+                * 24
+                * 60
+                * 60
+            )
             # The state project's capacity, checked here rather than when a worker first
             # provisions it.
             try:

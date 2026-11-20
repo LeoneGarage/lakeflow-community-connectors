@@ -3718,26 +3718,32 @@ class PurePythonInformixBridge:
 
         if time.monotonic() < getattr(self, "_utc_time_retry_at", 0.0):
             return None
-        self._ensure_connected()
-        try:
-            row = self.transport.execute(
-                "SELECT DBINFO('utc_current') AS utc FROM sysmaster:sysdual"
-            )[0]
-            return int(_field(row, "utc", 0))
-        except Exception as error:
-            lease_lost = getattr(self, "_connection_lease_lost", None)
-            if lease_lost is not None and lease_lost.is_set():
-                # The slot's lease went: that is for the operation guard to report, not a
-                # probe the source refused.
-                raise
-            # The failed statement poisoned the SQLI client: drop the transport, keeping
-            # the slot, so the next statement reconnects rather than failing on it. A
-            # source that answered with an error isn't asked again for a while: the
-            # error may mean it can't run the probe, or only a lock timeout.
-            self.reset_transport()
-            if not isinstance(error, (SqliTransportError, OSError)):
-                self._utc_time_retry_at = time.monotonic() + _UTC_TIME_REPROBE_SECONDS
-            return None
+        for attempt in range(2):
+            self._ensure_connected()
+            try:
+                row = self.transport.execute(
+                    "SELECT DBINFO('utc_current') AS utc FROM sysmaster:sysdual"
+                )[0]
+                return int(_field(row, "utc", 0))
+            except Exception as error:
+                lease_lost = getattr(self, "_connection_lease_lost", None)
+                if lease_lost is not None and lease_lost.is_set():
+                    # The slot's lease went: that is for the operation guard to report, not
+                    # a probe the source refused.
+                    raise
+                # The failed statement poisoned the SQLI client: drop the transport,
+                # keeping the slot, so the next statement reconnects rather than failing on
+                # it. A dropped connection is asked again at once: an index-ordered scan's
+                # time of a key's last read, or of its end, was lost to one. A source that
+                # answered with an error isn't asked again for a while: the error may mean
+                # it can't run the probe, or only a lock timeout.
+                self.reset_transport()
+                if not isinstance(error, (SqliTransportError, OSError)):
+                    self._utc_time_retry_at = time.monotonic() + _UTC_TIME_REPROBE_SECONDS
+                    return None
+                if attempt:
+                    return None
+        return None
 
     @_serialized_sqli_operation
     def prepare_initial_capture(self, identities: Sequence[str]) -> int:
@@ -4919,15 +4925,32 @@ class PurePythonInformixBridge:
                     set_socket_timeout(float(previous_socket_timeout))
                 except Exception as error:
                     cleanup_errors.append(error)
-            active_error = sys.exc_info()[1]
             if cleanup_errors:
-                if active_error is None:
-                    # 60: Informix CDC session cleanup failed
-                    raise InformixError(_m(60)) from cleanup_errors[0]
-                for error in cleanup_errors:
-                    add_informix_exception_note(
-                        active_error, f"Informix CDC cleanup also failed: {error}"
-                    )
+                self._settle_poll_cleanup(cleanup_errors, sys.exc_info()[1])
+
+    def _settle_poll_cleanup(
+        self, cleanup_errors: list[BaseException], active_error: BaseException | None
+    ) -> None:
+        # Docstring: What a CDC poll's failed session teardown comes to: a note on the
+        # poll's own failure, or after a whole read a failure of its own (60) -- unless the
+        # connection dropped or stalled, which no reconnect loop retried (the 60 failed the
+        # flow). The session ends with the connection: it is dropped, keeping the slot, so
+        # the next poll reconnects, as a validation's teardown does (41), and the poll
+        # returns what it read.
+
+        if active_error is not None:
+            for error in cleanup_errors:
+                add_informix_exception_note(
+                    active_error, f"Informix CDC cleanup also failed: {error}"
+                )
+            return
+        if not all(_is_timeout_error(e) or reconnectable_error(e) for e in cleanup_errors):
+            # 60: Informix CDC session cleanup failed
+            raise InformixError(_m(60)) from cleanup_errors[0]
+        self.reset_transport()
+        # 483: Informix CDC poll read its changes, but ending its session failed on a
+        # dropped or stalled connection; resetting the transport, which ends the session
+        logging.getLogger(__name__).warning(_m(483), exc_info=cleanup_errors[0])
 
 
 # A variable that holds the bridge's class, so that tests can put another in its place.
@@ -5116,10 +5139,13 @@ class _ScanReads:
     # and the CDC polls are. A read advances nothing until it returns: the scan samples
     # the log around its reads, and sorts a poll's changes after it.
 
+    # The clock too: its reconnect, outside its own best-effort catch, failed a scan at the
+    # finish line on a blip after every page was read.
     _READS = frozenset(
         {
             "boundary_lsn",
             "current_lsn",
+            "current_utc_time",
             "key_rows",
             "read_changes",
             "rows_by_values",
@@ -6682,17 +6708,42 @@ def _fallback_value(literal: Any, operand: str | tuple, context: dict) -> Any:
         # A function can land in another type than its column (see _transform_spark_type),
         # and the fallback lands as the function's values do: ROUND(vcol, 0) is a
         # DECIMAL(38,0) where vcol is a DECIMAL(38,18), and 10^20 fits the one, not the
-        # other; ROUND(int_col, -3) can be a BIGINT.
+        # other; ROUND(int_col, -3) can be a BIGINT. So is ROUND's carry digit: under
+        # decimal(5,2), NVL(ROUND(vcol, 2), 1000) was checked against the DECIMAL(6,2)
+        # and then failed the first NULL against the column's decimal(5,2).
         inner = _transform_spark_type(operand, column, options)
         if isinstance(inner, (IntegerType, LongType)):
             return int(literal)
-        if isinstance(inner, DecimalType) and inner.scale != getattr(
-            _spark_type(column, options), "scale", None
-        ):
+        places = None
+        if isinstance(inner, DecimalType) and inner != _spark_type(column, options):
+            places = inner.scale
+        elif isinstance(inner, StringType) and _is_variable_scale_decimal(column):
+            # As a string, at the places the function's values have: ROUND(vcol, 2)
+            # writes 12.30, so the fallback 12.3 must too, or HASH gave the two digests.
+            places = _number_text_places(operand)
+        if places is not None:
             with localcontext() as decimal_context:
                 decimal_context.prec = 80
-                return literal.quantize(Decimal(1).scaleb(-inner.scale))
+                result = literal.quantize(Decimal(1).scaleb(-places))
+            if isinstance(inner, DecimalType):
+                return result
+            return format(result or abs(result), "f")
     return _number_for_column(literal, column, options)
+
+
+def _number_text_places(operand: str | tuple) -> int | None:
+    # Docstring: The places a number function's text values carry (see _apply_function):
+    # ROUND's and TRUNC's digits, none for MOD, ABS those of what it reads; None for the
+    # column's own text, which drops trailing zeros.
+
+    while not isinstance(operand, str):
+        _, name, arguments = operand
+        if name in ("ROUND", "TRUNC"):
+            return max(int(arguments[1][1]) if len(arguments) > 1 else 0, 0)
+        if name == "MOD":
+            return 0
+        operand = arguments[0]
+    return None
 
 
 def _number_for_column(value: Decimal, column: "Column", options: dict[str, str]) -> Any:
@@ -9972,17 +10023,6 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self._snapshot_staging_location = _validated_volume_location(
             staging_location, "snapshot.staging.location", options
         )
-        self._snapshot_staging_retention_seconds = (
-            int(
-                options.get(
-                    "snapshot.staging.retention.days",
-                    str(_DEFAULT_SNAPSHOT_STAGE_RETENTION_DAYS),
-                )
-            )
-            * 24
-            * 60
-            * 60
-        )
         # Validate numeric configuration without opening a connection.
         for name, default, minimum in (
             ("snapshot.page.size", str(_DEFAULT_SNAPSHOT_PAGE_SIZE), 1),
@@ -10049,6 +10089,18 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 raise ValueError(f"Option '{name}' must be a whole number") from error
             if value < minimum:
                 raise ValueError(f"Option '{name}' must be >= {minimum}")
+        # After the check: before it, a retention of "abc" failed with int()'s own error.
+        self._snapshot_staging_retention_seconds = (
+            int(
+                options.get(
+                    "snapshot.staging.retention.days",
+                    str(_DEFAULT_SNAPSHOT_STAGE_RETENTION_DAYS),
+                )
+            )
+            * 24
+            * 60
+            * 60
+        )
         # The state project's capacity, checked here rather than when a worker first
         # provisions it.
         try:

@@ -6566,6 +6566,50 @@ class LakeflowContractTests(unittest.TestCase):
         ):
             bridge.read_changes([capture], 90, 1, 2)
 
+    def test_a_poll_whose_session_teardown_drops_returns_what_it_read(self):
+        # The read was whole; only ending the session lost the connection. Raised as 60,
+        # which no reconnect loop retries, it failed the flow. The session ends with the
+        # connection, which is reset for the next poll.
+        for error in (
+            informix_module.SqliTransportError("truncated SQLI stream"),
+            TimeoutError("The read operation timed out"),
+        ):
+            with self.subTest(error=type(error).__name__):
+
+                class DroppedCleanupTransport(FakeCdcTransport):
+                    def execute(self, sql, parameters=(), error=error):
+                        if "cdc_endcapture" in sql:
+                            raise error
+                        return super().execute(sql, parameters)
+
+                bridge = object.__new__(PurePythonInformixBridge)
+                bridge.options = {}
+                bridge.transport = DroppedCleanupTransport([[{"op": "TIMEOUT", "lsn": 100}]])
+                bridge.reset_transport = mock.Mock()
+                capture = {
+                    "identity": "demo:app.orders",
+                    "logical_identity": "demo.app.orders",
+                    "columns": ["id"],
+                    "descriptors": [{"name": "id", "type_name": "INTEGER"}],
+                }
+                clean = object.__new__(PurePythonInformixBridge)
+                clean.options = {}
+                clean.transport = FakeCdcTransport([[{"op": "TIMEOUT", "lsn": 100}]])
+                with (
+                    mock.patch.object(informix_module, "CdcFrameParser", RecordParser),
+                    mock.patch.object(
+                        informix_module,
+                        "decode_frame",
+                        side_effect=lambda frame, labels, **_: dict(frame),
+                    ),
+                ):
+                    expected = clean.read_changes([capture], 90, 1, 2)
+                    with self.assertLogs(informix_module.__name__, "WARNING") as logs:
+                        records = bridge.read_changes([capture], 90, 1, 2)
+                self.assertEqual(records, expected)
+                bridge.reset_transport.assert_called_once_with()
+                self.assertIn("ending its session failed", logs.output[0])
+
     def test_native_cdc_cleanup_is_attached_to_primary_error(self):
         class FailedCleanupTransport(FakeCdcTransport):
             def execute(self, sql, parameters=()):
@@ -7194,6 +7238,8 @@ class LakeflowContractTests(unittest.TestCase):
             ssl.SSLCertVerificationError(1, "certificate verify failed"),
             SqliUnsupportedAuthentication("Informix login failed"),
             SqliDescriptorNotImplemented("type 99"),
+            # An ssl.ca.file path that names no file (a dropped mount's is a transport loss).
+            FileNotFoundError(2, "No such file or directory"),
         ):
             with self.subTest(error=type(error).__name__):
                 connector = self._partitioned_connector()
@@ -12925,6 +12971,11 @@ class LakeflowContractTests(unittest.TestCase):
     def test_snapshot_staging_retention_days_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, "snapshot.staging.retention.days.*>= 1"):
             self.connector(**{"snapshot.staging.retention.days": "0"})
+        # A word failed with int()'s own error before the check could name the option.
+        with self.assertRaisesRegex(
+            ValueError, "Option 'snapshot.staging.retention.days' must be a whole number"
+        ):
+            self.connector(**{"snapshot.staging.retention.days": "abc"})
 
     def test_retention_sweep_removes_stale_runs_and_keeps_fresh(self):
         # Build the staging layout by hand with one old run and one fresh run, then run
@@ -24142,13 +24193,32 @@ class CurrentUtcTimeTests(unittest.TestCase):
             self.assertIsNone(bridge.current_utc_time())
             self.assertEqual(bridge.transport.execute.call_count, 2)
 
-    def test_a_dropped_connection_is_retried_on_the_next_probe(self):
-        bridge = self._bridge(informix_module.SqliTransportError("truncated SQLI stream"))
+    def test_a_dropped_connection_is_asked_again_at_once(self):
+        # An index-ordered scan's time of a key's last read, or of its end, was lost to one.
+        drop = informix_module.SqliTransportError("truncated SQLI stream")
+        bridge = self._bridge([drop, [{"utc": 1700000000}]])
 
+        self.assertEqual(bridge.current_utc_time(), 1700000000)
+        self.assertEqual(bridge.transport.execute.call_count, 2)
+        # A source that stays down gives no time, and is asked again on the next probe.
+        bridge = self._bridge(drop)
         self.assertIsNone(bridge.current_utc_time())
         self.assertFalse(bridge._connected)
-        self.assertIsNone(bridge.current_utc_time())
         self.assertEqual(bridge.transport.execute.call_count, 2)
+        self.assertIsNone(bridge.current_utc_time())
+        self.assertEqual(bridge.transport.execute.call_count, 4)
+
+    def test_an_index_scan_retries_its_clock_reads_on_a_drop(self):
+        # Its reconnect, outside the probe's own catch, failed a scan at the finish line.
+        connector = mock.Mock()
+        connector._bridge.current_utc_time = mock.Mock(return_value=7)
+        reads = informix_module._ScanReads(connector, mock.Mock())
+        reads.current_utc_time()
+        connector._snapshot_read_with_reconnect.assert_called_once()
+        self.assertEqual(
+            connector._snapshot_read_with_reconnect.call_args.kwargs["operation"],
+            "scan current_utc_time",
+        )
 
 
 class KeyIndexDirectionsTests(unittest.TestCase):
@@ -27444,6 +27514,35 @@ class UnloadHelperTests(unittest.TestCase):
             informix_module._fallback_value(Decimal("1.5"), "vcol", context).as_tuple().exponent,
             -18,
         )
+
+    def test_an_nvl_fallback_over_round_lands_as_rounds_values_do(self):
+        # Under decimal(5,2) ROUND(vcol, 2) lands as DECIMAL(6,2), for its carry: the
+        # fallback 1000 was checked against that, then failed the first NULL against the
+        # column's decimal(5,2). Under string, ROUND writes 12.30 and the fallback 12.3
+        # landed as 12.3, so HASH gave the one number two digests.
+        column = informix_module.Column.parse(
+            {"name": "vcol", "type_name": "DECIMAL", "precision": 16, "scale": 255}
+        )
+
+        def fallback(literal, operand, kind):
+            context = {"columns": {"vcol": column}, "options": {"decimal.variable.type": kind}}
+            return informix_module._fallback_value(Decimal(literal), operand, context)
+
+        def call(name, *digits):
+            return ("fn", name, ("vcol", *(("number", Decimal(d)) for d in digits)))
+
+        self.assertEqual(fallback("1000", call("ROUND", 2), "decimal(5,2)"), Decimal("1000.00"))
+        rounded = informix_module._apply_function("ROUND", "12.3", [Decimal(2)], {})
+        self.assertEqual(rounded, "12.30")
+        self.assertEqual(fallback("12.3", call("ROUND", 2), "string"), rounded)
+        self.assertEqual(fallback("12.3", call("TRUNC", 2), "string"), "12.30")
+        self.assertEqual(fallback("120", call("ROUND", -1), "string"), "120")
+        self.assertEqual(fallback("7", call("MOD", 5), "string"), "7")
+        self.assertEqual(fallback("0", call("ROUND", 1), "string"), "0.0")
+        # ABS keeps what it reads; the column alone drops trailing zeros, as its values do.
+        self.assertEqual(fallback("12.3", ("fn", "ABS", (call("ROUND", 2),)), "string"), "12.30")
+        self.assertEqual(fallback("12.30", ("fn", "ABS", ("vcol",)), "string"), "12.3")
+        self.assertEqual(fallback("12.30", "vcol", "string"), "12.3")
 
     def test_a_password_login_does_not_run_a_pam_provider_factory(self):
         # The factory answers PAM challenges only: under a password login it was imported

@@ -416,6 +416,33 @@ def _unpack(fmt: str, data: memoryview):
 
 
 def decode_packed_decimal(data: bytes, precision: int, scale: int) -> Decimal | None:
+    # Docstring: A packed DECIMAL(precision, scale) (scale 0xFF: floating), refused when
+    # its digits don't fit the type. Informix stores no value that doesn't (a DECIMAL(4)
+    # of 1.23456 is 1.235, live-checked), but the wire has room for more: the exponent
+    # byte goes past the integer digits, the last byte past the scale. A record a reused
+    # log replays, read under this column's layout, fails on them (message 11), not
+    # rounded or past the type into Spark.
+
+    value = _packed_decimal_value(data, precision, scale)
+    if value is None:
+        return None
+    with localcontext() as context:
+        context.prec = 46
+        if scale == 0xFF:
+            if len(value.normalize().as_tuple().digits) > precision:
+                raise CdcProtocolError(f"packed decimal {value} exceeds DECIMAL({precision})")
+            return value
+        result = None
+        if value.adjusted() < precision - scale:
+            result = value.quantize(Decimal(1).scaleb(-scale))
+        if result != value:
+            raise CdcProtocolError(f"packed decimal {value} exceeds DECIMAL({precision},{scale})")
+        return result
+
+
+def _packed_decimal_value(data: bytes, precision: int, scale: int) -> Decimal | None:
+    # Docstring: The exact value of a packed decimal, every digit the wire holds.
+
     variable_scale = scale == 0xFF
     if not 1 <= precision <= 38 or not (variable_scale or 0 <= scale <= precision):
         raise UnsupportedCdcType(f"invalid DECIMAL({precision},{scale}) metadata")
@@ -444,11 +471,7 @@ def decode_packed_decimal(data: bytes, precision: int, scale: int) -> Decimal | 
             Decimal(digit) * (Decimal(100) ** (exponent - index - 1))
             for index, digit in enumerate(digits)
         )
-        if not positive:
-            value = -value
-        if variable_scale:
-            return value
-        return value.quantize(Decimal(1).scaleb(-scale))
+        return value if positive else -value
 
 
 def datetime_size(qualifier: int) -> int:
@@ -685,9 +708,16 @@ def decode_interval(data: memoryview, qualifier: int) -> tuple[str | None, int]:
     total = (qualifier >> 8) & 0xFF
     size = (total + (fraction & 1) + 3) // 2
     _need(data, size)
-    value = decode_packed_decimal(bytes(data[:size]), total, fraction)
+    # Not decode_packed_decimal: the fields' grid puts more integer digits on the wire
+    # than the qualifier counts (HOUR TO MINUTE's 10:30 is 103000).
+    value = _packed_decimal_value(bytes(data[:size]), total, fraction)
     if value is None:
         return None, size
+    with localcontext() as context:
+        context.prec = 46
+        if value != value.quantize(Decimal(1).scaleb(-fraction)):
+            # Rounded, SECOND TO SECOND's 12.60 read as 13.
+            raise CdcProtocolError(f"INTERVAL holds digits below its fraction: {value}")
     negative = value < 0
     magnitude = -value if negative else value
     text = "-" if negative and magnitude else ""

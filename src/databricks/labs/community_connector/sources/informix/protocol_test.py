@@ -198,6 +198,36 @@ class FrameTests(unittest.TestCase):
         )
         self.assertEqual(decode_value(memoryview(b"\0\0\0"), column), (None, 3))
 
+    def test_a_packed_decimal_past_its_type_is_refused(self):
+        # The wire has room for digits the type doesn't hold: the exponent byte past the
+        # integer digits, the last byte past the scale. Rounded, or let through to fail in
+        # Spark, a record a reused log replays was not told by its decode (message 11).
+        # Informix stores none: a DECIMAL(4) of 1.23456 is 1.235 (live-checked).
+        for packed, precision, scale, fits in (
+            ("c20100", 4, 2, None),  # 100.00 in a DECIMAL(4,2)
+            ("d40c22", 4, 2, None),  # 12 x 100^19 and more
+            ("c10c22", 4, 2, Decimal("12.34")),
+            ("c00c2263", 5, 2, None),  # 0.123499: digits below the scale
+            ("c00c0000", 5, 2, Decimal("0.12")),
+            ("c10c2233", 5, 3, None),  # 12.3451
+            ("c10c2232", 5, 3, Decimal("12.345")),
+            ("ff636363", 4, 0xFF, None),  # six digits in a DECIMAL(4)
+            ("c10c2232", 4, 0xFF, None),  # 12.345
+            ("c10c2200", 4, 0xFF, Decimal("12.34")),
+            ("3e5742", 4, 2, Decimal("-12.34")),
+        ):
+            with self.subTest(packed=packed, precision=precision, scale=scale):
+                column = ColumnDescriptor("d", "DECIMAL", precision=precision, scale=scale)
+                raw = bytes.fromhex(packed)
+                if fits is None:
+                    with self.assertRaisesRegex(CdcProtocolError, "exceeds DECIMAL"):
+                        decode_value(memoryview(raw), column)
+                    with self.assertRaisesRegex(SqliProtocolError, "result column 'd'"):
+                        result = ResultColumn("d", 0, 5, 0, precision << 8 | scale)
+                        _decode_result_value(raw, result, "utf-8")
+                else:
+                    self.assertEqual(decode_value(memoryview(raw), column), (fits, len(raw)))
+
     def test_ordinary_decimal_with_omitted_scale_accepts_null(self):
         column = ResultColumn("prefix", 0, 5, 0, 0x05FF)
 
@@ -534,6 +564,9 @@ class IntervalTests(unittest.TestCase):
             (0x0468, "c20a1e", "below its last field"),  # seconds in HOUR TO MINUTE
             (0x0346, "c50100", "exceeds 1 digits"),  # DAY(1) TO HOUR, 100 days
             (0x03CD, "c1013c", "above its fraction"),  # FRACTION TO FRACTION(3), 1.016
+            # SECOND(4) TO SECOND holding 12.60: rounded, it read as 13.
+            (0x04AA, "c10c3c", "below its fraction"),
+            (0x01CB, "c033", "below its fraction"),  # FRACTION TO FRACTION(1), .51
         ):
             with self.subTest(packed):
                 raw = bytes.fromhex(packed)
@@ -1376,6 +1409,51 @@ class SqliPacketTests(unittest.TestCase):
         self.assertIs(error, bad)
         self.assertEqual(create_context.call_count, 1)
         open_socket.assert_not_called()
+
+    def test_a_ca_file_path_that_names_no_file_fails_at_once(self):
+        # Wrapped as a transport loss, a typo or a directory was retried by every reconnect
+        # loop for half a minute. A file missing off a Volume may be a dropped mount.
+        module = "databricks.labs.community_connector.sources.informix.sqli"
+        for path, error, retried in (
+            ("/etc/ssl/ca.pem", FileNotFoundError(2, "No such file or directory"), False),
+            ("/Volumes/c/s/v/ca.pem", IsADirectoryError(21, "Is a directory"), False),
+            ("/etc/ca.pem/x", NotADirectoryError(20, "Not a directory"), False),
+            ("/Volumes/c/s/v/ca.pem", FileNotFoundError(2, "No such file or directory"), True),
+        ):
+            with self.subTest(path=path, error=type(error).__name__):
+                client = InformixSqliClient(
+                    "host", 9088, "db", "user", "secret", server_name="server", ca_file=path
+                )
+                with (
+                    patch(f"{module}._CA_FILE_RETRY_SECONDS", 0),
+                    patch("ssl.create_default_context", side_effect=error) as create_context,
+                    patch("socket.create_connection") as open_socket,
+                    self.assertRaises(_sqli.SqliTransportError if retried else OSError) as raised,
+                ):
+                    client._connect_once("host", 9088, "server", float("inf"))
+                self.assertEqual(create_context.call_count, 3 if retried else 1)
+                self.assertEqual(_sqli.reconnectable_error(raised.exception), retried)
+                if not retried:
+                    self.assertIs(raised.exception, error)
+                open_socket.assert_not_called()
+
+    def test_ca_file_retries_stop_at_the_login_deadline(self):
+        # The waits ran past authentication.login.timeout: a 0.2 s login slept 1.5 s.
+        module = "databricks.labs.community_connector.sources.informix.sqli"
+        client = InformixSqliClient(
+            "host", 9088, "db", "user", "secret", server_name="server", ca_file="/v/ca.pem"
+        )
+        refused = PermissionError(1, "Operation not permitted")
+        with (
+            patch(f"{module}.time.monotonic", return_value=100.0),
+            patch(f"{module}.time.sleep") as sleep,
+            patch("ssl.create_default_context", side_effect=refused) as create_context,
+            self.assertRaises(_sqli.SqliTransportError) as raised,
+        ):
+            client._connect_once("host", 9088, "server", 100.2)
+        sleep.assert_not_called()
+        self.assertEqual(create_context.call_count, 1)
+        self.assertIs(raised.exception.__cause__, refused)
 
     def test_plaintext_connection_does_not_create_or_wrap_tls_context(self):
         raw = Mock()

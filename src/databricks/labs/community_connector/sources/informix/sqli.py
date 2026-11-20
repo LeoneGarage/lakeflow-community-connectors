@@ -747,11 +747,15 @@ _UNREACHABLE_ERRNOS = frozenset({errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EN
 
 
 # What no retry helps: a certificate that failed verification, a login refused (bad
-# credentials, a login deadline, a redirect not allowed), a type the client can't decode.
+# credentials, a login deadline, a redirect not allowed), a type the client can't decode,
+# an ssl.ca.file path that names no file (see _ca_file_misnamed).
 CONFIGURATION_ERRORS = (
     ssl.SSLCertVerificationError,
     SqliUnsupportedAuthentication,
     SqliDescriptorNotImplemented,
+    FileNotFoundError,
+    IsADirectoryError,
+    NotADirectoryError,
 )
 
 
@@ -1270,6 +1274,20 @@ def _fixed_result_size(column: ResultColumn) -> int:
 # How long a TLS connection waits before its first and second retry of reading
 # ssl.ca.file (twice this, the second time).
 _CA_FILE_RETRY_SECONDS = 0.5
+# The FUSE mounts an ssl.ca.file can be read through, where a dropped mount can hide a file.
+_FUSE_PATH_PREFIXES = ("/Volumes/", "/Workspace/", "/dbfs/")
+
+
+def _ca_file_misnamed(error: OSError, path: str | None) -> bool:
+    # Docstring: Whether ``error`` reading ssl.ca.file says the path names no file, which
+    # no retry finds: a directory, or a file missing off a FUSE mount. Wrapped as a
+    # transport loss, each reconnect loop retried a typo for half a minute.
+
+    if isinstance(error, (IsADirectoryError, NotADirectoryError)):
+        return True
+    return isinstance(error, FileNotFoundError) and not str(path or "").startswith(
+        _FUSE_PATH_PREFIXES
+    )
 
 
 @dataclass(eq=False, repr=False)
@@ -1395,24 +1413,7 @@ class InformixSqliClient:
     ) -> None:
         context = self.ssl_context
         if self.tls and context is None:
-            # ssl.ca.file can sit on a Volume, read through its FUSE mount, which refuses
-            # a read now and then: a failed read is tried twice more, before the socket is
-            # opened. Contents that don't load (ssl.SSLError) fail at once.
-            for attempt in range(3):
-                try:
-                    context = ssl.create_default_context(cafile=self.ca_file)
-                    break
-                except ssl.SSLError:
-                    raise
-                except OSError as error:
-                    if attempt == 2:
-                        # A transport loss, so a reconnect tries again: a mount dropped for
-                        # longer (ENOTCONN, seen on serverless) failed the stream reader's
-                        # lookup at once. The OSError stays the cause.
-                        raise SqliTransportError(
-                            f"ssl.ca.file could not be read: {error!r}"
-                        ) from error
-                    time.sleep(_CA_FILE_RETRY_SECONDS * (attempt + 1))
+            context = self._ca_file_context(deadline)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise SqliUnsupportedAuthentication("Informix login deadline exceeded")
@@ -1620,6 +1621,30 @@ class InformixSqliClient:
         ):
             raise SqliProtocolError("SQLI database session is not open")
         return self._input, self._output
+
+    def _ca_file_context(self, deadline: float) -> ssl.SSLContext:
+        # Docstring: The TLS context, ssl.ca.file loaded. The file can sit on a Volume, read
+        # through its FUSE mount, which refuses a read now and then: a failed read is tried
+        # twice more, before the socket is opened, if the login deadline leaves the time.
+        # Contents that don't load (ssl.SSLError), or a path that names no file, fail at once.
+
+        attempt = 0
+        while True:
+            try:
+                return ssl.create_default_context(cafile=self.ca_file)
+            except ssl.SSLError:
+                raise
+            except OSError as error:
+                if _ca_file_misnamed(error, self.ca_file):
+                    raise
+                attempt += 1
+                delay = _CA_FILE_RETRY_SECONDS * attempt
+                if attempt == 3 or time.monotonic() + delay >= deadline:
+                    # A transport loss, so a reconnect tries again: a mount dropped for
+                    # longer (ENOTCONN, seen on serverless) failed the stream reader's
+                    # lookup at once. The OSError stays the cause.
+                    raise SqliTransportError(f"ssl.ca.file could not be read: {error!r}") from error
+                time.sleep(delay)
 
     def set_socket_timeout(self, timeout: float) -> None:
         # Docstring: Update the timeout used by the live SQLI socket.

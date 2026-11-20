@@ -1521,7 +1521,9 @@ an object from column name to an expression over that column:
   integer column, `LENGTH`, `CHAR_LENGTH`, `YEAR`, `MONTH`, `DAY`, or `WEEKDAY`, or a
   variable-scale `DECIMAL` under `decimal.variable.type: integer`, the fallback must be a
   whole number, and it must fit that type (a `DECIMAL(5,2)` holds up to 999.99). It is
-  rounded to that type's scale, so `NVL(ROUND(vcol, 0), 1.5)` lands 2.
+  rounded to that type's scale, so `NVL(ROUND(vcol, 0), 1.5)` lands 2. Under `string` it
+  is written with the places the function's values have, so `NVL(ROUND(vcol, 2), 12.3)`
+  lands `12.30`, as a value of 12.3 does.
 - **Order:** `row_filter`, the column selection, and the key options see source values;
   `rename_columns` applies after, so a renamed column's transform still uses its source
   name. Change images, deletes, and append-path tombstones are transformed like
