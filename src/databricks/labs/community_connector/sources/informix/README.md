@@ -211,7 +211,7 @@ other.
 | `snapshot.split.bytes` | No | `52428800` | Per-table (also connection-scope) target byte size for each parallel `.unl` split — each executor reads roughly this many bytes, snapped up to the next record boundary. Splitting by bytes rather than rows lets the connector plan splits with a few small reads instead of scanning the whole file. Positive integer; default 50 MiB. Only meaningful with `snapshot.source`. |
 | `snapshot.gzip.records.per.batch` | No | `0` | Per-table (also connection-scope) number of records of a gzip `.unl.gz` file to serve per microbatch, so a gzip file resumes mid-file after a failure instead of being re-read whole. `0` (default) keeps today's behaviour: each gzip file is one split, read whole on an executor in one microbatch. With a positive value, each gzip file is served on the driver that many records per microbatch, and the checkpoint records how many of its records are done. The driver keeps the file's decompressor open between microbatches, so normal progress is still one pass over the file; after a restart it reopens the file and skips the records already ingested, which re-decompresses that prefix but never re-ingests it. Each microbatch's rows pass through the driver, and a gzip file is no longer read in parallel with other splits, so this suits a few large gzip files rather than many small ones; keep the value moderate, for example tens of thousands to a few hundred thousand records. Plain `.unl` files still fan out to executors. Clearing the option while a file is part-served finishes that file in one microbatch. A file replaced while part-served fails the read with a full-refresh error rather than resuming into different content. Applies to the partitioned reader (the default). Only meaningful with `snapshot.source`. |
 | `snapshot.unl.delimiter` | No | `\|` | Per-table (also connection-scope) field delimiter for a `snapshot.source` extract; a single character. Default `\|` (Informix UNLOAD). Set it when the extract is **HPL DELIMITED** output whose ipload job uses a non-pipe delimiter — HPL does not honor `DBDELIMITER`, so the delimiter is whatever the job set. An HPL extract whose last column can be NULL needs a delimiter other than `\|`: such a row ends in the delimiter, which under `\|` reads as a truncated UNLOAD record and fails. Record terminator is always newline. Must differ from `snapshot.unl.escape`. Only meaningful with `snapshot.source`. |
-| `snapshot.unl.escape` | No | `\` | Per-table (also connection-scope) escape character for a `snapshot.source` extract; a single character. Default `\` (UNLOAD backslash escaping: `\n`/`\r`/`\t` → control chars, `\<other>` → literal). Set it to match an HPL job's escape character, or to the **empty string** to disable escape processing for an HPL job that writes no escapes. Must differ from `snapshot.unl.delimiter`. Only meaningful with `snapshot.source`. |
+| `snapshot.unl.escape` | No | `\` | Per-table (also connection-scope) escape character for a `snapshot.source` extract; a single character. Default `\` (UNLOAD backslash escaping: `\n`/`\r`/`\t` → control chars, `\<other>` → literal). Set it to match an HPL job's escape character, or to `none` to disable escape processing for an HPL job that writes no escapes (an empty value is no value: a connection form sends it for a field left blank). Must differ from `snapshot.unl.delimiter`. Only meaningful with `snapshot.source`. |
 | `table.migration` | No | `false` | Per-table (also connection-scope) boolean. When `true`, the table runs a two-run checkpoint handoff instead of its normal read, so it can move to a new Lakeflow flow — an SCD Type 1 → append-only switch, or a destination relocation — **without re-snapshotting**. Orthogonal to `snapshot.mode`, which the table keeps unchanged. Migration never streams: every read records a checkpoint, emits no rows, and stops. Clearing it (Restore) resumes normal reads from the recorded offset. See [Migrating a table without a re-snapshot](#migrating-a-table-without-a-re-snapshot). Accepts `true`/`false`. |
 | `snapshot.page.size` | No | `20000` | Rows per page for **keyed** tables — keyset-paged incremental chunks and the keyed blocking `initial` snapshot; minimum `1`. Pages are read under one repeatable-read transaction and delivered through checkpointed Lakeflow microbatches. A keyless `initial` snapshot uses `keyless.snapshot.page.size` instead. |
 | `keyless.snapshot.page.size` | No | `50000` | Rows per immutable staged Volume page for a **keyless** `initial` snapshot (an append-only keyless table with `snapshot.mode=initial`); minimum `1`. Such a table drains positionally (no seek cursor), so a larger page means fewer manifest entries and round trips for the same rows. A per-page byte ceiling still applies, and `snapshot.max.rows`/`snapshot.max.bytes` cap the whole drain. |
@@ -733,10 +733,13 @@ Requirements and limits:
 - A key that keeps changing through five re-reads fails the snapshot; run it when the
   table is quieter.
 - The snapshot ends by waiting until Informix CDC shows it has read the log past the end
-  of the scan, so that step 2 has seen every change. On a table with no changes that takes
-  until the server's next checkpoint, so the wait stops after 30 seconds. If a change
-  that step 2 should have settled then reaches the stream later, the stream fails and
-  asks for a full refresh instead of guessing whether the snapshot holds it. A change
+  of the scan, so that step 2 has seen every change, however late CDC hands them over. On
+  a table with no changes that takes until the server's next checkpoint (five minutes
+  apart by default), so the wait stops after 10 minutes, and after 30 seconds when
+  nothing has been written to the log since the scan ended, as such a log may get no
+  checkpoint to show it. If a change that step 2 should have settled reaches the stream later still, the
+  stream fails and asks for a full refresh instead of guessing whether the snapshot holds
+  it. A change
   that committed after the scan by the source's clock is not such a change, even when
   it is still on the log page the scan ended on. That needs `DBINFO('utc_current')` on
   the source; without it, the first change to a quiet table after its snapshot can stop
@@ -1521,9 +1524,10 @@ an object from column name to an expression over that column:
   integer column, `LENGTH`, `CHAR_LENGTH`, `YEAR`, `MONTH`, `DAY`, or `WEEKDAY`, or a
   variable-scale `DECIMAL` under `decimal.variable.type: integer`, the fallback must be a
   whole number, and it must fit that type (a `DECIMAL(5,2)` holds up to 999.99). It is
-  rounded to that type's scale, so `NVL(ROUND(vcol, 0), 1.5)` lands 2. Under `string` it
-  is written with the places the function's values have, so `NVL(ROUND(vcol, 2), 12.3)`
-  lands `12.30`, as a value of 12.3 does.
+  rounded to that type's scale, halves away from zero as `ROUND` rounds them, so
+  `NVL(ROUND(vcol, 0), 2.5)` lands 3. Under `string` it is written with at least the
+  places the function's values have, so `NVL(ROUND(vcol, 2), 12.3)` lands `12.30`, as a
+  value of 12.3 does, and `NVL(ROUND(vcol, 2), 12.345)` lands `12.345`.
 - **Order:** `row_filter`, the column selection, and the key options see source values;
   `rename_columns` applies after, so a renamed column's transform still uses its source
   name. Change images, deletes, and append-path tombstones are transformed like
@@ -1876,7 +1880,7 @@ unlike `UNLOAD`, HPL does not honor `DBDELIMITER`), and it writes no trailing de
 parser already tolerates a missing trailing delimiter, and `||` is NULL for both. Set
 `snapshot.unl.delimiter` and `snapshot.unl.escape` (each a single character; both default to
 `UNLOAD`'s `|` and `\`) to match the HPL job when they differ from those defaults; set
-`snapshot.unl.escape=""` to disable escape processing for an HPL job that writes no escapes.
+`snapshot.unl.escape=none` to disable escape processing for an HPL job that writes no escapes.
 
 **Give an HPL job a delimiter other than `|` when the table's last column can be NULL.**
 With no trailing delimiter, a row whose last column is NULL ends in the delimiter: `1|x|`

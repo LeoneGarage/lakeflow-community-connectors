@@ -174,6 +174,11 @@ class SqliRedirect(SqliUnsupportedAuthentication):
         self.detail = detail
 
 
+class SqliInvalidCaFile(SqliProtocolError):
+    # Docstring: ssl.ca.file read, but holds no certificate that loads: no retry helps.
+    pass
+
+
 class SqliDescriptorNotImplemented(SqliProtocolError):
     pass
 
@@ -753,6 +758,7 @@ CONFIGURATION_ERRORS = (
     ssl.SSLCertVerificationError,
     SqliUnsupportedAuthentication,
     SqliDescriptorNotImplemented,
+    SqliInvalidCaFile,
     FileNotFoundError,
     IsADirectoryError,
     NotADirectoryError,
@@ -1632,8 +1638,10 @@ class InformixSqliClient:
         while True:
             try:
                 return ssl.create_default_context(cafile=self.ca_file)
-            except ssl.SSLError:
-                raise
+            except ssl.SSLError as error:
+                # Not as itself: an SSLError is a handshake cut short, which every reconnect
+                # loop retried, for half a minute each, on a file that fails the same way.
+                raise SqliInvalidCaFile(f"ssl.ca.file does not load: {error}") from error
             except OSError as error:
                 if _ca_file_misnamed(error, self.ca_file):
                     raise
@@ -2252,6 +2260,7 @@ __all__ = [
     "InformixSqliClient",
     "PasswordAuthenticationProvider",
     "SqliDescriptorNotImplemented",
+    "SqliInvalidCaFile",
     "SqliSessionRejected",
     "SqliProtocolError",
     "SqliTransportError",

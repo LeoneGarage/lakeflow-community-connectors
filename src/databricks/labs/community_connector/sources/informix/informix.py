@@ -617,11 +617,9 @@ _INDEX_SCAN_KEY_TYPES = frozenset(
 )
 # Rows read between two looks at the table's changes while the scan runs.
 _INDEX_SCAN_FOLLOW_ROWS = 200_000
-# How long a poll for changes may go without getting there, and how long the scan waits at
-# its end for proof that the log was read through it. An idle session reports the position
-# of the last checkpoint, so on a quiet table the proof takes until the next one; the scan
-# does not wait for it longer than this, and the stream then fails on a change the proof
-# would have brought (see _drop_scanned_changes).
+# How long a poll for changes may go without getting there, which is also how long the scan
+# waits at its end for proof that the log was read through it; and how long it waits for
+# that on a log nothing has written to since (see follow in _index_scan_snapshot).
 _INDEX_SCAN_FOLLOW_SECONDS = 600
 _INDEX_SCAN_PROOF_SECONDS = 30
 # How long one of the follower's polls may read before it returns for the waits to be checked.
@@ -737,14 +735,17 @@ _UNL_SCAN_CHUNK_BYTES = 4 << 20
 # delimiter. These per-table (connection-fallback) options let the file serve parse an
 # HPL DELIMITED extract whose delimiter/escape differ from UNLOAD's `|`/backslash
 # defaults; the defaults leave a plain UNLOAD extract parsed exactly as before. Both are
-# a single character (an empty escape disables escape processing for an HPL job that
-# writes none). The record terminator stays a physical newline; HPL's fixed-position,
+# a single character; the escape ``none`` disables escape processing for an HPL job that
+# writes none. Not "": a form sends that for a field nobody filled in, which then turned
+# escaping off on every load of the connection (an empty VARCHAR read as a backslash).
+# The record terminator stays a physical newline; HPL's fixed-position,
 # COBOL, and Informix-internal binary formats are not supported (they are not
 # self-describing) -- configure the HPL job to emit newline-terminated DELIMITED output.
 _UNL_DELIMITER_OPTION = "snapshot.unl.delimiter"
 _UNL_ESCAPE_OPTION = "snapshot.unl.escape"
 _UNL_DEFAULT_DELIMITER = "|"
 _UNL_DEFAULT_ESCAPE = "\\"
+_UNL_NO_ESCAPE = "none"
 # Informix integer/float type names, for mapping UNLOAD text back to Python values.
 _UNLOAD_INT_TYPES = frozenset(
     {"INTEGER", "INT", "SMALLINT", "BIGINT", "INT8", "SERIAL", "SERIAL8", "BIGSERIAL"}
@@ -1743,17 +1744,21 @@ def _driver_registration(spark_session: Any | None = None) -> dict[str, Any]:
     now = time.monotonic()
     if held is None or (running is not None and running != held):
         capture_workspace_credentials()
-        _CREDENTIAL_CAPTURED["at"] = now
+        _CREDENTIAL_CAPTURED.update(at=now, pid=os.getpid())
         scope, request = _registration_identity(spark_session)
         _INFORMIX_REGISTRATION_CONTEXT["request"] = request
         _INFORMIX_REGISTRATION_CONTEXT["scope"] = scope
-    elif now - _CREDENTIAL_CAPTURED.get("at", now) >= _CREDENTIAL_RECAPTURE_SECONDS:
+    elif (
+        _CREDENTIAL_CAPTURED.get("pid") == os.getpid()
+        and now - _CREDENTIAL_CAPTURED["at"] >= _CREDENTIAL_RECAPTURE_SECONDS
+    ):
         # The same update, or a session outside a pipeline, packing a registration again
         # (a flow restarted, say, or a connector pickled for a worker, which asks with no
         # session): the token captured when it began lasts about an hour, and a process
         # first reaching the control plane after that failed with it. Captured again here,
-        # in the process that captured it, the only one with a capture time; a process that
-        # was handed the credentials hands the same on. A failed capture keeps the one held.
+        # in the process that captured it (the merged file's globals carry the capture
+        # time to every process with its code, but not the process); a process that was
+        # handed the credentials hands the same on. A failed capture keeps the one held.
         capture_workspace_credentials()
         _CREDENTIAL_CAPTURED["at"] = now
     return {
@@ -1773,6 +1778,8 @@ def _install_registration(state: dict[str, Any]) -> None:
     if state.get("scope"):
         _INFORMIX_REGISTRATION_CONTEXT["scope"] = state["scope"]
         _INFORMIX_REGISTRATION_CONTEXT["request"] = state.get("request")
+        # Whole: merged in, an earlier update's token stayed where this one carried none.
+        _CAPTURED_WORKSPACE.clear()
     if state.get("workspace"):
         _CAPTURED_WORKSPACE.update(state["workspace"])
 
@@ -1920,6 +1927,9 @@ else:
     # along. Doing it in the merged-deployment branch is deliberate: a plain
     # package import is not a driver and has nothing to capture.
     capture_workspace_credentials()
+    # When and where, so that the driver captures again as a package's does (see
+    # _driver_registration): it was never, and the token lasts about an hour.
+    _CREDENTIAL_CAPTURED.update(at=time.monotonic(), pid=os.getpid())
     # The merged source's own parameter: the framework's data source, merged after this
     # file, registers through it and is shortened then (_ShortenedRegistrations).
     if locals().get("spark") is not None:
@@ -3714,7 +3724,9 @@ class PurePythonInformixBridge:
         # units, for stamping snapshot rows' ``_informix_commit_time``.
         #
         # Best-effort: a source that does not support ``DBINFO('utc_current')`` yields NULL
-        # commit-time on snapshot rows rather than failing the read.
+        # commit-time on snapshot rows rather than failing the read. A reconnect that fails
+        # raises, for the caller's reconnect loop (an index-ordered scan's); the snapshot's
+        # stamp (_source_utc_time) takes that for None.
 
         if time.monotonic() < getattr(self, "_utc_time_retry_at", 0.0):
             return None
@@ -6404,6 +6416,7 @@ def _expression_kind(
         # And one that type can hold. Left unchecked, the mistake showed only when a row
         # with a NULL arrived, as a failed batch. A variable-scale DECIMAL's type is the
         # decimal options' to say, so it is checked only when they are known.
+        # An integer type holds one more below zero than above: an INT8's -2^63 was refused.
         if isinstance(inner, IntegerType):
             limit = Decimal((1 << 31) - 1)
         elif isinstance(inner, LongType):
@@ -6419,8 +6432,13 @@ def _expression_kind(
                 )
         else:
             limit = None
-        # copy_abs, not abs(): that rounds to the context's 28 digits as well.
-        if limit is not None and fallback.copy_abs() > limit:
+        # copy_abs, not abs(): that rounds to the context's 28 digits as well, as a sum
+        # with the limit would.
+        if (
+            limit is not None
+            and fallback.copy_abs() > limit
+            and not (isinstance(inner, (IntegerType, LongType)) and fallback == -limit - 1)
+        ):
             # 450: Option '{}' gives {} the fallback {} for {}, which is more than a {}
             # column holds
             raise InformixError(
@@ -6720,15 +6738,25 @@ def _fallback_value(literal: Any, operand: str | tuple, context: dict) -> Any:
         elif isinstance(inner, StringType) and _is_variable_scale_decimal(column):
             # As a string, at the places the function's values have: ROUND(vcol, 2)
             # writes 12.30, so the fallback 12.3 must too, or HASH gave the two digests.
+            # Only padded: a string holds 12.345 as given.
             places = _number_text_places(operand)
+            if places is not None:
+                places = max(places, -literal.as_tuple().exponent)
         if places is not None:
-            with localcontext() as decimal_context:
-                decimal_context.prec = 80
-                result = literal.quantize(Decimal(1).scaleb(-places))
+            result = _rounded_half_up(literal, places)
             if isinstance(inner, DecimalType):
                 return result
             return format(result or abs(result), "f")
     return _number_for_column(literal, column, options)
+
+
+def _rounded_half_up(value: Decimal, places: int) -> Decimal:
+    # Docstring: ``value`` at ``places``, a half away from zero as ROUND rounds one: under
+    # the default half-even, NVL(ROUND(vcol, 0), 2.5) landed 2 where ROUND lands 3.
+
+    with localcontext() as decimal_context:
+        decimal_context.prec = 80
+        return value.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
 
 
 def _number_text_places(operand: str | tuple) -> int | None:
@@ -6757,17 +6785,17 @@ def _number_for_column(value: Decimal, column: "Column", options: dict[str, str]
         return _float32(float(value)) if smallfloat else float(value)
     if column.type_name in {"DECIMAL", "NUMERIC", "MONEY"}:
         if _is_variable_scale_decimal(column):
-            return _coerce_variable_decimal_value(
-                value, column, _variable_decimal_target(column, options)
-            )
+            target = _variable_decimal_target(column, options)
+            if target[0] == "decimal":
+                # Rounded as below, not cut as the column's own values are.
+                value = _rounded_half_up(value, target[2] or 0)
+            return _coerce_variable_decimal_value(value, column, target)
         if column.scale is not None:
             scale = column.scale
         else:
             scale = 2 if column.type_name == "MONEY" else 0
-        with localcontext() as decimal_context:
-            # Past the default 28 digits: a DECIMAL holds up to 32.
-            decimal_context.prec = 80
-            return value.quantize(Decimal(1).scaleb(-scale))
+        # Past the default 28 digits (a DECIMAL holds up to 32), and as ROUND rounds.
+        return _rounded_half_up(value, scale)
     return value
 
 
@@ -9945,9 +9973,9 @@ def _options_set(options: Any) -> Any:
     # Docstring: A table's options as the connector reads them: without the ones left empty,
     # under lower-case names. An empty value is one not set: a form sends "" for a field
     # nobody filled in. Read as set, it shadowed the connection's value with the default,
-    # or failed as an invalid one. The escape character is the one whose empty value means
-    # something. Only "" counts: a value of blanks is something typed, and is judged as
-    # given (a tab is a delimiter, and a column list of one blank is a mistake to report).
+    # or failed as an invalid one. Only "" counts: a value of blanks is something typed, and
+    # is judged as given (a tab is a delimiter, and a column list of one blank is a mistake
+    # to report).
     #
     # Lower case because Spark hands a read its options under lower-case names while the
     # pipeline hands read_table_metadata a table's configuration as written: a key such
@@ -9958,11 +9986,7 @@ def _options_set(options: Any) -> Any:
         items = list(options.items())
     except (TypeError, AttributeError):
         return options
-    empty = {
-        name
-        for name, value in items
-        if isinstance(value, str) and value == "" and str(name).lower() != _UNL_ESCAPE_OPTION
-    }
+    empty = {name for name, value in items if isinstance(value, str) and value == ""}
     if not empty and all(not isinstance(name, str) or name == name.lower() for name, _ in items):
         return options
     return {
@@ -9981,8 +10005,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     def __init__(self, options: dict[str, str]) -> None:
         # A parameter left empty is one not set: a form sends "" for a field nobody
         # filled in, and a number or flag read from "" would fail here or, later, on a
-        # worker. The same rule as a table's options (_options_set): only "" counts, and
-        # the escape character is the one whose empty value means something. A value of
+        # worker. The same rule as a table's options (_options_set): only "" counts. A value of
         # blanks is something typed, judged as given; it was dropped here but judged in a
         # table's options, so the same blank was unset at read time and an error at
         # registration.
@@ -9992,9 +10015,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         options = options.copy() if callable(getattr(options, "copy", None)) else dict(options)
         with contextlib.suppress(TypeError, AttributeError):
             for name in [
-                name
-                for name, value in options.items()
-                if isinstance(value, str) and value == "" and name.lower() != _UNL_ESCAPE_OPTION
+                name for name, value in options.items() if isinstance(value, str) and value == ""
             ]:
                 del options[name]
         # Under the names Spark hands them over in, lowercased, as a table's options are
@@ -10488,10 +10509,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # gets a page's moved rows from its descriptor, and reads a manifest itself.
         for name in _SCAN_CACHES:
             state.pop(name, None)
-        if _generated_trigger_base is None and _INFORMIX_REGISTRATION_CONTEXT["scope"]:
-            # Registered by class from a package: an executor imports this module afresh
-            # and is handed only readers, so what the driver gathered goes with them.
-            state["_driver_registration"] = _driver_registration()
+        if _INFORMIX_REGISTRATION_CONTEXT["scope"]:
+            # Captured again here when old, on the driver (see _driver_registration).
+            registration = _driver_registration()
+            if _generated_trigger_base is None:
+                # Registered by class from a package: an executor imports this module
+                # afresh and is handed only readers, so what the driver gathered goes with
+                # them. The merged file's globals go with its code.
+                state["_driver_registration"] = registration
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -16039,7 +16064,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 # 252: Consistent snapshot LSN {} precedes prepared LSN {} for '{}'
                 raise InformixError(_m(252, snapshot_lsn, high_water, table.exposed_name))
             try:
-                current_lsn = _strict_lsn(self._bridge.current_lsn(), "current_lsn")
+                # Retried on a drop: the bridge's own session sat idle while another read the
+                # pages, and a reset lost the whole staged snapshot.
+                current_lsn = _strict_lsn(
+                    self._snapshot_read_with_reconnect(
+                        self._bridge.current_lsn, table=table, operation="end"
+                    ),
+                    "current_lsn",
+                )
             except ValueError as error:
                 # 253: Informix bridge returned an invalid current source LSN
                 raise InformixError(_m(253)) from error
@@ -16645,14 +16677,25 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # has stopped handing changes over only ever goes idle. With ``proof`` the poll
             # must report having read up to ``target``, or bring a later commit. An idle
             # session reports the last checkpoint's position, so on a quiet table that takes
-            # until the next checkpoint: the wait for it is short, and an idle poll is taken
-            # in the end.
+            # until the next checkpoint. Waited for only 30 s, a change Informix CDC handed
+            # over later than that (its triggered lag runs to minutes) reached the stream
+            # alone, which failed for a full refresh (438). So it is waited for as long as a
+            # poll may take, then taken as read; on a log nothing has written to since
+            # ``target`` 30 s, as such a log may get no checkpoint to show it.
             nonlocal start, last_commit
             if not follows:
                 return
             began = time.monotonic()
             idle_since = None
             while True:
+                # Whether the log is no further than ``target``: asked before a poll, so that
+                # a poll is still the last thing the wait does, and nothing that committed
+                # after it can pass for having committed during the scan.
+                quiet = (
+                    idle_since is not None
+                    and time.monotonic() - idle_since >= _INDEX_SCAN_PROOF_SECONDS
+                    and bridge.current_lsn() <= target
+                )
                 records = bridge.read_changes(
                     [capture],
                     start,
@@ -16763,9 +16806,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 # The short wait is for proof alone, from the first idle poll: a backlog is
                 # read to its end first.
                 now = time.monotonic()
-                idle_since = idle_since or (now if idle else None)
-                if idle and now - idle_since >= _INDEX_SCAN_PROOF_SECONDS:
+                if idle and (quiet or now - began > _INDEX_SCAN_FOLLOW_SECONDS):
                     break
+                # From the first idle poll; the log moved, asked again a proof interval on.
+                idle_since = (
+                    now
+                    if idle
+                    and (idle_since is None or now - idle_since >= _INDEX_SCAN_PROOF_SECONDS)
+                    else idle_since
+                )
                 if now - began > _INDEX_SCAN_FOLLOW_SECONDS:
                     # 435: The index-ordered snapshot stopped waiting for
                     # Informix CDC to reach the snapshot's position for '{}'
@@ -17529,7 +17578,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         #
         # Resolved table option, then connection, then the UNLOAD defaults (``|``/backslash),
         # so a plain UNLOAD extract needs no options and an HPL extract sets only what differs.
-        # Both are validated to a single character (empty escape allowed = escaping disabled),
+        # Both are validated to a single character (the escape ``none`` = escaping disabled),
         # and the two must differ.
 
         delimiter = _unl_char(
@@ -18720,7 +18769,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if len(rows) > limit:
             # 276: Snapshot-only table {} exceeds snapshot.max.rows={}
             raise InformixError(_m(276, table.exposed_name, limit))
-        lsn = self._bridge.current_lsn()
+        lsn = self._snapshot_read_with_reconnect(
+            self._bridge.current_lsn, table=table, operation="end"
+        )
         commit_time = self._source_utc_time()
         return (
             iter(
@@ -22600,14 +22651,14 @@ def _unl_char(value: object, name: str, *, allow_empty: bool) -> str:
     #
     # HPL and UNLOAD field delimiters and escape characters are each one character. A
     # multi-character value is a configuration error, caught eagerly rather than silently
-    # truncated. An empty value is rejected for the delimiter and accepted for the escape
-    # (``allow_empty``), where it disables escape processing for an HPL extract that writes
-    # no escapes.
+    # truncated. The escape takes ``none`` (``allow_empty``), which disables escape
+    # processing for an HPL extract that writes no escapes: given as "", which a form sends
+    # for a field nobody filled in, it turned escaping off on every load of the connection.
 
     text = "" if value is None else str(value)
+    if allow_empty and text.lower() == _UNL_NO_ESCAPE:
+        return ""
     if text == "":
-        if allow_empty:
-            return ""
         # 359: Option '{}' must be a single character
         raise ValueError(_m(359, name))
     if len(text) != 1:
@@ -24037,10 +24088,14 @@ def _number_alike(column: Column | None, op: str, old: tuple, new: tuple) -> boo
         scale = column.scale if column.scale is not None else 2 * (column.type_name == "MONEY")
     else:
         return False
-    # In steps of the column's smallest value, where its values are the whole numbers.
-    a, b = old[1].scaleb(scale), new[1].scaleb(scale)
-    if op in ("=", "<>"):
-        return a != a.to_integral_value() and b != b.to_integral_value()
+    # In steps of the column's smallest value, where its values are the whole numbers. Past
+    # the default context's 28 digits: in a DECIMAL(32,2) it made ...890.12 and ...890.99
+    # one number, and a change that moved 87 values passed as no change.
+    with localcontext() as context:
+        context.prec = 200
+        a, b = old[1].scaleb(scale), new[1].scaleb(scale)
+        if op in ("=", "<>"):
+            return a != a.to_integral_value() and b != b.to_integral_value()
     rounding = math.ceil if op in (">=", "<") else math.floor
     return rounding(a) == rounding(b)
 

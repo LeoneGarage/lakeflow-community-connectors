@@ -864,6 +864,32 @@ class _IndexScanSource:
         return [dict(record) for record in self.log if begins[record["tx_id"]] >= start]
 
 
+class _LaggingIndexScanSource(_IndexScanSource):
+    """CDC hands a transaction over only some polls after it committed, and an idle session
+    reports no further than what it has handed over, as the demo server's does: its
+    triggered lag runs to minutes."""
+
+    def __init__(self, random, delay, **kwargs):
+        super().__init__(random, **kwargs)
+        self.delay, self.polls, self.shows_at = delay, 0, {}
+
+    def read_changes(
+        self, captures, start, timeout, max_records, budget=None, until=None, seconds=None
+    ):
+        self.polls += 1
+        records = super().read_changes(captures, start, timeout, max_records, budget, until)
+        # A busy server: other tables' writes move the log on between polls.
+        self.lsn += self.PAGE
+        for record in self.log:
+            if record["op"] == "COMMIT":
+                self.shows_at.setdefault(record["tx_id"], self.polls + self.delay)
+        late = {tx for tx, at in self.shows_at.items() if at > self.polls}
+        for at, record in enumerate(records):
+            if record.get("tx_id") in late and record["op"] != "TIMEOUT":
+                return records[:at] + [{"op": "TIMEOUT", "lsn": record["lsn"] - 1}]
+        return records
+
+
 class _KeyedIndexScanSource(_IndexScanSource):
     """The same table with a third column: ``value`` names each row, as a primary.keys
     option says, ``id`` is still the indexed column and ``note`` the rest of the row. Its
@@ -1322,6 +1348,35 @@ class LakeflowContractTests(unittest.TestCase):
                         )
                     )
                 )
+
+    def test_a_drop_reading_the_lsn_at_a_snapshots_end_is_retried(self):
+        # The bridge's own session sat idle while the snapshot was read on another, and a
+        # reset of it lost the whole staged snapshot: the end's LSN read is retried as the
+        # snapshot's own reads are.
+        for cdc in (True, False):
+            with self.subTest(cdc=cdc):
+                bridge = FakeBridge()
+                bridge.tables = [_table(cdc=cdc)]
+                name = "consistent_snapshot" if cdc else "snapshot_page"
+                original, current, armed = getattr(bridge, name), bridge.current_lsn, []
+
+                def reading(*args, _original=original, _armed=armed, **kwargs):
+                    _armed.append(True)
+                    return _original(*args, **kwargs)
+
+                def lsn(_current=current, _armed=armed):
+                    if _armed == [True]:
+                        _armed.append(False)
+                        raise informix_module.SqliTransportError("truncated SQLI stream")
+                    return _current()
+
+                setattr(bridge, name, reading)
+                bridge.current_lsn = lsn
+                connector = self.connector(bridge, registration_scope=f"end-{cdc}")
+                with mock.patch.object(informix_module.time, "sleep"):
+                    rows, _ = connector.read_table("app.orders", {}, {})
+                self.assertEqual(len(list(rows)), 2)
+                self.assertEqual(armed, [True, False])
 
     def test_snapshot_materialization_failure_is_not_published(self):
         bridge = FakeBridge()
@@ -2626,6 +2681,48 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertGreater(dropped, 100)
         self.assertGreater(settled_nulls, 5)
 
+    def test_an_index_scan_waits_for_changes_informix_cdc_hands_over_late(self):
+        # Waited for only 30 s, a change the scan's pages may hold that Informix CDC handed
+        # over later reached the stream alone, which failed for a full refresh (438). On a
+        # log written to since, the scan waits until CDC shows it has read past its end.
+        for seed in range(40):
+            random = random_module.Random(21000 + seed)
+            source = _LaggingIndexScanSource(random, 3, nulls=seed % 2 == 0)
+            with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
+                boundary, staged, scan, connector, table = self._index_scan(
+                    source, random.choice([3, 5, 50])
+                )
+            transactions = informix_module._transaction_batch(source.history(boundary))[0]
+            connector._read_snapshot_stage_manifest = lambda *_: scan
+            connector._offset_scopes = lambda checkpoint: ("scope", "scope")
+            kept = connector._drop_scanned_changes(
+                table, {"commit_lsn": str(boundary), "schema_id": "s"}, {}, transactions
+            )
+            result = collections.Counter(_IndexScanSource.text(row) for row in staged)
+            for tx in kept:
+                for record in tx.records:
+                    op, row = record["op"], record.get("row")
+                    for image, sign in (
+                        (record.get("before", row if op == "DELETE" else None), -1),
+                        (record.get("after", row if op == "INSERT" else None), 1),
+                    ):
+                        if image is not None:
+                            result[_IndexScanSource.text(image)] += sign
+            self.assertEqual(+result, collections.Counter(source.rows_as_text()), f"seed {seed}")
+            self.assertFalse(-result, f"seed {seed}")
+
+    def test_an_unproven_index_scan_end_is_taken_as_read_at_the_follow_limit(self):
+        # A server whose checkpoints are further apart than the limit shows no more: the
+        # idle poll is taken, as before, and not failed for a restart that would wait again.
+        source = _IndexScanSource(random_module.Random(4), transactions=0, quiet=True)
+        with (
+            mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 10**6),
+            mock.patch.object(informix_module, "_INDEX_SCAN_FOLLOW_SECONDS", 0),
+        ):
+            boundary, _staged, scan, _connector, _table = self._index_scan(source, 5)
+        self.assertIsNotNone(boundary)
+        self.assertTrue(scan["index_scan"])
+
     def test_an_index_scan_adds_up_when_updates_change_the_index_value(self):
         # An UPDATE of the index column takes a row out of one key and puts it into another.
         # The scan may have read either key before the update and the other after it: the
@@ -3377,13 +3474,22 @@ class LakeflowContractTests(unittest.TestCase):
 
     def test_a_parameter_left_blank_is_one_not_set(self):
         # A form sends "" for a field nobody filled in. A number or a flag read from it
-        # would fail at once or, later, on a worker. The escape character is the one
-        # whose blank means something: no escape processing.
-        blank = {"port": "", "cdc.timeout": "", "padVarchar": "", "lakebase.database": ""}
-        connector = self.connector(FakeBridge(), **blank, **{"snapshot.unl.escape": ""})
+        # would fail at once or, later, on a worker. The escape character too: its blank
+        # was kept as "no escape processing", which a connection form's unfilled field
+        # then gave every load (an empty VARCHAR read as a backslash).
+        blank = {
+            "port": "",
+            "cdc.timeout": "",
+            "padVarchar": "",
+            "lakebase.database": "",
+            "snapshot.unl.escape": "",
+        }
+        connector = self.connector(FakeBridge(), **blank)
         for name in blank:
             self.assertNotIn(name, connector.options)
-        self.assertEqual(connector.options["snapshot.unl.escape"], "")
+        self.assertEqual(connector._unl_field_format({}), ("|", "\\"))
+        connector = self.connector(FakeBridge(), **{"snapshot.unl.escape": "None"})
+        self.assertEqual(connector._unl_field_format({}), ("|", ""))
         with self.assertRaisesRegex(ValueError, "lakebase.password"):
             self.connector(FakeBridge(), **{"lakebase.password": ""})
         # Blanks are something typed, judged as given, as in a table's options: a number
@@ -3815,7 +3921,7 @@ class LakeflowContractTests(unittest.TestCase):
         informix_module._INFORMIX_REGISTRATION_CONTEXT.update({"scope": "a" * 32, "request": None})
         for asker in (session, None):
             with self.subTest(session=asker is not None):
-                informix_module._CREDENTIAL_CAPTURED["at"] = 1000.0
+                informix_module._CREDENTIAL_CAPTURED.update(at=1000.0, pid=os.getpid())
                 with mock.patch.object(informix_module, "capture_workspace_credentials") as capture:
                     with mock.patch.object(informix_module.time, "monotonic", return_value=1500.0):
                         informix_module._driver_registration(asker)
@@ -3830,6 +3936,50 @@ class LakeflowContractTests(unittest.TestCase):
             with mock.patch.object(informix_module.time, "monotonic", return_value=9000.0):
                 informix_module._driver_registration(None)
         capture.assert_not_called()
+        # The merged file's globals carry the capture time to every process with its code:
+        # only the process that captured captures again, a worker has no identity to.
+        informix_module._CREDENTIAL_CAPTURED.update(at=1000.0, pid=os.getpid() + 1)
+        with mock.patch.object(informix_module, "capture_workspace_credentials") as capture:
+            with mock.patch.object(informix_module.time, "monotonic", return_value=9000.0):
+                informix_module._driver_registration(None)
+        capture.assert_not_called()
+
+    def test_a_merged_connector_captures_its_credential_again_when_pickled(self):
+        # The merged file's globals carry the registration; it was never captured again,
+        # as it had no capture time, and a worker first reaching the control plane after
+        # the token's hour was handed the expired one.
+        connector = self.connector(FakeBridge())
+        module = informix_module
+        self.addCleanup(module._CREDENTIAL_CAPTURED.clear)
+        module._CREDENTIAL_CAPTURED.update(at=1000.0, pid=os.getpid())
+        with (
+            mock.patch.object(module, "_generated_trigger_base", object()),
+            mock.patch.dict(
+                module._INFORMIX_REGISTRATION_CONTEXT, {"scope": "a" * 32, "request": None}
+            ),
+            mock.patch.object(module, "capture_workspace_credentials") as capture,
+            mock.patch.object(module.time, "monotonic", return_value=9000.0),
+        ):
+            state = connector.__getstate__()
+        capture.assert_called_once()
+        self.assertNotIn("_driver_registration", state)
+
+    def test_a_registration_replaces_the_workspace_credentials_it_finds(self):
+        # Merged in, an earlier update's token stayed on a warm worker where this update
+        # carried none.
+        module = informix_module
+        with (
+            mock.patch.dict(module._INFORMIX_REGISTRATION_CONTEXT, {"scope": None}),
+            mock.patch.dict(
+                module._CAPTURED_WORKSPACE, {"host": "https://old", "token": "old"}, clear=True
+            ),
+        ):
+            module._install_registration({"scope": "b" * 32, "request": None, "workspace": {}})
+            self.assertEqual(module._CAPTURED_WORKSPACE, {})
+            module._install_registration(
+                {"scope": "b" * 32, "workspace": {"host": "https://ws", "token": "t"}}
+            )
+            self.assertEqual(module._CAPTURED_WORKSPACE, {"host": "https://ws", "token": "t"})
 
     def test_a_connector_from_the_package_carries_the_registration_to_executors(self):
         # An executor is handed readers, not the class, and imports the module afresh: the
@@ -3884,8 +4034,8 @@ class LakeflowContractTests(unittest.TestCase):
     def test_a_table_option_left_empty_is_one_not_set(self):
         # A form sends "" for a field nobody filled in. Read as set, an empty table
         # option shadowed the connection's value with the default, or failed as an
-        # invalid one. Only "" counts: blanks are something typed, and the escape
-        # character's empty value means something.
+        # invalid one. Only "" counts: blanks are something typed. The escape is no
+        # exception: it takes "none" to disable escaping.
         clean = informix_module._options_set
         options = {
             "snapshot.mode": "",
@@ -3897,7 +4047,6 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(
             clean(options),
             {
-                "snapshot.unl.escape": "",
                 "snapshot.unl.delimiter": "\t",
                 "primary.keys": " ",
                 "x": "1",
@@ -7231,6 +7380,7 @@ class LakeflowContractTests(unittest.TestCase):
 
         from databricks.labs.community_connector.sources.informix.sqli import (
             SqliDescriptorNotImplemented,
+            SqliInvalidCaFile,
             SqliUnsupportedAuthentication,
         )
 
@@ -7238,8 +7388,10 @@ class LakeflowContractTests(unittest.TestCase):
             ssl.SSLCertVerificationError(1, "certificate verify failed"),
             SqliUnsupportedAuthentication("Informix login failed"),
             SqliDescriptorNotImplemented("type 99"),
-            # An ssl.ca.file path that names no file (a dropped mount's is a transport loss).
+            # An ssl.ca.file path that names no file (a dropped mount's is a transport loss),
+            # or one whose contents don't load.
             FileNotFoundError(2, "No such file or directory"),
+            SqliInvalidCaFile("ssl.ca.file does not load"),
         ):
             with self.subTest(error=type(error).__name__):
                 connector = self._partitioned_connector()
@@ -27515,6 +27667,72 @@ class UnloadHelperTests(unittest.TestCase):
             -18,
         )
 
+    def test_an_equivalent_filter_rewrite_is_judged_past_28_digits(self):
+        # Under the default context's 28 digits, ...890.12 and ...890.99 were one number in
+        # a DECIMAL(32,2): a change moving 87 values passed as no change, without the full
+        # refresh 383 asks for.
+        def alike(precision, scale, op, old, new):
+            column = informix_module.Column.parse(
+                {"name": "amt", "type_name": "DECIMAL", "precision": precision, "scale": scale}
+            )
+            return informix_module._number_alike(
+                column, op, ("number", Decimal(old)), ("number", Decimal(new))
+            )
+
+        big = "123456789012345678901234567890"
+        self.assertFalse(alike(32, 2, ">=", f"{big}.12", f"{big}.99"))
+        self.assertTrue(alike(32, 2, ">=", f"{big}.115", f"{big}.12"))
+        self.assertFalse(alike(32, 0, ">=", f"{big[:-1]}1", f"{big[:-1]}4"))
+        # Off the step both, at 31 digits: = matches no value either way.
+        self.assertTrue(alike(32, 2, "=", f"{big[:28]}.125", f"{big[:28]}.135"))
+
+    def test_an_nvl_fallback_rounds_a_half_away_from_zero_and_holds_the_lowest_int8(self):
+        # A fallback the type can't hold exactly was rounded half-even, cut under
+        # decimal(p,s), where ROUND rounds a half away from zero: NVL(ROUND(vcol, 0), 2.5)
+        # landed 2 where ROUND lands 3. And an integer type holds -2^63, which was refused.
+        decimal_column = informix_module.Column.parse(
+            {"name": "vcol", "type_name": "DECIMAL", "precision": 16, "scale": 255}
+        )
+        fixed = informix_module.Column.parse(
+            {"name": "fcol", "type_name": "DECIMAL", "precision": 5, "scale": 2}
+        )
+
+        def fallback(literal, operand, kind=None):
+            options = {"decimal.variable.type": kind} if kind else {}
+            context = {"columns": {"vcol": decimal_column, "fcol": fixed}, "options": options}
+            return informix_module._fallback_value(Decimal(literal), operand, context)
+
+        rounded = ("fn", "ROUND", ("vcol", ("number", Decimal(0))))
+        self.assertEqual(fallback("2.5", rounded), Decimal("3"))
+        self.assertEqual(fallback("1.005", "fcol"), Decimal("1.01"))
+        self.assertEqual(fallback("1.005", "vcol", "decimal(5,2)"), Decimal("1.01"))
+        self.assertEqual(fallback("-1.005", "fcol"), Decimal("-1.01"))
+        # Under string, a fallback with more places than the function's keeps them.
+        two = ("fn", "ROUND", ("vcol", ("number", Decimal(2))))
+        self.assertEqual(fallback("12.345", two, "string"), "12.345")
+        columns = [
+            {"name": "id", "type_name": "INTEGER", "length": 4, "nullable": False},
+            {"name": "big", "type_name": "INT8", "length": 10, "nullable": True},
+            {"name": "qty", "type_name": "INTEGER", "length": 4, "nullable": True},
+        ]
+        table = Table.parse({**_table(), "columns": columns}, "demo")
+
+        def apply(transforms):
+            return informix_module._apply_column_transforms(
+                table, informix_module._column_transforms({"transform_columns": transforms}), None
+            )
+
+        apply('{"big": "NVL(big, -9223372036854775808)"}')
+        apply('{"qty": "NVL(qty, -2147483648)"}')
+        for transforms in (
+            '{"big": "NVL(big, -9223372036854775809)"}',
+            '{"qty": "NVL(qty, -2147483649)"}',
+            '{"big": "NVL(big, 9223372036854775808)"}',
+        ):
+            with self.subTest(transforms=transforms):
+                with self.assertRaisesRegex(InformixError, "more than a"):
+                    apply(transforms)
+
     def test_an_nvl_fallback_over_round_lands_as_rounds_values_do(self):
         # Under decimal(5,2) ROUND(vcol, 2) lands as DECIMAL(6,2), for its carry: the
         # fallback 1000 was checked against that, then failed the first NULL against the
@@ -27625,6 +27843,48 @@ class UnloadHelperTests(unittest.TestCase):
             informix_module._schema_fingerprint(carried),
             informix_module._schema_fingerprint(previous),
         )
+
+    def test_the_compare_tool_reads_partial_datetimes_and_other_locales(self):
+        # A DATETIME YEAR TO MONTH lands as YEAR=2024:MONTH=05, which UNLOAD writes as
+        # 2024-05: every row differed. And the files were read as Latin-1 whatever the
+        # database's code set, with dbaccess run under the default locale.
+        import argparse
+
+        from databricks.labs.community_connector.sources.informix import (
+            compare_live_data_test_tool as tool,
+        )
+        from databricks.labs.community_connector.sources.informix.cdc_protocol import (
+            _render_datetime,
+        )
+
+        for collength, unloaded, values, fraction in (
+            (0x0602, "2024-05", {0: 2024, 2: 5}, ""),  # YEAR TO MONTH
+            (0x0424, "05-12", {2: 5, 4: 12}, ""),  # MONTH TO DAY
+            (0x078D, "10:30.123", {8: 10, 10: 30}, "123"),  # MINUTE TO FRACTION(3)
+        ):
+            with self.subTest(unloaded=unloaded):
+                kind = tool.partial_datetime_type(collength)
+                start, end = (collength >> 4) & 0xF, collength & 0xF
+                landed = _render_datetime(values, fraction, start, max(0, end - 10), "x")
+                self.assertEqual(tool.normalize(unloaded, kind), landed)
+                self.assertEqual(tool.normalize(landed, kind), landed)
+        # A timestamp and a time of day compare as they are.
+        self.assertIsNone(tool.partial_datetime_type(0x0E0A))  # YEAR TO SECOND
+        self.assertIsNone(tool.partial_datetime_type(0x066A))  # HOUR TO SECOND
+        self.assertEqual(tool.locale_encoding("en_US.819"), "latin-1")
+        self.assertEqual(tool.locale_encoding("en_US.utf8"), "utf-8")
+        self.assertEqual(tool.locale_encoding("en_US.CP1252"), "cp1252")
+        args = argparse.Namespace(
+            tables=["t"],
+            source_owner="informix",
+            informix_server="informix",
+            container="informix-cdc",
+            database="testdb",
+        )
+        self.assertNotIn("DB_LOCALE", tool.source_export_command(args, "r"))
+        args.db_locale = "en_US.utf8"
+        command = tool.source_export_command(args, "r")
+        self.assertIn("-e DB_LOCALE=en_US.utf8 -e CLIENT_LOCALE=en_US.utf8", command)
 
     def test_the_compare_tool_keys_a_table_by_its_key_columns_by_name(self):
         # The key's parts are column numbers. Taken as a count of leading columns, a key
@@ -29171,10 +29431,10 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
         self.assertEqual(fanned, serial)
 
     def test_unl_hpl_escape_disabled_treats_backslash_as_literal_data(self):
-        # snapshot.unl.escape="" disables escape processing (an HPL job that writes no
+        # snapshot.unl.escape=none disables escape processing (an HPL job that writes no
         # escapes): a backslash in a VARCHAR is literal rather than starting an escape.
         source = self._source("1|a\\b|\n")
-        options = {"snapshot.source": source, "snapshot.unl.escape": ""}
+        options = {"snapshot.source": source, "snapshot.unl.escape": "none"}
         rows, _ = self.connector(FakeBridge()).read_table("app.orders", {}, options)
         rows = list(rows)
         self.assertEqual(rows[0]["value"], "a\\b")

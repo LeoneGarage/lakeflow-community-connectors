@@ -542,9 +542,9 @@ connection:
         Escape character for a `.unl` extract read via `snapshot.source`, also accepted at
         connection scope; a single character, default `\` (Informix UNLOAD backslash
         escaping, where `\n`/`\r`/`\t` decode to control chars and `\<other>` to the literal
-        char). Set it to match an HPL job that uses a different escape character, or to the
-        empty string to disable escape processing entirely for an HPL job that writes no
-        escapes. Only meaningful with `snapshot.source`; must differ from
+        char). Set it to match an HPL job that uses a different escape character, or to
+        `none` to disable escape processing entirely for an HPL job that writes no escapes;
+        left empty, it is unset. Only meaningful with `snapshot.source`; must differ from
         `snapshot.unl.delimiter`.
 
     - name: snapshot.boundary.lsn

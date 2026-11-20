@@ -19,6 +19,7 @@ from the generated single-file connector runtime.
 from __future__ import annotations
 
 import argparse
+import codecs
 import collections
 import concurrent.futures
 import datetime as datetime_module
@@ -28,6 +29,7 @@ import hmac
 import json
 import math
 import pathlib
+import re
 import shlex
 import struct
 import subprocess
@@ -312,13 +314,31 @@ def source_export_command(args: argparse.Namespace, run_id: str) -> str:
         f"WHERE c.tabid=t.tabid AND t.tabname IN ({table_literals}) "
         f"AND t.owner='{source_owner}' AND MOD(c.coltype,256)=14;"
     )
+    # A DATETIME neither a timestamp (YEAR to DAY or past) nor a time of day (from HOUR)
+    # lands as labelled text (YEAR=2024:MONTH=05), which UNLOAD writes as 2024-05: their
+    # qualifiers, to compare them alike (see normalize).
+    sql_statements.append(
+        f"UNLOAD TO '{remote}/datetime_columns.unl' DELIMITER '|' "
+        "SELECT t.tabname,c.colname,c.collength FROM systables t,syscolumns c "
+        f"WHERE c.tabid=t.tabid AND t.tabname IN ({table_literals}) "
+        f"AND t.owner='{source_owner}' AND MOD(c.coltype,256)=10;"
+    )
     sql = "\n".join(sql_statements) + "\n"
     encoded_sql = __import__("base64").b64encode(sql.encode()).decode()
-    # DBDATE=Y4MD- writes a DATE as ISO, as the README's extract scripts do.
+    # DBDATE=Y4MD- writes a DATE as ISO, as the README's extract scripts do. A database in
+    # another locale than the default en_US.819 names it (--db-locale): dbaccess refuses a
+    # mismatched one (-23197), and the files are read in its code set.
+    locale = getattr(args, "db_locale", None)
+    locale_environment = (
+        f"-e DB_LOCALE={shlex.quote(locale)} -e CLIENT_LOCALE={shlex.quote(locale)} "
+        if locale
+        else ""
+    )
     environment = (
         "-e INFORMIXDIR=/opt/ibm/informix "
         "-e DBDATE=Y4MD- "
         f"-e INFORMIXSERVER={shlex.quote(args.informix_server)} "
+        f"{locale_environment}"
         "-e LD_LIBRARY_PATH=/opt/ibm/informix/lib:/opt/ibm/informix/lib/esql"
     )
     return "; ".join(
@@ -516,6 +536,8 @@ def normalize(value: Any, data_type: str) -> str | None:
         return str(int(text))
     if data_type == "INTERVAL":
         return text.strip()
+    if data_type.startswith("DATETIME "):
+        return partial_datetime_text(text, *map(int, data_type.split()[1:]))
     if data_type == "TIMESTAMP":
         timestamp = text.replace("T", " ").replace("Z", "+00:00")
         if "." in timestamp:
@@ -551,8 +573,69 @@ def pipe_value(value: Any) -> str:
     )
 
 
+_DATETIME_LABELS = {0: "YEAR", 2: "MONTH", 4: "DAY", 6: "HOUR", 8: "MINUTE", 10: "SECOND"}
+
+
+def partial_datetime_text(text: str, start: int, end: int) -> str:
+    # The connector's labelled text for a DATETIME qualifier ``start`` TO ``end``
+    # (YEAR=2024:MONTH=05:FRACTION(3)=123) from UNLOAD's (2024-05); a value already in it
+    # (the destination's) as it is.
+    if "=" in text:
+        return text
+    numbers = re.findall(r"\d+", text)
+    codes = [code for code in _DATETIME_LABELS if start <= code <= min(end, 10)]
+    rendered = ":".join(
+        f"{_DATETIME_LABELS[code]}={int(number):0{4 if code == 0 else 2}d}"
+        for code, number in zip(codes, numbers)
+    )
+    if end > 10 and len(numbers) > len(codes):
+        rendered += f":FRACTION({end - 10})={numbers[len(codes)]}"
+    return rendered
+
+
+def partial_datetime_type(collength: int) -> str | None:
+    # The compare type of a DATETIME column whose syscolumns.collength is ``collength``, or
+    # None for a timestamp (YEAR to DAY or past) or a time of day (from HOUR), which
+    # compare as they are.
+    start, end = (collength >> 4) & 0xF, collength & 0xF
+    if (start == 0 and end >= 4) or start == 6:
+        return None
+    return f"DATETIME {start} {end}"
+
+
+def source_column_types(source_root: pathlib.Path, types: dict[str, dict[str, str]]) -> None:
+    # The source's own types in ``types``, where the destination's don't tell how a column
+    # compares: an INTERVAL, and a DATETIME the connector lands as labelled text.
+    intervals = source_root / "interval_columns.unl"
+    if intervals.exists():
+        for line in intervals.read_text(encoding=UNLOAD_ENCODING).splitlines():
+            values = parse_unload_line(line)
+            if len(values) == 2 and values[1] in types.get(values[0], {}):
+                types[values[0]][values[1]] = "INTERVAL"
+    datetimes = source_root / "datetime_columns.unl"
+    if datetimes.exists():
+        for line in datetimes.read_text(encoding=UNLOAD_ENCODING).splitlines():
+            values = parse_unload_line(line)
+            if len(values) == 3 and values[1] in types.get(values[0], {}):
+                partial = partial_datetime_type(int(values[2]))
+                if partial:
+                    types[values[0]][values[1]] = partial
+
+
+def locale_encoding(locale: str) -> str:
+    # The Python codec of an Informix locale's code set: en_US.819 is Latin-1, en_US.utf8
+    # UTF-8, and a code set Python names itself (cp1252) that one.
+    codeset = locale.rpartition(".")[2].lower()
+    known = {"819": "latin-1", "8859-1": "latin-1", "utf8": "utf-8", "57372": "utf-8"}
+    try:
+        return known.get(codeset) or codecs.lookup(codeset).name
+    except LookupError as error:
+        raise SystemExit(f"--db-locale {locale}: no Python codec for code set {codeset}") from error
+
+
 # The export runs dbaccess with no CLIENT_LOCALE, so it writes in the default client locale,
-# en_US.819: Latin-1, whatever the reader's own default encoding is.
+# en_US.819: Latin-1, whatever the reader's own default encoding is (--db-locale names
+# another).
 UNLOAD_ENCODING = "latin-1"
 
 
@@ -763,6 +846,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--database", default="testdb")
     parser.add_argument("--source-owner", default="informix")
     parser.add_argument("--informix-server", default="informix_tcp")
+    parser.add_argument(
+        "--db-locale",
+        default=None,
+        help="the database's locale (DB_LOCALE), when not the default en_US.819",
+    )
     parser.add_argument("--databricks-profile", default="demo1")
     parser.add_argument("--catalog", default="members")
     parser.add_argument("--schema", default="connector_bronze")
@@ -779,7 +867,10 @@ def parse_args() -> argparse.Namespace:
         default=list(WHOLE_ROW_KEY_TABLES),
         help='keyless tables keyed on the whole row (primary.keys "*"): compared by distinct rows',
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    global UNLOAD_ENCODING  # noqa: PLW0603 - the files' code set, read by every parser here
+    UNLOAD_ENCODING = locale_encoding(args.db_locale) if args.db_locale else "latin-1"
+    return args
 
 
 def main() -> int:
@@ -837,12 +928,7 @@ def main() -> int:
                 continue
             columns[row["table_name"]].append(row["column_name"])
             types[row["table_name"]][row["column_name"]] = row["data_type"].upper()
-        intervals = source_root / "interval_columns.unl"
-        if intervals.exists():
-            for line in intervals.read_text(encoding=UNLOAD_ENCODING).splitlines():
-                values = parse_unload_line(line)
-                if len(values) == 2 and values[1] in types.get(values[0], {}):
-                    types[values[0]][values[1]] = "INTERVAL"
+        source_column_types(source_root, types)
         missing_schema = sorted(set(args.tables) - set(columns))
         if missing_schema:
             raise RuntimeError(f"Destination tables are missing: {missing_schema}")

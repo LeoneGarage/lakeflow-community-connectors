@@ -1406,7 +1406,11 @@ class SqliPacketTests(unittest.TestCase):
         open_socket.assert_not_called()
         bad = ssl.SSLError("no certificate or crl found")
         error, create_context, open_socket = connect([bad, context])
-        self.assertIs(error, bad)
+        # Not as itself: an SSLError is a handshake cut short to the reconnect loops, which
+        # retried a file that fails the same way for half a minute each.
+        self.assertIsInstance(error, _sqli.SqliInvalidCaFile)
+        self.assertIs(error.__cause__, bad)
+        self.assertFalse(_sqli.reconnectable_error(error))
         self.assertEqual(create_context.call_count, 1)
         open_socket.assert_not_called()
 
