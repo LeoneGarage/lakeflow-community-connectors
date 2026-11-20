@@ -6265,6 +6265,55 @@ class LakeflowContractTests(unittest.TestCase):
             {"demo.app.orders": "demo:app.orders"},
         )
 
+    def test_spill_runs_taken_back_by_several_rollbacks_or_before_the_spill_go(self):
+        # One discarded range had to span the run: two rollbacks that took back every change
+        # between them left it named. And a change taken back before the spill was replayed
+        # into it, naming a run and a SPILLING marker for a table left with none.
+        deleted = []
+
+        def change(table, lsn):
+            row = {"id": lsn}
+            return {"op": "INSERT", "tx_id": 7, "lsn": lsn, "table": table, "row": row}
+
+        spill = informix_module._CdcSpill(
+            1,
+            lambda *args: None,
+            lambda *args: deleted.append(args[1]),
+            {"demo.app.orders": "layout", "demo.app.items": "layout"},
+            "scope",
+            {"demo.app.orders": "demo:app.orders", "demo.app.items": "demo:app.items"},
+        )
+        with mock.patch.object(informix_module, "_CDC_SPILL_PAGE_RECORDS", 1):
+            spill.start(7, 10, [change("demo.app.orders", 20)])
+            spill.add(change("demo.app.items", 21))
+            spill.discard(7, 15)
+            spill.add(change("demo.app.orders", 31))
+            spill.discard(7, 30)
+            spill.add(change("demo.app.items", 33))
+            spilled = spill.finish(7, 40)
+        self.assertEqual([part["table"] for part in spilled], ["demo.app.items"])
+        self.assertEqual(len(deleted), 1)
+        tables = spill.start(
+            8,
+            10,
+            [
+                dict(change("demo.app.orders", 11), tx_id=8),
+                {"op": "DISCARD", "tx_id": 8, "lsn": 11},
+                dict(change("demo.app.items", 13), tx_id=8),
+            ],
+        )
+        self.assertEqual(tables, ["demo.app.items"])
+
+    def test_a_spill_run_is_named_by_the_string_null_byte_it_was_decoded_under(self):
+        # Decoded before it is spilled: a restart under another mode took up the pages of
+        # the first, its NULLs in place of the strings.
+        layouts = []
+        for mode in ("null", "keep"):
+            connector = self.connector(FakeBridge(), **{"string.null.byte": mode})
+            spill = connector._cdc_spill([self._ORDERS_CAPTURE])
+            layouts.append(spill._layouts)
+        self.assertNotEqual(layouts[0], layouts[1])
+
     def test_a_spill_run_a_savepoint_rollback_took_back_whole_is_not_named(self):
         # Named, a table the transaction left with no change failed an index-ordered scan's
         # stream (433); its pages are deleted instead.
@@ -7312,6 +7361,30 @@ class LakeflowContractTests(unittest.TestCase):
         # A locale the connector has no codec for is not taken for another codeset.
         unknown = bridge(Transport("en_US.819", "ja_JP.sjis-s"))
         unknown._connect_transport()
+
+    def test_a_shard_is_shared_only_under_the_same_decoding_and_staging(self):
+        # Keyed by the database alone, a flow through a connection with another
+        # string.null.byte got changes decoded under the leader's.
+        keys = []
+        for mode in ("null", "keep", "null"):
+            connector = self.connector(
+                FakeBridge(),
+                shared_cdc=True,
+                **{"cdc.shared.session": "process", "string.null.byte": mode},
+            )
+            table = connector._table("app.orders", {})
+            shard = mock.Mock()
+            shard.poll.return_value = None
+            with mock.patch.object(
+                informix_module, "_shared_cdc_shard", return_value=shard
+            ) as opened:
+                connector._shared_cdc_snapshot(
+                    table, _stream_offset(), {}, False, connector._pipeline_scope()
+                )
+            keys.append(opened.call_args.args[0])
+        self.assertNotEqual(keys[0], keys[1])
+        self.assertEqual(keys[0], keys[2])
+        self.assertEqual(keys[0][1:], keys[1][1:])
 
     def test_change_records_are_decoded_in_the_database_codeset(self):
         # A change record carries text as the database holds it, whatever the session's

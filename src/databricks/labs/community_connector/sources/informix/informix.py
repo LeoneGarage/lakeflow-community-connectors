@@ -8257,11 +8257,16 @@ class _CdcSpill:
         # it has a run for.
 
         self._open[tx_id] = (begin_lsn, {})
+        # Without what a rollback to a savepoint took back before the spill: replayed, it
+        # named a run, and a SPILLING marker, for a table left with no change.
+        kept: list[dict[str, Any]] = []
         for record in records:
             if record["op"] == "DISCARD":
-                self.discard(tx_id, int(record["lsn"]))
+                kept = [r for r in kept if int(r["lsn"]) < int(record["lsn"])]
             else:
-                self.add(record)
+                kept.append(record)
+        for record in kept:
+            self.add(record)
         return list(self._open[tx_id][1])
 
     def add(self, record: dict[str, Any]) -> bool:
@@ -8279,7 +8284,8 @@ class _CdcSpill:
                 "pages": 0,
                 "rows": [],
                 "bytes": 0,
-                "first": int(record["lsn"]),
+                # The earliest change no rollback has taken back, or None.
+                "live": None,
                 "last": 0,
                 "discarded": [],
                 "ops": set(),
@@ -8291,6 +8297,8 @@ class _CdcSpill:
         )
         part["ops"].add(record["op"])
         part["last"] = int(record["lsn"])
+        if part["live"] is None:
+            part["live"] = part["last"]
         # Wide text or byte columns end a page early, well inside the staged-page bound.
         part["bytes"] += 64 + sum(
             len(value) if isinstance(value, (str, bytes, bytearray)) else 16
@@ -8314,6 +8322,10 @@ class _CdcSpill:
             part["rows"] = [record for record in part["rows"] if int(record["lsn"]) < lsn]
             if part["pages"] and part["last"] >= lsn:
                 part["discarded"].append([lsn, part["last"]])
+            # A rollback takes back everything from its savepoint on, and changes come in
+            # LSN order: one at or before the earliest left leaves none.
+            if part["live"] is not None and part["live"] >= lsn:
+                part["live"] = None
 
     def drop(self, tx_id: int) -> None:
         _begin, parts = self._open.pop(tx_id)
@@ -8329,12 +8341,11 @@ class _CdcSpill:
         spilled = []
         for table, part in parts.items():
             native = self._natives.get(table, table)
-            if not part["rows"] and any(
-                low <= part["first"] and part["last"] <= high for low, high in part["discarded"]
-            ):
-                # A rollback to a savepoint took back every change of the run: named, a
-                # table with none failed an index-ordered scan's stream (433).
-                self._delete(native, part["run"])
+            if part["live"] is None:
+                # Rollbacks to savepoints took back every change of the run, in one or in
+                # several: named, a table with none failed an index-ordered scan's stream.
+                if part["pages"]:
+                    self._delete(native, part["run"])
                 continue
             if part["rows"]:
                 self._flush(table, part)
@@ -19010,9 +19021,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         natives = {str(c["logical_identity"]): str(c["identity"]) for c in captures}
         # Each table's run is named by its own capture, so the upsert and delete channels,
         # whose shards capture different sets of tables, name the same pages.
+        # And by string.null.byte, applied before a change is spilled: a restart under
+        # another one took up the pages of the first.
+        null_byte = _null_byte_mode(self.options)
         layouts = {
             str(c["logical_identity"]): hashlib.sha256(
-                json.dumps(c, sort_keys=True, default=str).encode("utf-8")
+                json.dumps([c, null_byte], sort_keys=True, default=str).encode("utf-8")
             ).hexdigest()[:12]
             for c in captures
         }
@@ -19625,7 +19639,27 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         channel = "delete" if deletes else "upsert"
         threads = self._shared_cdc_thread_count()
         shard_id = int(hashlib.sha256(table.native_identity.encode()).hexdigest(), 16) % threads
-        key = (self._lakebase_state_namespace(), pipeline_scope, channel, shard_id)
+        # By what the shard's leader decodes, spills and reads the catalog under, too: a
+        # flow of the same database through a connection with others got the leader's.
+        key = (
+            self._lakebase_state_namespace()
+            + ":"
+            + hashlib.sha256(
+                repr(
+                    [
+                        _null_byte_mode(self.options),
+                        _database_encoding(self.options),
+                        getattr(self, "_snapshot_staging_location", None),
+                        self.options.get("lakebase.project.id"),
+                        self.options.get("lakebase.database"),
+                        _option_bool(self.options, _PROMOTE_UNIQUE_INDEX_OPTION, True),
+                    ]
+                ).encode()
+            ).hexdigest()[:12],
+            pipeline_scope,
+            channel,
+            shard_id,
+        )
         capture = _capture_descriptor(table, _database_encoding(self.options))
         checkpoint_commit = int(checkpoint["commit_lsn"])
         floor = int(checkpoint.get("begin_lsn") or checkpoint["commit_lsn"])
