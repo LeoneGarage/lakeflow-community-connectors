@@ -1300,6 +1300,25 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertNotIn("_informix.nonblocking.connection.capacity", connector.options)
 
+    def test_a_table_the_connector_cannot_read_leaves_the_list_and_warns_if_selected(self):
+        bridge = FakeBridge()
+        bridge.tables.append({"owner": "app", "name": "blobs", "unreadable": "unsupported type"})
+        bridge.tables[2] = dict(_table(name="audit"), columns=[])  # Table.parse refuses it
+
+        with self.assertLogs(informix_module.__name__, "WARNING") as logs:
+            self.assertEqual(self.connector(bridge).list_tables(), ["app.orders", "sysadmin.jobs"])
+        warned = "\n".join(logs.output)
+        self.assertIn("app.blobs", warned)
+        self.assertIn("unsupported type", warned)
+        self.assertIn("app.audit", warned)
+
+        with mock.patch.object(
+            informix_module.logging.getLogger(informix_module.__name__), "warning"
+        ) as warn:
+            excluded = self.connector(bridge, **{"table.exclude.list": "app.blobs,app.audit"})
+            self.assertEqual(excluded.list_tables(), ["app.orders", "sysadmin.jobs"])
+        warn.assert_not_called()
+
     def test_worker_rejects_bridge_without_release_contract(self):
         class IncompleteBridge:
             @staticmethod
@@ -6293,7 +6312,7 @@ class LakeflowContractTests(unittest.TestCase):
             spilled = spill.finish(7, 40)
         self.assertEqual([part["table"] for part in spilled], ["demo.app.items"])
         self.assertEqual(len(deleted), 1)
-        tables = spill.start(
+        spill.start(
             8,
             10,
             [
@@ -6302,7 +6321,43 @@ class LakeflowContractTests(unittest.TestCase):
                 dict(change("demo.app.items", 13), tx_id=8),
             ],
         )
-        self.assertEqual(tables, ["demo.app.items"])
+        self.assertEqual([part["table"] for part in spill.finish(8, 20)], ["demo.app.items"])
+
+    def test_a_spill_run_pages_alike_wherever_a_channel_began_to_spill(self):
+        # The other channel's pages are kept, not written again, so a run's pages must not
+        # depend on when a poll began to spill: one that began after a rollback to a
+        # savepoint, its rolled-back changes left out before paging, wrote other pages
+        # under the same run, and read the first channel's without the rollback.
+        def change(lsn):
+            row = {"id": lsn}
+            return {"op": "INSERT", "tx_id": 7, "lsn": lsn, "table": "demo.app.orders", "row": row}
+
+        def channel(spilled_from):
+            writes = []
+            spill = informix_module._CdcSpill(
+                1,
+                lambda native, table, run, page, rows: writes.append(
+                    (run, page, [row["lsn"] for row in rows])
+                ),
+                lambda *args: None,
+                {"demo.app.orders": "layout"},
+                "scope",
+                {"demo.app.orders": "demo:app.orders"},
+            )
+            history = [change(20), change(61), change(62), {"op": "DISCARD", "tx_id": 7, "lsn": 60}]
+            history += [change(81), change(82)]
+            with mock.patch.object(informix_module, "_CDC_SPILL_PAGE_RECORDS", 2):
+                spill.start(7, 10, history[:spilled_from])
+                for record in history[spilled_from:]:
+                    if record["op"] == "DISCARD":
+                        spill.discard(7, record["lsn"])
+                    else:
+                        spill.add(record)
+                parts = spill.finish(7, 90)
+            return writes, [(part["run"], part["pages"], part["discarded"]) for part in parts]
+
+        self.assertEqual(channel(1), channel(5))
+        self.assertEqual(channel(1)[0][0][2], [20, 61])
 
     def test_a_spill_run_is_named_by_the_string_null_byte_it_was_decoded_under(self):
         # Decoded before it is spilled: a restart under another mode took up the pages of
@@ -9422,6 +9477,45 @@ class LakeflowContractTests(unittest.TestCase):
             [("informix", "systables"), ("sysadmin", "jobs")],
         )
         self.assertFalse(any("MATCHES" in sql for sql in bridge.transport.statements))
+
+    def test_a_table_the_connector_cannot_read_is_marked_not_the_list_failed(self):
+        class MetadataTransport:
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                if "syscolumns" not in sql:
+                    return []
+                return [
+                    {
+                        "colname": "id",
+                        "coltype": 2,
+                        "collength": 4,
+                        "colno": 1,
+                        "tabid": tabid,
+                        "extended_id": 0,
+                        "extended_name": None,
+                        "extended_owner": None,
+                        "owner": "app",
+                        "tabname": name,
+                    }
+                    for tabid, name in ((120, "orders"), (121, "blobs"))
+                ]
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.config = {"database": "demo"}
+        bridge.transport = MetadataTransport()
+        parse = PurePythonInformixBridge._table_from_catalog_rows
+
+        def catalog_rows(self, owner, name, *args):
+            if name == "blobs":
+                raise InformixError("unsupported Informix column type")
+            return parse(self, owner, name, *args)
+
+        with mock.patch.object(PurePythonInformixBridge, "_table_from_catalog_rows", catalog_rows):
+            tables = {table["name"]: table for table in bridge.list_tables()}
+
+        self.assertEqual(sorted(tables), ["blobs", "orders"])
+        self.assertEqual(tables["blobs"]["unreadable"], "unsupported Informix column type")
+        self.assertNotIn("unreadable", tables["orders"])
 
     def test_zero_metadata_byte_bound_skips_accounting(self):
         class MetadataTransport:

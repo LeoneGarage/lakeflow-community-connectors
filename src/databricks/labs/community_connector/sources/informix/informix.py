@@ -3161,13 +3161,17 @@ class PurePythonInformixBridge:
             else 0
         )
         for (owner, name), table_columns in columns_by_table.items():
-            table = self._table_from_catalog_rows(
-                owner,
-                name,
-                table_columns,
-                keys_by_table.get((owner, name), []),
-                unique_by_table.get((owner, name), []),
-            )
+            try:
+                table = self._table_from_catalog_rows(
+                    owner,
+                    name,
+                    table_columns,
+                    keys_by_table.get((owner, name), []),
+                    unique_by_table.get((owner, name), []),
+                )
+            except InformixError as error:
+                # Not the whole list for one table (see _table_map).
+                table = {"owner": owner, "name": name, "unreadable": str(error)}
             if maximum:
                 retained_bytes += _deep_size(table)
             if maximum and retained_bytes > maximum:
@@ -3258,8 +3262,8 @@ class PurePythonInformixBridge:
                 max_result_bytes=maximum,
             ):
                 table = (
-                    str(_field(row, "owner", owner_at)).strip(),
-                    str(_field(row, "tabname", owner_at + 1)).strip(),
+                    str(_field(row, "owner", owner_at)).rstrip(" "),
+                    str(_field(row, "tabname", owner_at + 1)).rstrip(" "),
                 )
                 if table in wanted:
                     into.setdefault(table, []).append(row)
@@ -3493,9 +3497,9 @@ class PurePythonInformixBridge:
         wanted = set(columns)
         return sorted(
             {
-                str(_field(row, "colname", 0)).strip()
+                str(_field(row, "colname", 0)).rstrip(" ")
                 for row in rows
-                if str(_field(row, "colname", 0)).strip() in wanted
+                if str(_field(row, "colname", 0)).rstrip(" ") in wanted
                 and str(_field(row, "type", 1)).strip().upper() != "N"
             }
         )
@@ -8257,16 +8261,16 @@ class _CdcSpill:
         # it has a run for.
 
         self._open[tx_id] = (begin_lsn, {})
-        # Without what a rollback to a savepoint took back before the spill: replayed, it
-        # named a run, and a SPILLING marker, for a table left with no change.
-        kept: list[dict[str, Any]] = []
+        # In order, a DISCARD where it came: a run's pages are its table's changes paged
+        # alike in every poll and channel that spills the transaction, wherever each began
+        # to, as the other channel's pages are kept, not written again. Rolled-back
+        # changes left out before paging gave one run two layouts, and a channel read the
+        # other's pages without the rollback (a run left with no change is deleted).
         for record in records:
             if record["op"] == "DISCARD":
-                kept = [r for r in kept if int(r["lsn"]) < int(record["lsn"])]
+                self.discard(tx_id, int(record["lsn"]))
             else:
-                kept.append(record)
-        for record in kept:
-            self.add(record)
+                self.add(record)
         return list(self._open[tx_id][1])
 
     def add(self, record: dict[str, Any]) -> bool:
@@ -21798,7 +21802,19 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             result: dict[str, Table] = {}
             database = self.options.get("database", "")
             for raw in self._bridge.list_tables():
-                table = Table.parse(raw, database)
+                # A table the connector can't read (a column type, or a name, it does not
+                # take) failed the whole list, the tables the include and exclude lists
+                # leave out too. Asked for by name, it fails with its own error.
+                try:
+                    if raw.get("unreadable"):
+                        raise InformixError(raw["unreadable"])
+                    table = Table.parse(raw, database)
+                except (InformixError, ValueError) as error:
+                    named = f"{raw.get('owner')}.{raw.get('name')}"
+                    if self._selected_names((f"{database}:{named}", named)):
+                        # 485: Informix table '{}' is left out of the table list: {}
+                        logging.getLogger(__name__).warning(_m(485, named, error))
+                    continue
                 if self._selected(table):
                     if table.exposed_name in result:
                         # 331: Duplicate exposed table name {}
@@ -21809,9 +21825,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         return self._tables
 
     def _selected(self, table: Table) -> bool:
+        return self._selected_names((table.identity, table.exposed_name, table.native_identity))
+
+    def _selected_names(self, names: tuple) -> bool:
         include = _patterns(self.options.get("table.include.list") or self.options.get("tables"))
         exclude = _patterns(self.options.get("table.exclude.list"))
-        names = (table.identity, table.exposed_name, table.native_identity)
         return (
             not include or any(fnmatch.fnmatchcase(n, p) for n in names for p in include)
         ) and not any(fnmatch.fnmatchcase(n, p) for n in names for p in exclude)
