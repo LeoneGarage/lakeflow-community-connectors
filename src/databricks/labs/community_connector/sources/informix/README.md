@@ -114,6 +114,15 @@ or of auto_snapshot's resnapshot of an expired checkpoint, which may establish a
 boundary than the batch had, leaves the floor as that batch published it, since Spark
 goes on from where the batch ended.
 
+A floor written before the pipeline's latest full refresh of every table is not started
+at, if that refresh emptied the targets: one that completed did, and one cancelled or
+failed did once its events show it past RESETTING. Such a refresh, stopped before a
+snapshot of its own replaced the floor, leaves the floor naming rows no target holds, and
+a delete reader starting there read the log from before the refresh on, through whatever
+the source did since (a rebuilt database failed those reads). It waits for this update's
+start instead, as with no floor. The pipelines API is asked when the update begins; where
+it can't be, the floor is started at as before.
+
 In a full refresh of the whole pipeline (the first run included) there is no floor to
 start at, so a bootstrapping delete reader takes the update's start itself: the same
 elected initialization its upsert reader then snapshots from, which it records first if

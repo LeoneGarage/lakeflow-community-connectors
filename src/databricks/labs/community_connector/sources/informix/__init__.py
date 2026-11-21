@@ -27,7 +27,9 @@ def _take_up_registration(reader) -> None:
     if scope is None:
         return
     reader.lakeflow_connect.set_registration_scope(scope)
-    reader.lakeflow_connect.set_update_request(_INFORMIX_REGISTRATION_CONTEXT["request"])
+    reader.lakeflow_connect.set_update_request(
+        _INFORMIX_REGISTRATION_CONTEXT["request"], _INFORMIX_REGISTRATION_CONTEXT.get("reset_at")
+    )
     role = "delete" if reader.lakeflow_connect._is_delete_flow() else "upsert"
     # 10: Informix CDC reader initialized: scope={} table={} role={}
     table = reader.options.get(TABLE_NAME, "<unknown>")

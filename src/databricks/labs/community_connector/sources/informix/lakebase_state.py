@@ -403,6 +403,67 @@ def pipeline_update(pipeline_id: str, update_id: str) -> dict[str, Any] | None:
     return update if isinstance(update, dict) else None
 
 
+def pipeline_updates(pipeline_id: str, pages: int = 3) -> list[dict[str, Any]] | None:
+    # Docstring: The pipeline's updates, newest first, up to ``pages`` pages of 100, as the
+    # pipelines API lists them, or None when it cannot be asked. As pipeline_update: on the
+    # driver, never fatal.
+
+    captured = capture_workspace_credentials()
+    host, token = captured.get("host"), captured.get("token")
+    if not host or not token:
+        return None
+    updates: list[dict[str, Any]] = []
+    page_token = None
+    try:
+        for _ in range(pages):
+            query = "max_results=100" + (
+                f"&page_token={urllib.parse.quote(str(page_token), safe='')}" if page_token else ""
+            )
+            answer = _WorkspaceApi(host, token).request(
+                "GET",
+                f"/api/2.0/pipelines/{pipeline_id}/updates?{query}",
+                deadline=time.monotonic() + 30,
+            )
+            updates += [u for u in (answer or {}).get("updates") or () if isinstance(u, dict)]
+            page_token = (answer or {}).get("next_page_token")
+            if not page_token:
+                break
+    except Exception:
+        _LOGGER.debug("Cannot list the updates of pipeline %s", pipeline_id, exc_info=True)
+        return None
+    return updates
+
+
+def pipeline_events(pipeline_id: str, since: str, pages: int = 3) -> list[dict[str, Any]] | None:
+    # Docstring: The pipeline's events from ``since`` (an ISO timestamp) on, oldest first, up
+    # to ``pages`` pages of 100, or None when the API cannot be asked. As pipeline_update.
+
+    captured = capture_workspace_credentials()
+    host, token = captured.get("host"), captured.get("token")
+    if not host or not token:
+        return None
+    first = {"max_results": "100", "order_by": "timestamp asc", "filter": f"timestamp >= '{since}'"}
+    query = urllib.parse.urlencode(first)
+    events: list[dict[str, Any]] = []
+    try:
+        for _ in range(pages):
+            answer = _WorkspaceApi(host, token).request(
+                "GET",
+                f"/api/2.0/pipelines/{pipeline_id}/events?{query}",
+                deadline=time.monotonic() + 30,
+            )
+            events += [e for e in (answer or {}).get("events") or () if isinstance(e, dict)]
+            page_token = (answer or {}).get("next_page_token")
+            if not page_token:
+                break
+            # A page token goes alone: the API refuses it beside the filter and the order.
+            query = urllib.parse.urlencode({"max_results": "100", "page_token": page_token})
+    except Exception:
+        _LOGGER.debug("Cannot list the events of pipeline %s", pipeline_id, exc_info=True)
+        return None
+    return events
+
+
 def _https_host(host: str) -> str:
     # Docstring: ``host`` for a REST call that carries a bearer token: refused unless HTTPS.
     #

@@ -3791,24 +3791,28 @@ class LakeflowContractTests(unittest.TestCase):
             workspace.update(host="https://ws", token="driver-token")
 
         with (
-            mock.patch.dict(context, {"scope": None, "request": None}),
+            mock.patch.dict(context, {"scope": None, "request": None, "reset_at": None}),
             mock.patch.dict(workspace, {}, clear=True),
             mock.patch.object(package, "_active_spark_session", return_value=session),
             mock.patch.object(module, "_update_request", return_value="full_refresh") as asked,
+            mock.patch.object(module, "_last_reset", return_value=1795259451.936) as reset,
             mock.patch.object(module, "capture_workspace_credentials", side_effect=capture),
         ):
             data = CloudPickleSerializer().dumps(package.InformixDataSource)
             asked.assert_called_once_with(*scope.split("_@_"))
+            reset.assert_called_once_with(scope.split("_@_")[0])
             # Another process: nothing gathered yet.
-            context.update(scope=None, request=None)
+            context.update(scope=None, request=None, reset_at=None)
             workspace.clear()
             self.assertIs(CloudPickleSerializer().loads(data), package.InformixDataSource)
-            self.assertEqual(context, {"scope": scope, "request": "full_refresh"})
+            self.assertEqual(
+                context, {"scope": scope, "request": "full_refresh", "reset_at": 1795259451.936}
+            )
             self.assertEqual(workspace, {"host": "https://ws", "token": "driver-token"})
             # A process that was handed them hands the same on, and asks nothing again.
             again = CloudPickleSerializer().dumps(package.InformixDataSource)
             asked.assert_called_once()
-            context.update(scope=None, request=None)
+            context.update(scope=None, request=None, reset_at=None)
             CloudPickleSerializer().loads(again)
             self.assertEqual(context["scope"], scope)
             # A driver kept warm registers again under the next update: gathered anew.
@@ -3822,6 +3826,7 @@ class LakeflowContractTests(unittest.TestCase):
                 ).get(key, default)
             )
             asked.return_value = "continue"
+            reset.return_value = None
             workspace.update(token="stale-token")
             capture_later = mock.Mock(side_effect=lambda: workspace.update(token="fresh-token"))
             with mock.patch.object(module, "capture_workspace_credentials", capture_later):
@@ -3829,10 +3834,10 @@ class LakeflowContractTests(unittest.TestCase):
             self.assertEqual(asked.call_count, 2)
             capture_later.assert_called_once()
             # A worker Spark kept from the earlier update takes the new update's up.
-            context.update(scope=scope, request="full_refresh")
+            context.update(scope=scope, request="full_refresh", reset_at=1795259451.936)
             workspace.update(token="stale-token")
             CloudPickleSerializer().loads(data)
-            self.assertEqual(context, {"scope": later, "request": "continue"})
+            self.assertEqual(context, {"scope": later, "request": "continue", "reset_at": None})
             self.assertEqual(workspace["token"], "fresh-token")
         # The lookup by source name still finds the class.
         from databricks.labs.community_connector.sparkpds import find_data_source
@@ -3851,14 +3856,15 @@ class LakeflowContractTests(unittest.TestCase):
         connector = mock.Mock(options={})
         options = {"tableName": "app.orders"}
         with mock.patch.dict(
-            module._INFORMIX_REGISTRATION_CONTEXT, {"scope": scope, "request": "continue"}
+            module._INFORMIX_REGISTRATION_CONTEXT,
+            {"scope": scope, "request": "continue", "reset_at": 1795259451.936},
         ):
             simple = package.InformixStreamReader(options, None, connector)
             partitioned = package.InformixPartitionedStreamReader(options, None, connector)
         self.assertEqual(
             connector.set_registration_scope.call_args_list, [mock.call(scope), mock.call(scope)]
         )
-        connector.set_update_request.assert_called_with("continue")
+        connector.set_update_request.assert_called_with("continue", 1795259451.936)
         simple.prepareForTriggerAvailableNow()
         partitioned.prepareForTriggerAvailableNow()
         self.assertEqual(connector.prepare_for_trigger_available_now.call_count, 2)
@@ -22046,6 +22052,82 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(again["floor_seed"], new["pipeline_scope"])
         _, on = later.read_table_deletes("app.orders", again, {})
         self.assertNotIn("floor_seed", on)
+
+    def test_a_delete_reader_skips_a_floor_written_before_the_last_reset(self):
+        # A full refresh emptied every target and was stopped before a snapshot of its own
+        # replaced the floor. The next update's delete reader, with no checkpoint, started at
+        # that floor: at deletes of rows no target held, read through whatever the source did
+        # since (seen live: a database rebuilt twice failed the reads, SQ_LODATA -1). It waits
+        # for this update's start instead; a floor written after the reset still stands.
+        bridge = FakeBridge()
+        reader = self._floor_updates(bridge)
+        _, snapshot = reader(2, "full_refresh").read_table("app.orders", {}, {})
+        written = time.time()
+        for reset_at, seeded in ((written + 60, False), (written - 60, True)):
+            with self.subTest(reset_at=reset_at - written):
+                later = reader(4)
+                later.set_update_request("continue", reset_at)
+                _, start = later.read_table_deletes("app.orders", {}, {})
+                if seeded:
+                    self.assertEqual(start["commit_lsn"], snapshot["commit_lsn"])
+                    continue
+                self.assertNotIn("commit_lsn", start)
+                with mock.patch.object(
+                    later, "_capacity_attempt", side_effect=AssertionError("took a slot")
+                ):
+                    _, still = later.read_table_deletes("app.orders", start, {})
+                self.assertNotIn("commit_lsn", still)
+
+    def test_the_last_reset_is_the_latest_whole_refresh_past_resetting(self):
+        # The pipelines API keeps no stage of an update: one cancelled before RESETTING
+        # emptied nothing and is passed over, as is the retry of a failed one, which goes on
+        # with what it began.
+        def update(uid, created, *, full=True, state="CANCELED", cause="USER_ACTION"):
+            return {
+                "update_id": uid,
+                "creation_time": created,
+                "start_time": f"2026-11-21T11:{created:02d}:00.000Z",
+                "full_refresh": full,
+                "state": state,
+                "cause": cause,
+            }
+
+        def progress(uid, state):
+            return {
+                "origin": {"update_id": uid},
+                "event_type": "update_progress",
+                "details": {"update_progress": {"state": state}},
+            }
+
+        updates = [
+            update("now", 50, full=False, state="RUNNING", cause="JOB_TASK"),
+            update("retry", 40, cause="RETRY_ON_FAILURE", state="FAILED"),
+            update("early", 30),
+            update("reset", 20),
+            update("done", 10, state="COMPLETED"),
+        ]
+        events = {
+            "early": [progress("early", "INITIALIZING"), progress("early", "CANCELED")],
+            "reset": [
+                progress("other", "RUNNING"),
+                progress("reset", "RESETTING"),
+                progress("reset", "SETTING_UP_TABLES"),
+            ],
+        }
+        started = {u["start_time"]: u["update_id"] for u in updates}
+        with (
+            mock.patch.object(informix_module, "pipeline_updates", return_value=updates),
+            mock.patch.object(
+                informix_module,
+                "pipeline_events",
+                side_effect=lambda pipeline, since: events.get(started[since], []),
+            ),
+        ):
+            self.assertEqual(informix_module._last_reset("p"), 0.02)
+            updates.remove(updates[3])
+            self.assertEqual(informix_module._last_reset("p"), 0.01)
+        with mock.patch.object(informix_module, "pipeline_updates", return_value=None):
+            self.assertIsNone(informix_module._last_reset("p"))
 
     def test_a_floor_the_delete_reader_turned_down_takes_no_connection_slot_again(self):
         # The floor is another column layout's (or out of the log): the reader can't start

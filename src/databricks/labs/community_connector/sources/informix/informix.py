@@ -107,7 +107,9 @@ from databricks.labs.community_connector.sources.informix.lakebase_state import 
     heartbeat_waiter,
     list_spill_runs,
     merge_spill_run,
+    pipeline_events,
     pipeline_update,
+    pipeline_updates,
     pool_progress_token,
     publish_backlog_hint,
     publish_connection_limit,
@@ -1190,7 +1192,7 @@ _SHARED_STATE_MOUNT_RETRY_MAX_SECONDS = 8.0
 _MAX_REGISTRATION_TABLE_CACHES = 512
 # Predecessor hops a same-position channel start may follow back to its first schema.
 _MAX_SCHEMA_DESCENT = 256
-_INFORMIX_REGISTRATION_CONTEXT: dict[str, Any] = {"scope": None, "request": None}
+_INFORMIX_REGISTRATION_CONTEXT: dict[str, Any] = {"scope": None, "request": None, "reset_at": None}
 # How old the driver's captured workspace credential may get before the driver, packing a
 # registration, captures it again: the ambient token lasts about an hour.
 _CREDENTIAL_RECAPTURE_SECONDS = 900.0
@@ -1215,8 +1217,12 @@ def _update_request(pipeline_id: str, update_id: str) -> str | None:
     # start itself only in a whole one (_full_refresh_delete_seed).
 
     update = pipeline_update(pipeline_id, update_id)
-    if update is None:
-        return None
+    return None if update is None else _update_purpose(update)
+
+
+def _update_purpose(update: dict[str, Any]) -> str:
+    # Docstring: What an update of the pipelines API was started for (see _update_request).
+
     if update.get("cause") == "RETRY_ON_FAILURE":
         return "continue"
     # Tables named by name or by source file (an editor's "run file with full refresh").
@@ -1230,6 +1236,52 @@ def _update_request(pipeline_id: str, update_id: str) -> str | None:
     if update.get("full_refresh") and not partial:
         return "full_refresh"
     return "selective_refresh" if selected or update.get("full_refresh") else "continue"
+
+
+# Where a full refresh's update has emptied every target and checkpoint: past RESETTING.
+_RESET_STATES = frozenset({"SETTING_UP_TABLES", "RUNNING", "STOPPING", "COMPLETED"})
+
+
+def _last_reset(pipeline_id: str) -> float | None:
+    # Docstring: When the pipeline's latest full refresh of every table that emptied the
+    # targets was created, in seconds since the epoch, or None when the pipelines API can't
+    # say or lists none.
+    #
+    # One stopped as early as it started emptied nothing: one that completed did, and one
+    # stopped or failed did if its events show it past RESETTING. A snapshot floor written
+    # before it names rows no target holds (_floor_predates_reset).
+
+    refreshes = 0
+    for update in pipeline_updates(pipeline_id) or ():
+        if _update_purpose(update) != "full_refresh":
+            continue
+        try:
+            created = int(update["creation_time"]) / 1000
+        except (KeyError, TypeError, ValueError):
+            return None
+        if update.get("state") == "COMPLETED" or _update_reset(pipeline_id, update):
+            return created
+        refreshes += 1
+        if refreshes >= 3:
+            return None
+    return None
+
+
+def _update_reset(pipeline_id: str, update: dict[str, Any]) -> bool:
+    # Docstring: Whether an update's events show it past RESETTING, which empties the targets.
+
+    for event in pipeline_events(pipeline_id, str(update.get("start_time"))) or ():
+        origin = event.get("origin") if isinstance(event.get("origin"), dict) else {}
+        if origin.get("update_id") != update.get("update_id"):
+            continue
+        details = event.get("details") if isinstance(event.get("details"), dict) else {}
+        progress = details.get("update_progress")
+        state = progress.get("state") if isinstance(progress, dict) else None
+        if state in _RESET_STATES:
+            return True
+        if state in {"CANCELED", "FAILED"}:
+            return False
+    return False
 
 
 class _StateValidationCoordinator:
@@ -1700,10 +1752,10 @@ def _replay_between_offsets(start, end, read, options, connector_options, staged
             options[_REPLAY_END_SEED_OPTION] = previous_seed
 
 
-def _registration_identity(spark_session: Any | None) -> tuple[str, str | None]:
+def _registration_identity(spark_session: Any | None) -> tuple[str, str | None, float | None]:
     # Docstring: The scope of this registration, from the pipeline and update the Spark
-    # session runs under (a random one outside a pipeline), and what the update was
-    # started for (see _update_request).
+    # session runs under (a random one outside a pipeline), what the update was started for
+    # (see _update_request), and when the pipeline's targets were last reset (_last_reset).
 
     pipeline_id: str | None = None
     update_id: str | None = None
@@ -1714,12 +1766,12 @@ def _registration_identity(spark_session: Any | None) -> tuple[str, str | None]:
         except (AttributeError, TypeError):
             pass
     if not pipeline_id or not update_id:
-        return secrets.token_hex(16), None
+        return secrets.token_hex(16), None, None
     registration_scope = f"{pipeline_id}_@_{update_id}".lower()
     if _PIPELINE_SCOPE.fullmatch(registration_scope) is None:
         # 9: Spark pipeline and update IDs must be canonical UUID strings
         raise ValueError(_m(9))
-    return registration_scope, _update_request(pipeline_id, update_id)
+    return registration_scope, _update_request(pipeline_id, update_id), _last_reset(pipeline_id)
 
 
 def _driver_registration(spark_session: Any | None = None) -> dict[str, Any]:
@@ -1749,8 +1801,9 @@ def _driver_registration(spark_session: Any | None = None) -> dict[str, Any]:
     if held is None or (running is not None and running != held):
         capture_workspace_credentials()
         _CREDENTIAL_CAPTURED.update(at=now, pid=os.getpid())
-        scope, request = _registration_identity(spark_session)
+        scope, request, reset_at = _registration_identity(spark_session)
         _INFORMIX_REGISTRATION_CONTEXT["request"] = request
+        _INFORMIX_REGISTRATION_CONTEXT["reset_at"] = reset_at
         _INFORMIX_REGISTRATION_CONTEXT["scope"] = scope
     elif (
         _CREDENTIAL_CAPTURED.get("pid") == os.getpid()
@@ -1768,6 +1821,7 @@ def _driver_registration(spark_session: Any | None = None) -> dict[str, Any]:
     return {
         "scope": _INFORMIX_REGISTRATION_CONTEXT["scope"],
         "request": _INFORMIX_REGISTRATION_CONTEXT["request"],
+        "reset_at": _INFORMIX_REGISTRATION_CONTEXT["reset_at"],
         "workspace": dict(_CAPTURED_WORKSPACE),
     }
 
@@ -1782,6 +1836,7 @@ def _install_registration(state: dict[str, Any]) -> None:
     if state.get("scope"):
         _INFORMIX_REGISTRATION_CONTEXT["scope"] = state["scope"]
         _INFORMIX_REGISTRATION_CONTEXT["request"] = state.get("request")
+        _INFORMIX_REGISTRATION_CONTEXT["reset_at"] = state.get("reset_at")
         # Whole: merged in, an earlier update's token stayed where this one carried none.
         _CAPTURED_WORKSPACE.clear()
     if state.get("workspace"):
@@ -1792,8 +1847,9 @@ def _informix_available_now_base(base: type, spark_session: Any | None = None) -
     # Docstring: Wrap the generated reader base without changing the shared adapter source.
 
     original_base = getattr(base, "_informix_original_base", base)
-    registration_scope, update_request = _registration_identity(spark_session)
+    registration_scope, update_request, reset_at = _registration_identity(spark_session)
     _INFORMIX_REGISTRATION_CONTEXT["request"] = update_request
+    _INFORMIX_REGISTRATION_CONTEXT["reset_at"] = reset_at
     # Schema discovery constructs connector instances before stream readers
     # exist. Publish this registration's immutable scope early so those
     # instances can share the registration-scoped catalog snapshot.
@@ -1821,7 +1877,7 @@ def _informix_available_now_base(base: type, spark_session: Any | None = None) -
                     setter(registration_scope)
                 setter = getattr(reader.lakeflow_connect, "set_update_request", None)
                 if setter is not None:
-                    setter(update_request)
+                    setter(update_request, reset_at)
                 options = getattr(reader, "options", {})
                 table = options.get("tableName", "<unknown>")
                 is_delete = getattr(reader.lakeflow_connect, "_is_delete_flow", None)
@@ -10605,6 +10661,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self._registration_scope: str | None = _INFORMIX_REGISTRATION_CONTEXT["scope"]
         # What this update was started for (see _update_request).
         self._update_request: str | None = _INFORMIX_REGISTRATION_CONTEXT.get("request")
+        # When the pipeline's targets were last reset (see _last_reset).
+        self._update_reset_at: float | None = _INFORMIX_REGISTRATION_CONTEXT.get("reset_at")
         self._metadata_session_lock = threading.RLock()
         # Set by a snapshot-drain worker to a callback that reports a staged page to the
         # pool, resetting the consumer's liveness watchdog. None on a normal reader.
@@ -10658,10 +10716,12 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self._spill_runs: dict[tuple[str, str], dict[str, tuple]] = {}
         self._spill_runs_listed: dict[tuple[str, str], float] = {}
 
-    def set_update_request(self, request: str | None) -> None:
-        # Docstring: Install what this update was started for (see _update_request).
+    def set_update_request(self, request: str | None, reset_at: float | None = None) -> None:
+        # Docstring: Install what this update was started for (see _update_request) and when
+        # the pipeline's targets were last reset (see _last_reset).
 
         self._update_request = request
+        self._update_reset_at = reset_at
 
     def set_registration_scope(self, scope: str) -> None:
         # Docstring: Install the scope shared by every reader serialized from one registration.
@@ -13523,6 +13583,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         )
         if not isinstance(record, dict) or not isinstance(record.get("snapshot_scope"), str):
             return False
+        if self._floor_predates_reset(record):
+            return False
         # A floor _delete_floor_seed turned down is not one to wait in a connection slot for.
         rejected = self.__dict__.get("_rejected_delete_floors", {})
         return rejected.get(record_key) != record["snapshot_scope"]
@@ -13555,13 +13617,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         self._validate_immutable_record_header(record, "delete-floor", table.exposed_name)
         schema_id, fingerprint = record.get("schema_id"), _schema_fingerprint(table)
         floor = self._immutable_lsn(record, "start_lsn", table.exposed_name)
-        if (
+        unusable = (
             record.get("table") != table.native_identity
             or record.get("fingerprint") != fingerprint
             or not isinstance(schema_id, str)
             or not re.fullmatch(r"[0-9a-f]{32}", schema_id)
+            or self._floor_predates_reset(record)
             or not self._bridge.minimum_lsn() <= floor <= self._bridge.current_lsn()
-        ):
+        )
+        if unusable:
             # Remembered by its update, so the reader's later tries wait for its upsert
             # reader without a connection slot (_delete_floor_recorded); another floor is
             # judged afresh.
@@ -13583,6 +13647,24 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             "update_fingerprint": fingerprint,
             "floor_seed": record["snapshot_scope"],
         }
+
+    def _floor_predates_reset(self, record: dict) -> bool:
+        # Docstring: Whether a snapshot floor was written before the pipeline's latest full
+        # refresh, which emptied the target the floor's snapshot filled.
+        #
+        # One stopped before a snapshot of its own replaced the floor left it standing, and
+        # the next update's delete readers, with no checkpoint, started there: at deletes of
+        # rows no target held, read through whatever the source did since (seen live: a
+        # database rebuilt twice failed those reads with SQ_LODATA -1). They wait for this
+        # update's start instead, as with no floor, and the next floor is this one's.
+
+        reset_at = self.__dict__.get("_update_reset_at")
+        if reset_at is None:
+            return False
+        try:
+            return float(record.get("created_at")) < float(reset_at)
+        except (TypeError, ValueError):
+            return False
 
     def _full_refresh_delete_start(self, table_options: dict[str, str], snapshot_mode: str) -> bool:
         # Docstring: Whether a delete reader with no checkpoint takes this update's start
