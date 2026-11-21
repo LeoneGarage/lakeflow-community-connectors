@@ -9119,7 +9119,10 @@ def register_lakeflow_source(spark):
                         "SELECT is_ansi FROM sysmaster:sysdatabases WHERE name = ?",
                         (_sysmaster_database_name(self.config["database"]),),
                     )
-                    self._is_ansi_database = len(rows) == 1 and bool(int(_field(rows[0], "is_ansi", 0)))
+                    # Unknown where no row says (a restricted view of sysmaster): left for the
+                    # snapshot to ask, which fails on it (47), not taken for a database without.
+                    if len(rows) == 1:
+                        self._is_ansi_database = bool(int(_field(rows[0], "is_ansi", 0)))
                 except (SqliProtocolError, OSError) as error:
                     self._session_probe_failed(error)
                     # Refused, not asked again: the refusal ended the session, and each later
@@ -9133,20 +9136,26 @@ def register_lakeflow_source(spark):
             # procedure allows them for this session (probed on 14.10: it must be sent as a
             # command, and a value with a newline then compares as any other).
             command = getattr(self.transport, "execute_command", None)
-            if not callable(command) or self.__dict__.get("_newline_refused"):
+            if not callable(command):
                 return
-            try:
-                command("EXECUTE PROCEDURE ifx_allow_newline('t')")
-            except Exception as error:  # pylint: disable=broad-except
-                # A refusal ends the session: connect again, and do not ask a second time.
-                # A broken connection or a lost lease is no refusal: _session_probe_failed
-                # raises for those, before anything is marked (a lease shutdown closing the
-                # client shows as "session is not open", which is neither).
-                self._session_probe_failed(error)
-                self._newline_refused = True
-                # 446: Informix did not allow newlines in quoted strings for this session
-                # ({}); a string value that holds a newline fails with SQL error -282
-                logging.getLogger(__name__).warning(_m(446, error))
+            if not self.__dict__.get("_newline_refused"):
+                try:
+                    command("EXECUTE PROCEDURE ifx_allow_newline('t')")
+                except Exception as error:  # pylint: disable=broad-except
+                    # A refusal ends the session: connect again, and do not ask a second time.
+                    # A broken connection or a lost lease is no refusal: _session_probe_failed
+                    # raises for those, before anything is marked (a lease shutdown closing the
+                    # client shows as "session is not open", which is neither).
+                    self._session_probe_failed(error)
+                    self._newline_refused = True
+                    # 446: Informix did not allow newlines in quoted strings for this session
+                    # ({}); a string value that holds a newline fails with SQL error -282
+                    logging.getLogger(__name__).warning(_m(446, error))
+            # In an ANSI database the probes opened a transaction: ended here, as an operation's
+            # is, so that one connecting outside an operation does not hold its locks. A failure
+            # fails the connect.
+            if self.__dict__.get("_is_ansi_database") and getattr(self.transport, "uncommitted", False):
+                command("COMMIT WORK")
 
         def _check_database_locale(self) -> None:
             # Docstring: Fail a DB_LOCALE whose codeset is not the database's.
@@ -24672,8 +24681,9 @@ def register_lakeflow_source(spark):
             #
             # The single gate the partitioned ``latest_offset``/``get_partitions`` branches
             # share: a non-delete flow, ``snapshot.source`` set, and ``snapshot.mode`` initial or
-            # initial_only (the modes that route to the file serve, keyed or keyless-append;
-            # initial_only stops at the boundary as its live snapshot does). It fires
+            # initial_only (the modes that route to the file serve; initial_only, a keyed table's
+            # alone, which registration and _pin_unl_boundary refuse an append-only table, stops
+            # at the boundary as its live snapshot does). It fires
             # on the first read (no committed offset) and on every continuation microbatch (a
             # snapshot-phase offset), so the serve fans out ``stream.partitioned.snapshot.pages.
             # per.batch`` splits at a time until the boundary offset transitions to the stream
@@ -25848,18 +25858,32 @@ def register_lakeflow_source(spark):
                     # one triggered update with no writes to the table while it runs, and capture
                     # again
                     raise InformixError(_m(489, table.exposed_name, parked[0].get("commit_lsn")))
+                if deletes is not None and parked[0].get("phase") == "snapshot":
+                    # Parked mid-snapshot: the append stream goes on from the snapshot's LSN once
+                    # the pages are served, and the delete flow, which streams from there while
+                    # they are, already applied what came since to the rows served before.
+                    snapshot_at = str(parked[0].get("snapshot_lsn"))
+                    delete_at = _handoff_position(json.loads(deletes["offset_json"]))
+                    if delete_at != snapshot_at:
+                        # 491: table.migration for '{}' parked its upsert flow in the middle of its
+                        # snapshot, taken at LSN {}, but its delete flow at {}, and an append
+                        # stream goes on from the snapshot's LSN: the deletes the delete flow
+                        # applied since would be sent again. Run the keyed configuration without
+                        # table.migration until the snapshot is done and the table streams, then
+                        # capture again
+                        raise InformixError(_m(491, table.exposed_name, snapshot_at, delete_at))
                 if deletes is not None and parked[0].get("phase") == "stream":
                     parked.append(json.loads(deletes["offset_json"]))
-                    upsert_at, delete_at = (
-                        (str(p.get("commit_lsn")), str(p.get("change_lsn"))) for p in parked
-                    )
+                    # The change position too where it is not the commit's: stopped inside one
+                    # commit, the two named the same LSN.
+                    upsert_at, delete_at = (_handoff_position(p) for p in parked)
                     if upsert_at != delete_at:
                         # 488: table.migration for '{}' parked its upsert flow at LSN {} but its
                         # delete flow at {}, and an append stream goes on from one position: the
                         # deletes between them would be lost or sent again. Put the keyed
                         # configuration back without table.migration, run one triggered update with
                         # no writes to the table while it runs, and capture again
-                        raise InformixError(_m(488, table.exposed_name, upsert_at[0], delete_at[0]))
+                        raise InformixError(_m(488, table.exposed_name, upsert_at, delete_at))
                 # Seed from the parked position and stop (no rows); migration never streams.
                 # Adopts this flow's scope -- the seam is carried by the scope-independent LSNs,
                 # and the first stream read (after Restore clears table.migration) re-publishes
@@ -31711,6 +31735,14 @@ def register_lakeflow_source(spark):
             if name in result:
                 result[name] = check(result)
         return result
+
+
+    def _handoff_position(offset: dict[str, Any]) -> str:
+        # Docstring: A parked offset's stream position as messages give it: its commit LSN, and
+        # its change LSN where that is another.
+
+        commit, change = str(offset.get("commit_lsn")), str(offset.get("change_lsn"))
+        return commit if change == commit else f"{commit} (change {change})"
 
 
     def _validated_offset(offset: dict[str, Any]) -> dict[str, Any]:

@@ -15414,6 +15414,47 @@ class LakeflowContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(InformixError, expected):
                     self.connector(bridge).read_table("app.orders", {}, options)
 
+    def test_an_append_cutover_mid_snapshot_refuses_a_delete_flow_past_its_snapshot(self):
+        # Parked mid-snapshot, the append stream goes on from the snapshot's LSN once the
+        # pages are served; the delete flow, streaming from there while they were, already
+        # applied what came since, and those deletes were sent again.
+        migration = {"table.migration": "true"}
+        options = {**migration, "append.only.ingestion": "true"}
+        for ahead, refused in ((5, True), (0, False)):
+            with self.subTest(ahead=ahead):
+                self._lakebase.database.handoff.clear()
+                bridge = FakeBridge()
+                capture = self.connector(bridge, **{"snapshot.page.size": "1"})
+                _, mid = capture.read_table("app.orders", {}, {})
+                self.assertEqual(mid["phase"], "snapshot")
+                capture.read_table("app.orders", mid, migration)
+                at = int(mid["snapshot_lsn"]) + ahead
+                capture.read_table_deletes("app.orders", _stream_offset(at), migration)
+                cutover = self.connector(bridge, **{"snapshot.page.size": "1"})
+                if refused:
+                    expected = f"taken at LSN {mid['snapshot_lsn']}, but its delete flow at {at}"
+                    with self.assertRaisesRegex(InformixError, expected):
+                        cutover.read_table("app.orders", {}, options)
+                    continue
+                _, seeded = cutover.read_table("app.orders", {}, options)
+                self.assertEqual(seeded["phase"], "snapshot")
+
+    def test_an_append_cutover_names_the_change_position_where_the_flows_differ_by_it(self):
+        # Compared by commit and change position, but named by the commit's alone: flows
+        # stopped inside one commit were said to be at the same LSN.
+        migration = {"table.migration": "true"}
+        bridge = FakeBridge()
+        capture = self.connector(bridge)
+        capture.read_table("app.orders", _stream_offset(125), migration)
+        inside = {**_stream_offset(125), "change_lsn": "124", "begin_lsn": "120"}
+        capture.read_table_deletes("app.orders", inside, migration)
+
+        expected = r"at LSN 125 but its delete flow at 125 \(change 124\)"
+        with self.assertRaisesRegex(InformixError, expected):
+            self.connector(bridge).read_table(
+                "app.orders", {}, {**migration, "append.only.ingestion": "true"}
+            )
+
     def test_an_append_relocation_parks_no_delete_position_and_cuts_over(self):
         # An append flow has no delete flow beside it, so its token alone is complete.
         options = {"table.migration": "true", "append.only.ingestion": "true"}
@@ -28485,6 +28526,38 @@ class MixedDirectionKeyTests(unittest.TestCase):
 
         self.assertNotIn("ROLLBACK WORK", bridge.transport.commands)
         self.assertFalse(getattr(caught.exception, "__notes__", []))
+
+    def test_a_connect_ends_the_transaction_its_probes_opened_in_an_ansi_database(self):
+        # Ended only by an operation: a caller connecting outside one (the ANSI live test)
+        # held the probes' locks. And a probe no row answered was taken for a database that
+        # is not ANSI, which a snapshot then never asked again (47).
+        class Transport:
+            def __init__(self, answer):
+                self.answer, self.uncommitted, self.commands = answer, False, []
+
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                self.uncommitted = True
+                return self.answer
+
+            def execute_command(self, sql):
+                self.commands.append(sql)
+                self.uncommitted = sql != "COMMIT WORK"
+
+        for answer, ansi, ended in (
+            ([{"is_ansi": 1}], True, True),
+            ([{"is_ansi": 0}], False, False),
+            ([], None, False),
+        ):
+            with self.subTest(answer=answer):
+                bridge = object.__new__(PurePythonInformixBridge)
+                bridge.options = {}
+                bridge.config = {"database": "demo"}
+                bridge.transport = Transport(answer)
+                bridge._connect_transport()
+                self.assertIs(bridge.__dict__.get("_is_ansi_database"), ansi)
+                self.assertEqual("COMMIT WORK" in bridge.transport.commands, ended)
+                if ansi:
+                    self.assertFalse(bridge.transport.uncommitted)
 
     def test_an_ansi_commit_on_a_broken_session_leaves_the_operation_standing(self):
         # A session that broke under the COMMIT WORK ended its transaction with it: the

@@ -1822,6 +1822,11 @@ append stream simply continues on top of them.
     the parked page, then streams under its own scope. Because the pages are referenced,
     the cutover must happen within `snapshot.staging.retention.days` (the age-based sweep
     reclaims abandoned staging); a longer gap reclaims the pages and forces a re-snapshot.
+    An `scd_type` switch to append-only (Case 1) of a keyed table parked mid-serve fails
+    at cutover once its delete flow has moved past the snapshot's LSN, as it does while
+    the pages are served: the append stream goes on from that LSN and would send the
+    deletes since again. Run the keyed configuration without `table.migration` until the
+    snapshot is done and the table streams, then capture again.
 - **Capture and cut over in the same pipeline.** The parked positions are found by source table, but a delete flow that has no checkpoint at capture parks none, and the cutover's delete flow then starts at that pipeline's snapshot floor, below the parked upsert position. A pipeline that never snapshotted the table has no floor, so its delete flow would start at the upsert position and skip the deletes between.
 - **Keep the two runs close together.** The parked position must still be within
   Informix's retained logical logs at cutover; a long gap risks it aging out.
