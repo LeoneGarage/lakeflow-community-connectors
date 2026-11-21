@@ -4555,6 +4555,24 @@ def register_lakeflow_source(spark):
         pass
 
 
+    class SqliSqlError(SqliProtocolError):
+        # Docstring: An error the server reported for a statement (SQ_ERR); ``code`` is its SQL
+        # error code.
+
+        code = 0
+
+
+    def _sql_error(error: tuple, during: str = "") -> SqliSqlError:
+        # Docstring: The SqliSqlError for a statement's SQ_ERR ``error`` (code, ISAM code,
+        # offset, text).
+
+        failure = SqliSqlError(
+            f"Informix SQL error {error[0]}/{error[1]} at {error[2]}{during}: {error[3]}"
+        )
+        failure.code = int(error[0])
+        return failure
+
+
     def informix_locale_encoding(locale: str | None) -> str:
         # Docstring: Return the verified Python codec for an Informix locale codeset.
 
@@ -5185,6 +5203,14 @@ def register_lakeflow_source(spark):
     # What no retry helps: a certificate that failed verification, a login refused (bad
     # credentials, a login deadline, a redirect not allowed), a type the client can't decode,
     # an ssl.ca.file path that names no file (see _ca_file_misnamed).
+    # Errors in the statement itself, which a new session reads the same way: a syntax error
+    # (a snapshot.filter's), a table or column not there, a privilege missing, a refused
+    # newline, a value that does not convert or overflows. Retried as a lost connection, each
+    # reconnected and failed again before the read did. Any other SQL error, a locked row's
+    # among them, is still retried on a new session.
+    _STATEMENT_SQL_ERRORS = frozenset(
+        {-201, -206, -217, -272, -282, -329, -387, -1213, -1226, -1262, -1263}
+    )
     CONFIGURATION_ERRORS = (
         ssl.SSLCertVerificationError,
         SqliUnsupportedAuthentication,
@@ -5204,7 +5230,9 @@ def register_lakeflow_source(spark):
         # credentials, a login deadline, a redirect not allowed) or a type it can't decode:
         # those are configuration, and fail the same way again.
 
-        if isinstance(error, CONFIGURATION_ERRORS):
+        if isinstance(error, CONFIGURATION_ERRORS) or (
+            isinstance(error, SqliSqlError) and error.code in _STATEMENT_SQL_ERRORS
+        ):
             return False
         return isinstance(error, (SqliProtocolError, socket.gaierror, *_CONNECTION_LOSS)) or (
             isinstance(error, OSError) and error.errno in _UNREACHABLE_ERRNOS
@@ -5787,6 +5815,9 @@ def register_lakeflow_source(spark):
         # bridge doesn't page on (see PurePythonInformixBridge._unaltered); a command after the
         # query, such as the COMMIT WORK ending its read, leaves them.
         altered: set[str] = field(default_factory=set, init=False, repr=False)
+        # Whether a statement ran since the last COMMIT or ROLLBACK WORK: in an ANSI database it
+        # opened a transaction, which keeps what it read locked (see the bridge's operations).
+        uncommitted: bool = field(default=False, init=False, repr=False)
 
         def connect(self) -> "InformixSqliClient":
             if not self.server_name:
@@ -6177,9 +6208,7 @@ def register_lakeflow_source(spark):
                 if code == SQ_ERR:
                     error = self._read_error()
                     if error[0] != 100:
-                        raise SqliProtocolError(
-                            f"Informix SQL error {error[0]}/{error[1]} at {error[2]}: {error[3]}"
-                        )
+                        raise _sql_error(error)
                     continue
                 raise SqliProtocolError(f"unknown status response message {code}")
 
@@ -6395,6 +6424,11 @@ def register_lakeflow_source(spark):
                     )
                     output_stream.flush()
                     self._read_status_group(require_done=True)
+                    keyword = _statement_keyword(sql)
+                    if keyword in ("COMMIT", "ROLLBACK"):
+                        self.uncommitted = False
+                    elif keyword not in ("SET", "BEGIN"):
+                        self.uncommitted = True
                 except Exception as error:
                     self._poison()
                     _raise_connection_loss(error)
@@ -6418,6 +6452,7 @@ def register_lakeflow_source(spark):
                 # A query's first result group: its rows' own (see altered). Not a command's,
                 # which left none of the COMMIT WORK after a read to check.
                 self.altered = set()
+                self.uncommitted = True
             rows, exhausted = [], False
             # Fixed for the whole result, so decided once per batch rather than per tuple.
             variable_layout = None
@@ -6440,9 +6475,7 @@ def register_lakeflow_source(spark):
                     if error[0] == 100:
                         exhausted = True
                     else:
-                        raise SqliProtocolError(
-                            f"Informix SQL error {error[0]}/{error[1]} at {error[2]}: {error[3]}"
-                        )
+                        raise _sql_error(error)
                 elif code == 55:
                     read_exact(self._input, 8)
                 elif code == 99:
@@ -6663,11 +6696,7 @@ def register_lakeflow_source(spark):
                                 remaining -= chunk_size
                             continue
                         if code == SQ_ERR:
-                            error = self._read_error()
-                            raise SqliProtocolError(
-                                f"Informix SQL error {error[0]}/{error[1]} "
-                                f"at {error[2]} during LODATA: {error[3]}"
-                            )
+                            raise _sql_error(self._read_error(), " during LODATA")
                         raise SqliProtocolError(f"unexpected SQLI message {code} during LODATA")
                 except Exception as error:
                     self._poison()
@@ -8769,13 +8798,19 @@ def register_lakeflow_source(spark):
                 if lost():
                     # 12: Informix connection-capacity lease was lost before the SQLI operation
                     raise ConnectionCapacityUnavailable(_m(12))
+                depth = self.__dict__.get("_operation_depth", 0)
+                self._operation_depth = depth + 1
                 try:
                     result = method(self, *args, **kwargs)
+                    if not depth:
+                        self._end_ansi_transaction()
                 except BaseException as error:
                     if lost():
                         # 13: Informix connection-capacity lease was lost during the SQLI operation
                         raise ConnectionCapacityUnavailable(_m(13)) from error
                     raise
+                finally:
+                    self._operation_depth = depth
                 if lost():
                     # 13: Informix connection-capacity lease was lost during the SQLI operation
                     raise ConnectionCapacityUnavailable(_m(13))
@@ -9001,11 +9036,35 @@ def register_lakeflow_source(spark):
             if callable(connect):
                 connect()
 
+        def _end_ansi_transaction(self) -> None:
+            # Docstring: End the transaction an operation's statements opened in an ANSI database,
+            # where every statement opens one and it keeps what it read locked until a COMMIT
+            # WORK. Left open, a CDC shard leader's catalog and log position reads held their
+            # locks on systables and the rest through a whole catch-up, and DDL on the tables
+            # waited. A snapshot's transaction ends itself (_repeatable_read_transaction).
+
+            if self.__dict__.get("_is_ansi_database") and getattr(self.transport, "uncommitted", False):
+                self.transport.execute_command("COMMIT WORK")
+
         def _connect_transport(self) -> None:
             connect = getattr(self.transport, "connect", None)
             if connect:
                 connect()
             self._check_database_locale()
+            # Whether each operation's transaction is the bridge's to end (_end_ansi_transaction):
+            # known only to a snapshot's before, which a shard leader's reader never reads.
+            execute = getattr(self.transport, "execute", None)
+            if self.__dict__.get("_is_ansi_database") is None and callable(execute):
+                try:
+                    rows = execute(
+                        "SELECT is_ansi FROM sysmaster:sysdatabases WHERE name = ?",
+                        (_sysmaster_database_name(self.config["database"]),),
+                    )
+                    self._is_ansi_database = len(rows) == 1 and bool(int(_field(rows[0], "is_ansi", 0)))
+                except (SqliProtocolError, OSError) as error:
+                    self._session_probe_failed(error)
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    pass  # left to the first snapshot to find out, as before
             # Informix takes a string value as a quoted literal within the statement, and by
             # default (ALLOW_NEWLINE 0) refuses one that holds a newline with -282, which
             # also ends the session. A keyset bound or a looked-up key can hold one. The
@@ -15922,9 +15981,6 @@ def register_lakeflow_source(spark):
         # An error other than the lock being taken -- an unusable directory included --
         # marks host sharing unavailable here, so this process shares within itself.
 
-        import fcntl
-        import multiprocessing.connection
-
         with endpoints.lock:
             if key in endpoints.leading:
                 return True
@@ -15932,6 +15988,11 @@ def register_lakeflow_source(spark):
                 return False
             descriptor = None
             try:
+                # POSIX's alone (flock, AF_UNIX, a user id, O_NOFOLLOW): elsewhere host sharing is
+                # off, as for an unusable directory, where an ImportError failed the read.
+                import fcntl
+                import multiprocessing.connection
+
                 lock_path, socket_path, key_path = endpoints.paths(key)
                 descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
                 try:
@@ -15951,7 +16012,7 @@ def register_lakeflow_source(spark):
                 listener = multiprocessing.connection.Listener(
                     socket_path, family="AF_UNIX", backlog=128
                 )
-            except OSError as error:
+            except (OSError, ImportError, AttributeError) as error:
                 if descriptor is not None:
                     os.close(descriptor)
                 endpoints.unavailable = f"{type(error).__name__}: {error}"

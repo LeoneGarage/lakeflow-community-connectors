@@ -7623,6 +7623,7 @@ class LakeflowContractTests(unittest.TestCase):
             made.options = {}
             made.config = {"database": "testdb"}
             made._newline_refused = True
+            made._is_ansi_database = False  # the locale's query alone (see the ANSI probe)
             return made
 
         wrong = bridge(Transport("en_US.819", "en_US.utf8"))
@@ -7811,7 +7812,8 @@ class LakeflowContractTests(unittest.TestCase):
         bridge._connect_transport()
         bridge._connected = True
         self.assertFalse(bridge.buffered_logging())
-        self.assertEqual(seen, [("testdb",), ("testdb",)])
+        # The locale's, the ANSI probe's and the logging mode's.
+        self.assertEqual(seen, [("testdb",), ("testdb",), ("testdb",)])
 
     def test_the_connector_leaves_the_callers_options_as_they_were(self):
         given = {
@@ -24957,6 +24959,26 @@ class HostShardEndpointPathTests(unittest.TestCase):
         ):
             return informix_module._HostShardEndpoints().paths(("ns", "scope", "upsert", 0))
 
+    def test_a_platform_without_posix_locks_shares_within_the_process(self):
+        # Without fcntl, a user id or O_NOFOLLOW (Windows) the ImportError or AttributeError
+        # failed the read, where an unusable directory turns host sharing off.
+        for missing in ("getuid", "O_NOFOLLOW"):
+            with self.subTest(missing=missing):
+                endpoints = informix_module._HostShardEndpoints()
+                if missing == "O_NOFOLLOW":
+                    endpoints.directory = tempfile.mkdtemp()
+                original = getattr(informix_module.os, missing)
+                delattr(informix_module.os, missing)
+                try:
+                    with self.assertLogs(informix_module.__name__, "WARNING"):
+                        led = informix_module._host_shard_try_lead(
+                            endpoints, ("ns", "scope", "upsert", 0), lambda: None, {}
+                        )
+                finally:
+                    setattr(informix_module.os, missing, original)
+                self.assertFalse(led)
+                self.assertIn("AttributeError", endpoints.unavailable)
+
     def test_a_short_temp_directory_is_used(self):
         _, socket_path, _ = self._paths("/tmp")
         self.assertTrue(socket_path.startswith(f"/tmp/informix-cdc-shards-{os.getuid()}/"))
@@ -24983,6 +25005,7 @@ class CurrentUtcTimeTests(unittest.TestCase):
         )
         bridge.transport = mock.Mock()
         bridge.transport.execute.side_effect = error
+        bridge._is_ansi_database = False  # the time probe's queries alone
         bridge._ensure_connected()
         return bridge
 
@@ -28059,6 +28082,45 @@ class MixedDirectionKeyTests(unittest.TestCase):
         self.assertIsNone(bridge.key_index_directions("demo.app.t", ["b", "a"]))
         self.assertIsNone(bridge.key_index_directions("demo.app.t", ["c"]))
 
+
+    def test_an_ansi_databases_operation_ends_the_transaction_its_statements_opened(self):
+        # Every statement opens one there and it keeps what it read locked: a shard leader's
+        # catalog and log position reads held systables through a whole catch-up. Once, by
+        # the outermost operation, and only where a statement ran since the last commit.
+        class Transport:
+            def __init__(self, ansi):
+                self.ansi, self.uncommitted, self.commands = ansi, False, []
+
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                self.uncommitted = True
+                if "is_ansi" in sql:
+                    return [{"is_ansi": self.ansi}]
+                return [{"uniqid": 5, "used": 10}]
+
+            def execute_command(self, sql):
+                self.commands.append(sql)
+                self.uncommitted = sql != "COMMIT WORK"
+
+        @informix_module._serialized_sqli_operation
+        def outer(bridge):
+            return bridge.current_lsn(), bridge.transport.execute("SELECT 1")
+
+        for ansi, commits in ((1, ["COMMIT WORK"]), (0, [])):
+            with self.subTest(ansi=ansi):
+                bridge = object.__new__(PurePythonInformixBridge)
+                bridge.options = {}
+                bridge.config = {"database": "demo"}
+                bridge._operation_lock = threading.RLock()
+                bridge.transport = Transport(ansi)
+                bridge._connect_transport()
+                self.assertEqual(bridge._is_ansi_database, bool(ansi))
+                bridge.transport.commands.clear()
+                outer(bridge)
+                self.assertEqual(bridge.transport.commands, commits)
+                bridge.transport.commands.clear()
+                bridge.transport.uncommitted = False
+                bridge._end_ansi_transaction()
+                self.assertEqual(bridge.transport.commands, [])
 
     def test_key_index_directions_reads_a_positional_row_from_its_first_column(self):
         # The index query selects part1..part16 alone, so part1 is column 0: read from

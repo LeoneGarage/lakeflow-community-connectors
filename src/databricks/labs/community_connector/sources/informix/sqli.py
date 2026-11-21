@@ -124,6 +124,24 @@ class SqliSessionRejected(SqliProtocolError):
     pass
 
 
+class SqliSqlError(SqliProtocolError):
+    # Docstring: An error the server reported for a statement (SQ_ERR); ``code`` is its SQL
+    # error code.
+
+    code = 0
+
+
+def _sql_error(error: tuple, during: str = "") -> SqliSqlError:
+    # Docstring: The SqliSqlError for a statement's SQ_ERR ``error`` (code, ISAM code,
+    # offset, text).
+
+    failure = SqliSqlError(
+        f"Informix SQL error {error[0]}/{error[1]} at {error[2]}{during}: {error[3]}"
+    )
+    failure.code = int(error[0])
+    return failure
+
+
 def informix_locale_encoding(locale: str | None) -> str:
     # Docstring: Return the verified Python codec for an Informix locale codeset.
 
@@ -754,6 +772,14 @@ _UNREACHABLE_ERRNOS = frozenset({errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EN
 # What no retry helps: a certificate that failed verification, a login refused (bad
 # credentials, a login deadline, a redirect not allowed), a type the client can't decode,
 # an ssl.ca.file path that names no file (see _ca_file_misnamed).
+# Errors in the statement itself, which a new session reads the same way: a syntax error
+# (a snapshot.filter's), a table or column not there, a privilege missing, a refused
+# newline, a value that does not convert or overflows. Retried as a lost connection, each
+# reconnected and failed again before the read did. Any other SQL error, a locked row's
+# among them, is still retried on a new session.
+_STATEMENT_SQL_ERRORS = frozenset(
+    {-201, -206, -217, -272, -282, -329, -387, -1213, -1226, -1262, -1263}
+)
 CONFIGURATION_ERRORS = (
     ssl.SSLCertVerificationError,
     SqliUnsupportedAuthentication,
@@ -773,7 +799,9 @@ def reconnectable_error(error: BaseException) -> bool:
     # credentials, a login deadline, a redirect not allowed) or a type it can't decode:
     # those are configuration, and fail the same way again.
 
-    if isinstance(error, CONFIGURATION_ERRORS):
+    if isinstance(error, CONFIGURATION_ERRORS) or (
+        isinstance(error, SqliSqlError) and error.code in _STATEMENT_SQL_ERRORS
+    ):
         return False
     return isinstance(error, (SqliProtocolError, socket.gaierror, *_CONNECTION_LOSS)) or (
         isinstance(error, OSError) and error.errno in _UNREACHABLE_ERRNOS
@@ -1356,6 +1384,9 @@ class InformixSqliClient:
     # bridge doesn't page on (see PurePythonInformixBridge._unaltered); a command after the
     # query, such as the COMMIT WORK ending its read, leaves them.
     altered: set[str] = field(default_factory=set, init=False, repr=False)
+    # Whether a statement ran since the last COMMIT or ROLLBACK WORK: in an ANSI database it
+    # opened a transaction, which keeps what it read locked (see the bridge's operations).
+    uncommitted: bool = field(default=False, init=False, repr=False)
 
     def connect(self) -> "InformixSqliClient":
         if not self.server_name:
@@ -1746,9 +1777,7 @@ class InformixSqliClient:
             if code == SQ_ERR:
                 error = self._read_error()
                 if error[0] != 100:
-                    raise SqliProtocolError(
-                        f"Informix SQL error {error[0]}/{error[1]} at {error[2]}: {error[3]}"
-                    )
+                    raise _sql_error(error)
                 continue
             raise SqliProtocolError(f"unknown status response message {code}")
 
@@ -1964,6 +1993,11 @@ class InformixSqliClient:
                 )
                 output_stream.flush()
                 self._read_status_group(require_done=True)
+                keyword = _statement_keyword(sql)
+                if keyword in ("COMMIT", "ROLLBACK"):
+                    self.uncommitted = False
+                elif keyword not in ("SET", "BEGIN"):
+                    self.uncommitted = True
             except Exception as error:
                 self._poison()
                 _raise_connection_loss(error)
@@ -1987,6 +2021,7 @@ class InformixSqliClient:
             # A query's first result group: its rows' own (see altered). Not a command's,
             # which left none of the COMMIT WORK after a read to check.
             self.altered = set()
+            self.uncommitted = True
         rows, exhausted = [], False
         # Fixed for the whole result, so decided once per batch rather than per tuple.
         variable_layout = None
@@ -2009,9 +2044,7 @@ class InformixSqliClient:
                 if error[0] == 100:
                     exhausted = True
                 else:
-                    raise SqliProtocolError(
-                        f"Informix SQL error {error[0]}/{error[1]} at {error[2]}: {error[3]}"
-                    )
+                    raise _sql_error(error)
             elif code == 55:
                 read_exact(self._input, 8)
             elif code == 99:
@@ -2232,11 +2265,7 @@ class InformixSqliClient:
                             remaining -= chunk_size
                         continue
                     if code == SQ_ERR:
-                        error = self._read_error()
-                        raise SqliProtocolError(
-                            f"Informix SQL error {error[0]}/{error[1]} "
-                            f"at {error[2]} during LODATA: {error[3]}"
-                        )
+                        raise _sql_error(self._read_error(), " during LODATA")
                     raise SqliProtocolError(f"unexpected SQLI message {code} during LODATA")
             except Exception as error:
                 self._poison()

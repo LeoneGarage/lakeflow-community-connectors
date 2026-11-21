@@ -2143,13 +2143,19 @@ def _serialized_sqli_operation(method: Callable[..., Any]) -> Callable[..., Any]
             if lost():
                 # 12: Informix connection-capacity lease was lost before the SQLI operation
                 raise ConnectionCapacityUnavailable(_m(12))
+            depth = self.__dict__.get("_operation_depth", 0)
+            self._operation_depth = depth + 1
             try:
                 result = method(self, *args, **kwargs)
+                if not depth:
+                    self._end_ansi_transaction()
             except BaseException as error:
                 if lost():
                     # 13: Informix connection-capacity lease was lost during the SQLI operation
                     raise ConnectionCapacityUnavailable(_m(13)) from error
                 raise
+            finally:
+                self._operation_depth = depth
             if lost():
                 # 13: Informix connection-capacity lease was lost during the SQLI operation
                 raise ConnectionCapacityUnavailable(_m(13))
@@ -2375,11 +2381,35 @@ class PurePythonInformixBridge:
         if callable(connect):
             connect()
 
+    def _end_ansi_transaction(self) -> None:
+        # Docstring: End the transaction an operation's statements opened in an ANSI database,
+        # where every statement opens one and it keeps what it read locked until a COMMIT
+        # WORK. Left open, a CDC shard leader's catalog and log position reads held their
+        # locks on systables and the rest through a whole catch-up, and DDL on the tables
+        # waited. A snapshot's transaction ends itself (_repeatable_read_transaction).
+
+        if self.__dict__.get("_is_ansi_database") and getattr(self.transport, "uncommitted", False):
+            self.transport.execute_command("COMMIT WORK")
+
     def _connect_transport(self) -> None:
         connect = getattr(self.transport, "connect", None)
         if connect:
             connect()
         self._check_database_locale()
+        # Whether each operation's transaction is the bridge's to end (_end_ansi_transaction):
+        # known only to a snapshot's before, which a shard leader's reader never reads.
+        execute = getattr(self.transport, "execute", None)
+        if self.__dict__.get("_is_ansi_database") is None and callable(execute):
+            try:
+                rows = execute(
+                    "SELECT is_ansi FROM sysmaster:sysdatabases WHERE name = ?",
+                    (_sysmaster_database_name(self.config["database"]),),
+                )
+                self._is_ansi_database = len(rows) == 1 and bool(int(_field(rows[0], "is_ansi", 0)))
+            except (SqliProtocolError, OSError) as error:
+                self._session_probe_failed(error)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                pass  # left to the first snapshot to find out, as before
         # Informix takes a string value as a quoted literal within the statement, and by
         # default (ALLOW_NEWLINE 0) refuses one that holds a newline with -282, which
         # also ends the session. A keyset bound or a looked-up key can hold one. The
@@ -9296,9 +9326,6 @@ def _host_shard_try_lead(
     # An error other than the lock being taken -- an unusable directory included --
     # marks host sharing unavailable here, so this process shares within itself.
 
-    import fcntl
-    import multiprocessing.connection
-
     with endpoints.lock:
         if key in endpoints.leading:
             return True
@@ -9306,6 +9333,11 @@ def _host_shard_try_lead(
             return False
         descriptor = None
         try:
+            # POSIX's alone (flock, AF_UNIX, a user id, O_NOFOLLOW): elsewhere host sharing is
+            # off, as for an unusable directory, where an ImportError failed the read.
+            import fcntl
+            import multiprocessing.connection
+
             lock_path, socket_path, key_path = endpoints.paths(key)
             descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
             try:
@@ -9325,7 +9357,7 @@ def _host_shard_try_lead(
             listener = multiprocessing.connection.Listener(
                 socket_path, family="AF_UNIX", backlog=128
             )
-        except OSError as error:
+        except (OSError, ImportError, AttributeError) as error:
             if descriptor is not None:
                 os.close(descriptor)
             endpoints.unavailable = f"{type(error).__name__}: {error}"

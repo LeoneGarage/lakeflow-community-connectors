@@ -935,6 +935,39 @@ class SqliPacketTests(unittest.TestCase):
         client._read_query_group(None)
         self.assertEqual(client.altered, set())
 
+    def test_a_statement_error_is_not_retried_as_a_lost_connection(self):
+        # An SQ_ERR was a bare SqliProtocolError, which the reconnect loops took for a lost
+        # connection: a missing table or a filter's syntax error was reconnected and failed
+        # again before the read did. A locked row's is still retried on a new session.
+        for code, retried in ((-206, False), (-201, False), (-272, False), (-244, True)):
+            with self.subTest(code=code):
+                error = _sqli._sql_error((code, -111, 7, "text"))
+                self.assertIsInstance(error, _sqli.SqliProtocolError)
+                self.assertEqual(str(error), f"Informix SQL error {code}/-111 at 7: text")
+                self.assertEqual(_sqli.reconnectable_error(error), retried)
+
+    def test_the_client_knows_whether_a_statement_is_uncommitted(self):
+        # In an ANSI database each statement opens a transaction, which the bridge ends
+        # after its operations (see _end_ansi_transaction); SET and BEGIN open none here.
+        client = InformixSqliClient("host", 9088, "db", "user", "password")
+        client.state = _sqli.ConnectionState.DATABASE_OPEN
+        done = (
+            struct.pack(">hhhh", 99, 1, 2, 1) + struct.pack(">hhiii", 15, 0, 0, 0, 0)
+            + struct.pack(">h", 12)
+        )
+        for sql, uncommitted in (
+            ("SET ISOLATION TO COMMITTED READ", False),
+            ("EXECUTE PROCEDURE ifx_allow_newline('t')", True),
+            ("SET ISOLATION TO REPEATABLE READ", True),
+            ("COMMIT WORK", False),
+        ):
+            client._output, client._input = io.BytesIO(), io.BytesIO(done)
+            client.execute_command(sql)
+            self.assertEqual(client.uncommitted, uncommitted, sql)
+        client._input = io.BytesIO(struct.pack(">h", SQ_EOT))
+        client._read_query_group(None)
+        self.assertTrue(client.uncommitted)
+
     def test_non_row_command_consumes_zero_column_description(self):
         client = InformixSqliClient("host", 9088, "db", "user", "password")
         output = io.BytesIO()
