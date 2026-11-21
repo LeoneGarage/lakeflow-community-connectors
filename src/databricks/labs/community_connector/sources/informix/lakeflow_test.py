@@ -29312,6 +29312,45 @@ class UnloadHelperTests(unittest.TestCase):
             # A count still means the leading columns.
             self.assertEqual(tool._key_names(columns, 2), ["a", "b"])
 
+    def test_the_compare_tool_tells_a_destination_null_from_an_empty_string(self):
+        # The CLI's query tool writes a NULL as "", as it writes an empty string, so a
+        # NULL STRING read as "" and the 8,015 rows of tw901_claim_note with no client
+        # (NULL in Informix too) showed as missing and again as extra.
+        import argparse
+        import re as re_module
+
+        from databricks.labs.community_connector.sources.informix import (
+            compare_live_data_test_tool as tool,
+        )
+
+        table = [{"k": "1", "s": None}, {"k": "2", "s": ""}, {"k": "3", "s": "x"}]
+
+        def cli(_args, statement):
+            # Spark's casts and concat (a NULL in, a NULL out), then the CLI's rendering.
+            items = statement.split("SELECT ", 1)[1].split(" FROM ", 1)[0]
+            rendered = []
+            for row in table:
+                out = {}
+                for item in re_module.findall(r"(.+?) AS `([^`]+)`(?:,|$)", items):
+                    expression, alias = item
+                    cast = r"CAST\(`(\w+)` AS STRING\)"
+                    match = re_module.fullmatch(r"concat\('(.*)', " + cast + r"\)", expression)
+                    if match:
+                        value = row[match.group(2)]
+                        value = None if value is None else match.group(1) + value
+                    else:
+                        value = row[re_module.fullmatch(cast, expression).group(1)]
+                    out[alias] = "" if value is None else value
+                rendered.append(out)
+            return rendered
+
+        args = argparse.Namespace(catalog="c", schema="s", destination_page_size=10)
+        with mock.patch.object(tool, "databricks_query", cli), mock.patch.object(
+            tool, "progress", lambda *_: None
+        ):
+            rows = tool.destination_rows(args, "t", ["k", "s"], ["k"])
+        self.assertEqual(rows, table)
+
     def test_the_compare_tool_takes_a_whole_row_keyed_table_by_distinct_rows(self):
         # A keyless table keyed on the whole row (primary.keys "*") lands each distinct row
         # once. Compared by counts, a source row written twice read as one missing; by

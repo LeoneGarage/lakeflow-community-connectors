@@ -427,6 +427,19 @@ def _key_names(columns: list[str], key: "list[str] | int") -> list[str]:
     return list(columns[:key]) if isinstance(key, int) else list(key)
 
 
+# The CLI's query tool writes a NULL as "", as it writes an empty string, so each value is
+# read behind this prefix: only a NULL (concat of a NULL is one) comes back without it.
+_DESTINATION_PREFIX = "v"
+
+
+def _destination_value(value: Any) -> Any:
+    if value is None or value == "":
+        return None
+    if not value.startswith(_DESTINATION_PREFIX):
+        raise RuntimeError(f"destination value without its prefix: {value!r}")
+    return value[len(_DESTINATION_PREFIX) :]
+
+
 def destination_rows(
     args: argparse.Namespace, table: str, columns: list[str], key_columns: "list[str] | int"
 ) -> list[dict[str, Any]]:
@@ -434,7 +447,8 @@ def destination_rows(
         return "`" + column.replace("`", "``") + "`"
 
     projection = ",".join(
-        f"CAST({quote(column)} AS STRING) AS {quote(column)}" for column in columns
+        f"concat('{_DESTINATION_PREFIX}', CAST({quote(column)} AS STRING)) AS {quote(column)}"
+        for column in columns
     )
     ordering = _key_names(columns, key_columns) or columns
     order_by = ",".join(quote(column) for column in ordering)
@@ -449,7 +463,9 @@ def destination_rows(
             f"ORDER BY {order_by} LIMIT {args.destination_page_size} "
             f"OFFSET {len(rows)}",
         )
-        rows.extend(page)
+        rows.extend(
+            {name: _destination_value(value) for name, value in row.items()} for row in page
+        )
         progress(
             f"{table}: destination page {page_number} fetched "
             f"({len(page)} rows; {len(rows)} total)"
