@@ -791,6 +791,13 @@ CONFIGURATION_ERRORS = (
 )
 
 
+def statement_sql_error(error: BaseException) -> bool:
+    # Docstring: Whether ``error`` is one in the statement itself (_STATEMENT_SQL_ERRORS),
+    # which a new session reads the same way.
+
+    return isinstance(error, SqliSqlError) and error.code in _STATEMENT_SQL_ERRORS
+
+
 def reconnectable_error(error: BaseException) -> bool:
     # Docstring: Whether an in-place reconnect may retry ``error``: a lost connection, or a
     # connect refused, reset or timed out, a TLS handshake cut short, a name lookup or a
@@ -799,9 +806,7 @@ def reconnectable_error(error: BaseException) -> bool:
     # credentials, a login deadline, a redirect not allowed) or a type it can't decode:
     # those are configuration, and fail the same way again.
 
-    if isinstance(error, CONFIGURATION_ERRORS) or (
-        isinstance(error, SqliSqlError) and error.code in _STATEMENT_SQL_ERRORS
-    ):
+    if isinstance(error, CONFIGURATION_ERRORS) or statement_sql_error(error):
         return False
     return isinstance(error, (SqliProtocolError, socket.gaierror, *_CONNECTION_LOSS)) or (
         isinstance(error, OSError) and error.errno in _UNREACHABLE_ERRNOS
@@ -2307,6 +2312,9 @@ class InformixSqliClient:
                 pass
         self._input = self._output = None
         self._socket = None
+        # The session took its transaction with it: nothing is left for a COMMIT WORK, which
+        # on a closed client failed the operation that had reset it and returned.
+        self.uncommitted = False
         if self.state != ConnectionState.POISONED:
             self.state = ConnectionState.CLOSED
 

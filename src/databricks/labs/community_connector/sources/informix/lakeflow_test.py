@@ -7911,6 +7911,7 @@ class LakeflowContractTests(unittest.TestCase):
             SqliDescriptorNotImplemented,
             SqliInvalidCaFile,
             SqliUnsupportedAuthentication,
+            _sql_error,
         )
 
         for error in (
@@ -7921,6 +7922,8 @@ class LakeflowContractTests(unittest.TestCase):
             # or one whose contents don't load.
             FileNotFoundError(2, "No such file or directory"),
             SqliInvalidCaFile("ssl.ca.file does not load"),
+            # A database or privilege missing, which a new session reads the same way.
+            _sql_error((-272, 0, 0, "No SELECT permission")),
         ):
             with self.subTest(error=type(error).__name__):
                 connector = self._partitioned_connector()
@@ -28121,6 +28124,44 @@ class MixedDirectionKeyTests(unittest.TestCase):
                 bridge.transport.uncommitted = False
                 bridge._end_ansi_transaction()
                 self.assertEqual(bridge.transport.commands, [])
+
+    def test_an_ansi_commit_on_a_broken_session_leaves_the_operation_standing(self):
+        # A session that broke under the COMMIT WORK ended its transaction with it: the
+        # error failed an operation that had read and returned, where a reset will do.
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge._is_ansi_database = True
+        bridge.transport = mock.Mock(uncommitted=True)
+        bridge.transport.execute_command.side_effect = informix_module.SqliTransportError("gone")
+        bridge.reset_transport = mock.Mock()
+        bridge._end_ansi_transaction()
+        bridge.reset_transport.assert_called_once_with()
+
+    def test_a_refused_ansi_probe_is_not_asked_again_at_each_connect(self):
+        # The refusal ends the session, so each later connect opened two, as the locale
+        # and newline probes, which are remembered, do not.
+        class Transport:
+            def __init__(self):
+                self.asked = 0
+
+            def connect(self):
+                pass
+
+            def close(self):
+                pass
+
+            def execute(self, sql, parameters=()):
+                self.asked += 1
+                raise informix_module.SqliProtocolError("Informix SQL error -272/0")
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.config = {"database": "demo"}
+        bridge._newline_refused = True
+        bridge.transport = Transport()
+        bridge._connect_transport()
+        bridge._connect_transport()
+        self.assertEqual(bridge.transport.asked, 1)
+        self.assertIsNone(bridge.__dict__.get("_is_ansi_database"))
 
     def test_key_index_directions_reads_a_positional_row_from_its_first_column(self):
         # The index query selects part1..part16 alone, so part1 is column 0: read from

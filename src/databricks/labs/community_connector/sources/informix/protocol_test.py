@@ -946,6 +946,14 @@ class SqliPacketTests(unittest.TestCase):
                 self.assertEqual(str(error), f"Informix SQL error {code}/-111 at 7: text")
                 self.assertEqual(_sqli.reconnectable_error(error), retried)
 
+    def test_a_closed_session_has_no_transaction_left_to_commit(self):
+        # Closing it, a reset or a poisoning included, ends its transaction on the server:
+        # still marked uncommitted, the bridge's COMMIT WORK failed on the closed client.
+        client = InformixSqliClient("host", 9088, "db", "user", "password")
+        client.uncommitted = True
+        client.close()
+        self.assertFalse(client.uncommitted)
+
     def test_the_client_knows_whether_a_statement_is_uncommitted(self):
         # In an ANSI database each statement opens a transaction, which the bridge ends
         # after its operations (see _end_ansi_transaction); SET and BEGIN open none here.

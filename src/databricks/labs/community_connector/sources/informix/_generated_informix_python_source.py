@@ -5222,6 +5222,13 @@ def register_lakeflow_source(spark):
     )
 
 
+    def statement_sql_error(error: BaseException) -> bool:
+        # Docstring: Whether ``error`` is one in the statement itself (_STATEMENT_SQL_ERRORS),
+        # which a new session reads the same way.
+
+        return isinstance(error, SqliSqlError) and error.code in _STATEMENT_SQL_ERRORS
+
+
     def reconnectable_error(error: BaseException) -> bool:
         # Docstring: Whether an in-place reconnect may retry ``error``: a lost connection, or a
         # connect refused, reset or timed out, a TLS handshake cut short, a name lookup or a
@@ -5230,9 +5237,7 @@ def register_lakeflow_source(spark):
         # credentials, a login deadline, a redirect not allowed) or a type it can't decode:
         # those are configuration, and fail the same way again.
 
-        if isinstance(error, CONFIGURATION_ERRORS) or (
-            isinstance(error, SqliSqlError) and error.code in _STATEMENT_SQL_ERRORS
-        ):
+        if isinstance(error, CONFIGURATION_ERRORS) or statement_sql_error(error):
             return False
         return isinstance(error, (SqliProtocolError, socket.gaierror, *_CONNECTION_LOSS)) or (
             isinstance(error, OSError) and error.errno in _UNREACHABLE_ERRNOS
@@ -6738,6 +6743,9 @@ def register_lakeflow_source(spark):
                     pass
             self._input = self._output = None
             self._socket = None
+            # The session took its transaction with it: nothing is left for a COMMIT WORK, which
+            # on a closed client failed the operation that had reset it and returned.
+            self.uncommitted = False
             if self.state != ConnectionState.POISONED:
                 self.state = ConnectionState.CLOSED
 
@@ -9044,7 +9052,12 @@ def register_lakeflow_source(spark):
             # waited. A snapshot's transaction ends itself (_repeatable_read_transaction).
 
             if self.__dict__.get("_is_ansi_database") and getattr(self.transport, "uncommitted", False):
-                self.transport.execute_command("COMMIT WORK")
+                try:
+                    self.transport.execute_command("COMMIT WORK")
+                except (SqliProtocolError, OSError):
+                    # A session that broke under it ended its transaction, and the operation
+                    # stands: it read and returned. The next one connects again.
+                    self.reset_transport()
 
         def _connect_transport(self) -> None:
             connect = getattr(self.transport, "connect", None)
@@ -9054,7 +9067,11 @@ def register_lakeflow_source(spark):
             # Whether each operation's transaction is the bridge's to end (_end_ansi_transaction):
             # known only to a snapshot's before, which a shard leader's reader never reads.
             execute = getattr(self.transport, "execute", None)
-            if self.__dict__.get("_is_ansi_database") is None and callable(execute):
+            if (
+                self.__dict__.get("_is_ansi_database") is None
+                and not self.__dict__.get("_ansi_probe_refused")
+                and callable(execute)
+            ):
                 try:
                     rows = execute(
                         "SELECT is_ansi FROM sysmaster:sysdatabases WHERE name = ?",
@@ -9063,6 +9080,9 @@ def register_lakeflow_source(spark):
                     self._is_ansi_database = len(rows) == 1 and bool(int(_field(rows[0], "is_ansi", 0)))
                 except (SqliProtocolError, OSError) as error:
                     self._session_probe_failed(error)
+                    # Refused, not asked again: the refusal ended the session, and each later
+                    # connect opened two, as the locale and newline probes don't.
+                    self._ansi_probe_refused = True
                 except (AttributeError, KeyError, TypeError, ValueError):
                     pass  # left to the first snapshot to find out, as before
             # Informix takes a string value as a quoted literal within the statement, and by
@@ -18039,8 +18059,11 @@ def register_lakeflow_source(spark):
                     # would. Any OSError, a file's too (ssl.ca.file on a dropped mount gave
                     # ENOTCONN, which failed the update at once), but not a certificate, a login
                     # or a type no retry helps.
+                    # Nor a missing database or privilege (statement_sql_error), which slept
+                    # through every retry before the table's registration failed.
                     if (
                         isinstance(error, CONFIGURATION_ERRORS)
+                        or statement_sql_error(error)
                         or attempt >= _SNAPSHOT_RECONNECT_MAX_RETRIES
                     ):
                         raise
