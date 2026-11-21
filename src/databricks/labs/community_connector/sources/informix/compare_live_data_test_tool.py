@@ -373,16 +373,26 @@ def transfer_source_archive(args: argparse.Namespace, run_id: str, output: pathl
     wait_ssm(args, send_ssm(args, upload), 900)
     archive = output / f"{run_id}.tar.gz"
     aws(args, "s3", "cp", f"s3://{args.s3_bucket}/{key}", str(archive))
+    extract_source_archive(archive, run_id, output)
+
+
+def extract_source_archive(archive: pathlib.Path, run_id: str, output: pathlib.Path) -> None:
+    """Unpack the export's files and directories under ``output/run_id``, and nothing else:
+    a link, a device or a FIFO is refused, not only a path outside it, since a later member
+    could write through a link to anywhere."""
     with tarfile.open(archive, "r:gz") as handle:
         members = handle.getmembers()
         if any(
-            not pathlib.PurePosixPath(member.name).parts
+            not (member.isfile() or member.isdir())
+            or not pathlib.PurePosixPath(member.name).parts
             or pathlib.PurePosixPath(member.name).parts[0] != run_id
             or ".." in pathlib.PurePosixPath(member.name).parts
             for member in members
         ):
             raise RuntimeError("Informix export archive contains an unsafe path")
-        handle.extractall(output, members=members)
+        # The data filter refuses the same on a Python that has it (3.12, and backports).
+        safe = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+        handle.extractall(output, members=members, **safe)
 
 
 def databricks_query(args: argparse.Namespace, statement: str) -> list[dict[str, Any]]:

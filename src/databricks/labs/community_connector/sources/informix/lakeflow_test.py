@@ -28764,6 +28764,43 @@ class UnloadHelperTests(unittest.TestCase):
             informix_module._schema_fingerprint(previous),
         )
 
+    def test_the_compare_tool_unpacks_only_the_exports_files_and_directories(self):
+        # Checked by name alone, a link the archive held could point anywhere, and a later
+        # member write through it; a device or FIFO is no export either.
+        import io as io_module
+        import tarfile
+
+        from databricks.labs.community_connector.sources.informix import (
+            compare_live_data_test_tool as tool,
+        )
+
+        def archive(*members):
+            path = pathlib.Path(tempfile.mkdtemp()) / "run.tar.gz"
+            with tarfile.open(path, "w:gz") as handle:
+                for name, kind in members:
+                    info = tarfile.TarInfo(name)
+                    info.type = kind
+                    data = b"1|a|\n" if kind == tarfile.REGTYPE else b""
+                    if kind == tarfile.SYMTYPE:
+                        info.linkname = "/etc"
+                    info.size = len(data)
+                    handle.addfile(info, io_module.BytesIO(data))
+            return path
+
+        output = pathlib.Path(tempfile.mkdtemp())
+        good = archive(("r1", tarfile.DIRTYPE), ("r1/t.unl", tarfile.REGTYPE))
+        tool.extract_source_archive(good, "r1", output)
+        self.assertEqual((output / "r1" / "t.unl").read_bytes(), b"1|a|\n")
+        for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.FIFOTYPE, tarfile.CHRTYPE):
+            with self.subTest(kind=kind):
+                bad = archive(("r2", tarfile.DIRTYPE), ("r2/link", kind))
+                with self.assertRaisesRegex(RuntimeError, "unsafe path"):
+                    tool.extract_source_archive(bad, "r2", pathlib.Path(tempfile.mkdtemp()))
+        with self.assertRaisesRegex(RuntimeError, "unsafe path"):
+            tool.extract_source_archive(
+                archive(("other/t.unl", tarfile.REGTYPE)), "r3", pathlib.Path(tempfile.mkdtemp())
+            )
+
     def test_the_compare_tool_reads_partial_datetimes_and_other_locales(self):
         # A DATETIME YEAR TO MONTH lands as YEAR=2024:MONTH=05, which UNLOAD writes as
         # 2024-05: every row differed. And the files were read as Latin-1 whatever the
