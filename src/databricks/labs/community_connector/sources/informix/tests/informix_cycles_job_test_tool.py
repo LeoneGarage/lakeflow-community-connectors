@@ -391,6 +391,8 @@ def stop_part_way(cycle, label, update_id):
         f"{label}: stopped update {update_id} ({state}) with {pages} pages of "
         f"{RESUME_TABLE} recorded",
     )
+    # As run_for ends one: without it the dashboard showed the update RUNNING for good.
+    event(cycle, "ended", f"{label}: update {update_id} final state {state}")
     return {"pages": pages, "update": update_id, "state": state}
 
 

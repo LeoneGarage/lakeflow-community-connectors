@@ -5430,6 +5430,32 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertNotIn("scan_scope", offset)
         self.assertNotIn("scan_schema", offset)
 
+    def test_a_scan_taken_by_index_is_still_dropped_from_under_a_cursor_scan_set_since(self):
+        # snapshot.scan says how the next snapshot reads, not how this one did. Set to
+        # cursor before the stream was past the scan's end, the offset lost the scan's name
+        # and the stream replayed the changes the pages hold, twice in an append table.
+        bridge = _KeylessIndexBridge()
+        bridge.changes = [
+            {"op": "BEGIN", "tx_id": 1, "lsn": 91},
+            {"op": "INSERT", "tx_id": 1, "lsn": 92, "row": {"id": 2, "value": "x"}},
+            {"op": "COMMIT", "tx_id": 1, "lsn": 93, "timestamp": 1_700_000_000},
+        ]
+        options = {"snapshot.mode": "initial"}
+        first = self.connector(bridge, registration_scope="update-a")
+        with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
+            rows, offset = first.read_table("app.orders", {}, options)
+        self.assertEqual([row["id"] for row in rows], [1, 2])
+        while offset.get("phase") != "stream":
+            _, offset = first.read_table("app.orders", offset, options)
+        scope = offset["scan_scope"]
+
+        later = self.connector(bridge, registration_scope="update-b")
+        cursor = {**options, "snapshot.scan": "cursor"}
+        rows, offset = later.read_table("app.orders", offset, cursor)
+
+        self.assertEqual(list(rows), [])
+        self.assertEqual(offset["scan_scope"], scope)
+
     def test_an_index_key_reads_the_same_from_a_row_a_staged_row_and_the_manifest(self):
         # A change's key is matched to staged rows read back from a page, and to the page
         # bounds the manifest stores as JSON: decimals, dates and padded characters must
@@ -8275,6 +8301,34 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(reset_calls, [True])
         self.assertFalse(any("cdc_closesess" in sql for sql in bridge.transport.sql))
 
+    def test_initial_lsn_validation_survives_a_connection_lost_during_teardown(self):
+        # The session ends with the connection, as a poll's teardown takes it. Raised as 42,
+        # the schema chain took it for a refused transition and recorded it as one, failing
+        # the delete reader for the update.
+        class ResetTransport:
+            def __init__(self):
+                self.state = types.SimpleNamespace(name="DATABASE_OPEN")
+
+            def execute(self, sql, parameters=()):
+                if "sysenv" in sql:
+                    return [{"env_value": "demo_server"}]
+                if "cdc_opensess" in sql:
+                    return [{"session_id": 7}]
+                if "cdc_endcapture" in sql:
+                    self.state = types.SimpleNamespace(name="POISONED")
+                    raise informix_module.SqliTransportError("SQLI connection lost")
+                return [{"status": 0}]
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.transport = ResetTransport()
+        bridge.options = {}
+        reset_calls = []
+        bridge.reset_transport = lambda: reset_calls.append(True)
+
+        bridge.validate_initial_lsn({"identity": "demo:app.orders", "columns": ["id"]}, 80)
+
+        self.assertEqual(reset_calls, [True])
+
     def test_initial_lsn_validation_still_fails_on_non_timeout_cleanup_error(self):
         # A non-timeout cleanup failure with a successful primary is still fatal:
         # only a *timeout* teardown is treated as benign.
@@ -11053,6 +11107,48 @@ class LakeflowContractTests(unittest.TestCase):
             opened.assert_called_once()
             sleep.assert_not_called()
 
+    def test_a_state_path_is_normalised_before_it_is_held_to_its_root(self):
+        # commonpath keeps "..": a path that climbed out of the root passed, and was walked
+        # out of it a part at a time. A root given with a trailing slash refused its own
+        # children.
+        with tempfile.TemporaryDirectory() as parent:
+            root = os.path.join(parent, "staging")
+            os.makedirs(os.path.join(root, "a"))
+            os.mkdir(os.path.join(parent, "other"))
+            climbed = os.path.join(root, "a", "..", "..", "other")
+            with self.assertRaisesRegex(InformixError, "escapes"):
+                informix_module._open_state_directory(root, climbed)
+            os.close(informix_module._open_state_directory(root + os.sep, os.path.join(root, "a")))
+
+    def test_a_mount_lost_at_the_roots_stat_leaves_no_descriptor_open(self):
+        # The root's stat came before the walk's cleanup: a Volume mount that dropped between
+        # the open and the stat left the root open.
+        with tempfile.TemporaryDirectory() as root:
+            for walk in (
+                lambda: informix_module._newest_created_entry_mtime(root),
+                lambda: informix_module._created_since(root, 0.0),
+            ):
+                opened, real_open = [], os.open
+
+                def recording_open(*args, **kwargs):
+                    opened.append(real_open(*args, **kwargs))
+                    return opened[-1]
+
+                with (
+                    mock.patch.object(informix_module.os, "open", recording_open),
+                    mock.patch.object(
+                        informix_module.os,
+                        "fstat",
+                        side_effect=OSError(errno.ENOTCONN, "Transport endpoint is not connected"),
+                    ),
+                    self.assertRaises(OSError),
+                ):
+                    walk()
+                self.assertTrue(opened)
+                for descriptor in opened:
+                    with self.assertRaises(OSError):
+                        os.fstat(descriptor)
+
     def test_state_directory_open_exhaustion_is_transient_error(self):
         with (
             mock.patch.object(
@@ -11477,6 +11573,26 @@ class LakeflowContractTests(unittest.TestCase):
                 resumed = self._partitioned_connector(bridge, registration_scope=scope, **options)
                 with self.assertRaisesRegex(InformixError, "schema changed"):
                     resumed.latest_offset("app.orders", {}, first)
+
+    def test_a_replanned_snapshot_batch_refuses_a_schema_changed_since(self):
+        # get_partitions re-plans an uncommitted batch after a restart with no latest_offset
+        # to check drift first: it served the logged pages under the new schema, and the
+        # first batch's by the fingerprint its end pinned.
+        bridge = FakeBridge()
+        bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 5)]
+        options = {"snapshot.page.size": "1", "stream.partitioned.snapshot.pages.per.batch": "1"}
+        planned = self._partitioned_connector(bridge, registration_scope="replan", **options)
+        first = planned.latest_offset("app.orders", {}, {})
+        second = planned.latest_offset("app.orders", {}, first)
+        self.assertEqual(second["phase"], "snapshot")
+        bridge.tables[0]["columns"].append({"name": "added", "type_name": "INTEGER"})
+        for start, end in (({}, first), (first, second)):
+            with self.subTest(start=bool(start)):
+                restarted = self._partitioned_connector(
+                    bridge, registration_scope="replan", **options
+                )
+                with self.assertRaisesRegex(InformixError, "schema changed"):
+                    restarted.get_partitions("app.orders", {}, start, end)
 
     def test_a_replanned_page_batch_serves_the_pages_spark_logged(self):
         # get_partitions re-plans an uncommitted batch after a restart with no latest_offset
@@ -14824,8 +14940,13 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertFalse(mid["incremental"]["done"])
         copied = {row["id"] for row in first}
 
-        # Capture parks the mid-copy offset.
+        # Capture parks the mid-copy offset, and the delete flow's at the same position.
         self.connector(bridge).read_table("app.orders", mid, {"table.migration": "true"})
+        self.connector(bridge).read_table_deletes(
+            "app.orders",
+            {key: value for key, value in mid.items() if key != "incremental"},
+            {"table.migration": "true"},
+        )
 
         # Cutover (handoff): seed from the token, then record-and-stop -- neither read emits
         # rows and no re-snapshot is taken.
@@ -14850,6 +14971,29 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertNotIn("incremental", offset)  # copy finished -> pure stream
         self.assertEqual(copied, {1, 2, 3})  # every existing row was emitted, none lost
+
+    def test_a_copy_in_flight_finishes_after_its_mode_changes(self):
+        # A keyed table's copy went on only under incremental or auto_snapshot: under another
+        # mode its cursor was dropped, or (initial_only) its stream stopped, and the rows it
+        # had yet to copy were never read.
+        for mode in ("initial", "cdc_only", "initial_only", "recovery"):
+            with self.subTest(mode=mode):
+                bridge = FakeBridge()
+                bridge.rows = [{"id": i, "value": f"v{i}"} for i in (1, 2, 3)]
+                opts = {"snapshot.mode": "incremental", "snapshot.page.size": "1"}
+                first, offset = self.connector(bridge).read_table("app.orders", {}, opts)
+                self.assertFalse(offset["incremental"]["done"])
+                copied = {row["id"] for row in first}
+                changed = {"snapshot.mode": mode, "snapshot.page.size": "1"}
+                connector = self.connector(bridge)
+                for _ in range(6):
+                    rows, offset = connector.read_table("app.orders", offset, changed)
+                    copied |= {row["id"] for row in rows if row.get("_informix_op") == "r"}
+                    if "incremental" not in offset:
+                        break
+
+                self.assertNotIn("incremental", offset)
+                self.assertEqual(copied, {1, 2, 3})
 
     def test_handoff_relocates_a_blocking_snapshot_by_reference(self):
         # A blocking `initial` snapshot parked mid-serve carries phase=="snapshot" (unlike
@@ -15187,8 +15331,11 @@ class LakeflowContractTests(unittest.TestCase):
 
     def test_handoff_cutover_seeds_from_parked_offset_without_snapshot(self):
         bridge = FakeBridge()
-        # Capture on the still-keyed flow.
+        # Capture on the still-keyed flows.
         self.connector(bridge).read_table(
+            "app.orders", _stream_offset(125), {"table.migration": "true"}
+        )
+        self.connector(bridge).read_table_deletes(
             "app.orders", _stream_offset(125), {"table.migration": "true"}
         )
 
@@ -15204,11 +15351,14 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(seeded["commit_lsn"], "125")
         self.assertEqual(bridge.snapshot_calls, [])
         # Not deleted until the seed is committed (survives a crash before commit).
-        self.assertEqual(len(self._lakebase.database.handoff), 1)
+        self.assertEqual(len(self._lakebase.database.handoff), 2)
 
     def test_handoff_cutover_drops_token_once_the_seed_is_committed(self):
         bridge = FakeBridge()
         self.connector(bridge).read_table(
+            "app.orders", _stream_offset(125), {"table.migration": "true"}
+        )
+        self.connector(bridge).read_table_deletes(
             "app.orders", _stream_offset(125), {"table.migration": "true"}
         )
         options = {"table.migration": "true", "append.only.ingestion": "true"}
@@ -15241,6 +15391,39 @@ class LakeflowContractTests(unittest.TestCase):
                     continue
                 _, seeded = cutover.read_table("app.orders", {}, options)
                 self.assertEqual(seeded["commit_lsn"], "125")
+
+    def test_an_append_cutover_refuses_a_copy_or_a_delete_flow_with_no_position(self):
+        # A copy parked mid-way went on past the deletes its upsert flow skips, and a delete
+        # flow with no checkpoint at capture parked none, so the cutover checked nothing:
+        # the append stream went on from the upsert position and lost the deletes between.
+        migration = {"table.migration": "true"}
+        options = {**migration, "append.only.ingestion": "true"}
+        for case in ("incremental", "uncheckpointed"):
+            with self.subTest(case=case):
+                self._lakebase.database.handoff.clear()
+                bridge = FakeBridge()
+                capture = self.connector(bridge)
+                if case == "incremental":
+                    capture.read_table("app.orders", _incremental_reader_offset(125), migration)
+                    capture.read_table_deletes("app.orders", _stream_offset(120), migration)
+                    expected = "upsert flow at LSN 125 but its delete flow at 120"
+                else:
+                    capture.read_table("app.orders", _stream_offset(125), migration)
+                    capture.read_table_deletes("app.orders", {}, migration)
+                    expected = "upsert flow at LSN 125 but no position for its delete flow"
+                with self.assertRaisesRegex(InformixError, expected):
+                    self.connector(bridge).read_table("app.orders", {}, options)
+
+    def test_an_append_relocation_parks_no_delete_position_and_cuts_over(self):
+        # An append flow has no delete flow beside it, so its token alone is complete.
+        options = {"table.migration": "true", "append.only.ingestion": "true"}
+        bridge = FakeBridge()
+        self.connector(bridge).read_table("app.orders", _stream_offset(125), options)
+
+        _, seeded = self.connector(bridge).read_table("app.orders", {}, options)
+
+        self.assertEqual(seeded["commit_lsn"], "125")
+        self.assertNotIn("handoff_keyed", seeded)
 
     def test_handoff_cutover_without_a_parked_offset_fails_closed(self):
         bridge = FakeBridge()
@@ -15308,6 +15491,9 @@ class LakeflowContractTests(unittest.TestCase):
         # schema drifted since capture, resuming would misread the stream -> fail closed.
         bridge = FakeBridge()
         self.connector(bridge).read_table(
+            "app.orders", _stream_offset(125), {"table.migration": "true"}
+        )
+        self.connector(bridge).read_table_deletes(
             "app.orders", _stream_offset(125), {"table.migration": "true"}
         )
         bridge.tables[0]["columns"].append(
@@ -23953,6 +24139,37 @@ class ConnectionSlotLeaseLossTests(unittest.TestCase):
         self.assertFalse(bridge._connection_lease_lost.is_set())
         self.assertEqual(operation(bridge, False), "rows")
 
+    def test_a_lease_loss_seen_after_its_slot_was_released_leaves_the_next_slot_alone(self):
+        # The heartbeat's renewal failed while an operation held the lock. The read ended
+        # and released its slot, and the next read claimed another and connected; the
+        # shutdown, given the lock at last, closed that read's transport and freed its slot.
+        bridge = self._bridge()
+        first, second = object(), object()
+        stop = threading.Event()
+        bridge._lakebase_slot = first
+        bridge._connection_slot_heartbeat_stop = stop
+        bridge._connection_slot_heartbeat = None
+        bridge._lakebase_connection = mock.Mock()
+        later = mock.Mock()
+        with mock.patch.object(informix_module, "release_slot") as release:
+            bridge._operation_lock.acquire()
+            poisoner = threading.Thread(
+                target=bridge._poison_connection_slot_lease, args=(first, stop)
+            )
+            poisoner.start()
+            self.assertTrue(bridge._connection_lease_lost.wait(5))
+            bridge.release_connection()
+            bridge._lakebase_slot, bridge.transport, bridge._connected = second, later, True
+            bridge._operation_lock.release()
+            poisoner.join(5)
+
+        self.assertFalse(poisoner.is_alive())
+        self.assertEqual([call.args[1] for call in release.call_args_list], [first])
+        later.close.assert_not_called()
+        self.assertIs(bridge._lakebase_slot, second)
+        self.assertTrue(bridge._connected)
+        self.assertFalse(bridge._connection_lease_lost.is_set())
+
     def test_heartbeat_reports_lease_loss_when_renewal_is_rejected(self):
         bridge = self._bridge()
         reported = []
@@ -24153,14 +24370,33 @@ class SharedCdcShardTests(unittest.TestCase):
         narrowed = informix_module._apply_column_selection(self.table_a, ("include", ("id",)))
 
         self.assertIsNone(shard.poll(self.id_a, self.table_a, capture, 500, 500, "two"))
-        self.assertIs(shard.subscribe(self.id_a, filtered, capture, 500, 500, "one"), False)
-        self.assertIsNone(shard.poll(self.id_a, filtered, capture, 500, 500, "one"))
-        self.assertIsNone(
-            shard.poll(self.id_a, narrowed, _capture_descriptor(narrowed), 500, 500, "one")
-        )
+        # Flows that name no owner: a flow's own options don't change while it polls.
+        self.assertIs(shard.subscribe(self.id_a, filtered, capture, 500, 500), False)
+        self.assertIsNone(shard.poll(self.id_a, filtered, capture, 500, 500))
+        self.assertIsNone(shard.poll(self.id_a, narrowed, _capture_descriptor(narrowed), 500, 500))
 
         view = shard.poll(self.id_a, self.table_a, capture, 0, 0, "one")
         self.assertEqual([tx.tx_id for tx in view.committed], [1])
+
+    def test_a_flows_own_place_follows_a_change_its_capture_does_not_show(self):
+        # A column made NOT NULL, or a key the table gained, changes the table but not its
+        # capture. Taken for another flow's place, the flow itself read directly until the
+        # place expired, and the place's buffer, its checkpoint frozen, filled to the cap.
+        shard = _SharedCdcShard()
+        capture = _capture_descriptor(self.table_a)
+        changed = Table.parse(_table(name="orders", primary_keys=("id", "value")), "demo")
+        self.assertEqual(_capture_descriptor(changed), capture)
+        self.assertTrue(shard.subscribe(self.id_a, self.table_a, capture, 0, 0, "one"))
+        shard.buffers[self.id_a].append(mock.Mock(commit_lsn=150))
+
+        self.assertTrue(shard.subscribe(self.id_a, changed, capture, 100, 100, "one"))
+
+        self.assertIs(shard.subscribers[self.id_a]["table"], changed)
+        self.assertEqual(list(shard.buffers[self.id_a]), [])
+        # So does one whose flow stopped polling, for the flow that reads the table now.
+        shard.subscribers[self.id_a]["last_seen"] -= shard.subscriber_ttl + 1
+        self.assertTrue(shard.subscribe(self.id_a, self.table_a, capture, 100, 100, "two"))
+        self.assertEqual(shard.subscribers[self.id_a]["owner"], "two")
 
     def test_a_shard_keeps_the_shortest_timeout_and_largest_budget_asked_for(self):
         # Each poll configured the shard with its own table's cdc.timeout and
@@ -28199,6 +28435,57 @@ class MixedDirectionKeyTests(unittest.TestCase):
                 bridge._end_ansi_transaction()
                 self.assertEqual(bridge.transport.commands, [])
 
+    def test_an_ansi_databases_failed_operation_rolls_back_what_its_statements_opened(self):
+        # An operation that failed after its statements ran (a refused value, a nonzero
+        # cdc_* status) skipped the end, and the session held their locks until another
+        # operation succeeded on it.
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge._operation_lock = threading.RLock()
+        bridge._is_ansi_database = True
+        bridge.transport = mock.Mock(uncommitted=True)
+
+        @informix_module._serialized_sqli_operation
+        def refused(bridge):
+            raise InformixError("refused")
+
+        with self.assertRaisesRegex(InformixError, "refused"):
+            refused(bridge)
+
+        bridge.transport.execute_command.assert_called_once_with("ROLLBACK WORK")
+
+    def test_a_snapshot_on_a_client_that_closed_sends_no_rollback(self):
+        # The client closes on a failed call, which ends the transaction with the session:
+        # the rollback sent there only failed, a note on every such error.
+        class ClosingTransport:
+            state = types.SimpleNamespace(name="DATABASE_OPEN")
+
+            def __init__(self):
+                self.commands = []
+
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                if "sysmaster:sysdatabases" in sql:
+                    return [{"is_ansi": 0}]
+                if "sysmaster:syslogs" in sql:
+                    return [{"uniqid": 2, "used": 3}]
+                if "FIRST_ROWS" in sql:
+                    self.state = types.SimpleNamespace(name="POISONED")
+                    raise informix_module.SqliTransportError("SQLI connection lost")
+                return []
+
+            def execute_command(self, sql):
+                self.commands.append(sql)
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {"database": "demo"}
+        bridge.config = {"database": "demo"}
+        bridge.transport = ClosingTransport()
+
+        with self.assertRaises(informix_module.SqliTransportError) as caught:
+            bridge.consistent_snapshot("demo.app.orders", ["id"], ["id"], 10, 100, 0)
+
+        self.assertNotIn("ROLLBACK WORK", bridge.transport.commands)
+        self.assertFalse(getattr(caught.exception, "__notes__", []))
+
     def test_an_ansi_commit_on_a_broken_session_leaves_the_operation_standing(self):
         # A session that broke under the COMMIT WORK ended its transaction with it: the
         # error failed an operation that had read and returned, where a reset will do.
@@ -30374,7 +30661,8 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
         options = {"snapshot.source": source, "snapshot.unl.delimiter": "\t"}
         serial = list(self.connector(FakeBridge()).read_table("app.orders", {}, options)[0])
 
-        connector = self.connector(FakeBridge())
+        # Another snapshot, as a full refresh takes one: its own update's scope.
+        connector = self.connector(FakeBridge(), registration_scope="fanned")
         with mock.patch.object(informix_module, "_UNL_SPLIT_TARGET_BYTES", 1):
             offset = connector.latest_offset("app.orders", options, {})
             partitions = connector.get_partitions("app.orders", options, {}, offset)
@@ -30449,7 +30737,8 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
         options = {"snapshot.source": source}
         serial = list(self.connector(FakeBridge()).read_table("app.orders", {}, options)[0])
 
-        connector = self.connector(FakeBridge())
+        # Another snapshot, as a full refresh takes one: its own update's scope.
+        connector = self.connector(FakeBridge(), registration_scope="fanned")
         with mock.patch.object(informix_module, "_UNL_SPLIT_TARGET_BYTES", 8):
             offset = connector.latest_offset("app.orders", options, {})
             partitions = connector.get_partitions("app.orders", options, {}, offset)
@@ -30483,7 +30772,7 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
 
         for target, want_splits in (("1000000", 1), ("1", 5)):
             options = {**base, "snapshot.split.bytes": target}
-            connector = self.connector(FakeBridge())
+            connector = self.connector(FakeBridge(), registration_scope=f"split-{target}")
             offset = connector.latest_offset("app.orders", options, {})
             partitions = connector.get_partitions("app.orders", options, {}, offset)
             self.assertEqual(len(partitions), want_splits, target)
@@ -30583,6 +30872,51 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
             for row in connector.read_partition("app.orders", partition, options)
         ]
         self.assertEqual([(r["id"], r["value"]) for r in rows], [(3, "c"), (4, "d")])
+
+    def test_a_unl_snapshot_refuses_a_split_size_or_field_format_changed_mid_way(self):
+        # Its position is a split index into the plan these options give, and a record index
+        # counted by the delimiter and escape: changed mid-snapshot, the same index named
+        # other bytes, and rows were skipped or repeated while the files themselves matched.
+        source = self._source("1|a|\n2|b|\n3|c|\n4|d|\n5|e|\n")
+        options = {"snapshot.source": source, "snapshot.split.bytes": "1"}
+        for name, value in (
+            ("snapshot.split.bytes", "1000000"),
+            ("snapshot.unl.escape", "none"),
+            ("snapshot.unl.delimiter", ","),
+        ):
+            with self.subTest(option=name):
+                connector = self.connector(
+                    FakeBridge(), **{"stream.partitioned.snapshot.pages.per.batch": "2"}
+                )
+                first = connector.latest_offset("app.orders", options, {})
+                self.assertEqual(first["phase"], "snapshot")
+                changed = {**options, name: value}
+                with self.assertRaisesRegex(InformixError, f"Option '{name}'.*changed from"):
+                    connector.latest_offset("app.orders", changed, first)
+                with self.assertRaisesRegex(InformixError, f"Option '{name}'.*changed from"):
+                    connector.get_partitions("app.orders", changed, {}, first)
+                # As it was, the snapshot goes on.
+                self.assertEqual(
+                    connector.latest_offset("app.orders", options, first)["snapshot"]["page_index"],
+                    4,
+                )
+
+    def test_a_replanned_unl_window_refuses_a_schema_changed_since(self):
+        # A window re-planned after a restart had no latest_offset to check drift first:
+        # it served the extract's records under the new schema.
+        source = self._source("1|a|\n2|b|\n3|c|\n4|d|\n5|e|\n")
+        options = {"snapshot.source": source, "snapshot.split.bytes": "1"}
+        bridge = FakeBridge()
+        batch = {"stream.partitioned.snapshot.pages.per.batch": "2"}
+        planned = self.connector(bridge, **batch)
+        first = planned.latest_offset("app.orders", options, {})
+        second = planned.latest_offset("app.orders", options, first)
+        bridge.tables[0]["columns"].append({"name": "added", "type_name": "INTEGER"})
+        for start, end in (({}, first), (first, second)):
+            with self.subTest(start=bool(start)):
+                restarted = self.connector(bridge, **batch)
+                with self.assertRaisesRegex(InformixError, "schema changed"):
+                    restarted.get_partitions("app.orders", options, start, end)
 
     def test_unl_read_partition_shapes_without_a_live_table(self):
         # A descriptor carries the column metadata, so the executor shapes rows with no
@@ -31889,6 +32223,38 @@ class SchemaEvolutionTests(_TableOptionTestCase):
         bridge.changes = self.committed(("INSERT", {"id": 3, "value": "c"}))
         rows = list(connector.read_table("app.orders", checkpoint, {})[0])
         self.assertEqual([(row["id"], "extra" in row) for row in rows], [(3, False)])
+
+    def _drain_a_dropped_column(self, options, value, column=None):
+        """A change logged before ``extra`` was dropped, read with its option entry gone."""
+        bridge = _ProjectingBridge()
+        if column is not None:
+            bridge.tables[0]["columns"][2] = dict(column)
+            bridge.rows = [{"id": 1, "value": "a", "extra": None}]
+        connector, checkpoint = self.stream(bridge, options)
+        del bridge.tables[0]["columns"][2]  # ALTER TABLE ... DROP (extra)
+        bridge.now = 120
+        bridge.changes = self.committed(
+            ("INSERT", {"id": 3, "value": "c", "extra": value}), lsn=100
+        )
+        rows, end = connector.read_table("app.orders", checkpoint, {})
+        self.assertEqual(end["commit_lsn"], "102")
+        return [(row["id"], row.get("extra", "absent")) for row in rows]
+
+    # A change logged before a column was dropped, read once the column's option entry is
+    # cleaned out, as the table needs. It is captured with the live layout, not the one it
+    # was logged under (_read_stream_batch), so the column's value never reaches the shaping:
+    # not untransformed into Spark, nor as the default decimal type its entry kept it from.
+
+    def test_a_pre_alter_change_leaves_out_a_dropped_column_whose_transform_went(self):
+        options = {"transform_columns": '{"extra": "NULLIFY(extra)"}'}
+        self.assertEqual(self._drain_a_dropped_column(options, 9), [(3, "absent")])
+
+    def test_a_pre_alter_change_leaves_out_a_dropped_column_whose_decimal_type_went(self):
+        decimal = {"name": "extra", "type_name": "DECIMAL", "precision": 32, "scale": 255}
+        options = {"decimal.variable.column.type": "extra:string"}
+        self.assertEqual(
+            self._drain_a_dropped_column(options, Decimal("1" * 30), decimal), [(3, "absent")]
+        )
 
     def test_dropping_a_selected_column_asks_for_the_list_to_be_edited(self):
         options = {"include_columns": "id,value,extra"}

@@ -158,6 +158,8 @@ _DEFAULT_ENDPOINT = "primary"
 # Long-running provisioning calls return an operation envelope; poll until done.
 _OPERATION_POLL_SECONDS = 2.0
 _OPERATION_TIMEOUT_SECONDS = 900.0
+# Between looks at a deleted project's tombstone that another process is purging.
+_PURGE_POLL_SECONDS = 2.0
 
 _API_TIMEOUT_SECONDS = 120.0
 _API_ATTEMPTS = 4
@@ -490,24 +492,26 @@ def ensure_project(
         # time. GET still returns that tombstone, but it has no branch or
         # endpoint and its id cannot be recreated. Purge it explicitly so the
         # connector can safely recreate its deterministic project id.
-        purged = api.request(
-            "DELETE",
-            f"/api/2.0/postgres/projects/{project_id}?purge=true",
-            **deadline_kwargs,
-        )
-        if deadline is None:
-            api.await_operation(purged)
-        else:
-            api.await_operation(purged, deadline=deadline)
-        existing = api.request(
-            "GET",
-            f"/api/2.0/postgres/projects/{project_id}",
-            tolerate_missing=True,
-            **deadline_kwargs,
-        )
-        if existing is not None:
-            raise LakebaseStateError(f"purged Lakebase project {project_id} is still visible")
-        _LOGGER.info("Purged deleted Lakebase project tombstone %s", project_id)
+        # Every flow's process provisions on its own, so others purge the same tombstone at
+        # once: one that is gone already (404) or being purged (a conflict) is waited out,
+        # and a project another process made since is taken as found.
+        try:
+            purged = api.request(
+                "DELETE",
+                f"/api/2.0/postgres/projects/{project_id}?purge=true",
+                tolerate_missing=True,
+                **deadline_kwargs,
+            )
+        except LakebaseStateError:
+            purged = None
+        if purged is not None:
+            if deadline is None:
+                api.await_operation(purged)
+            else:
+                api.await_operation(purged, deadline=deadline)
+        existing = _purged_project(api, project_id, deadline)
+        if existing is None:
+            _LOGGER.info("Purged deleted Lakebase project tombstone %s", project_id)
     if existing is None:
         body = {
             "spec": {
@@ -557,6 +561,29 @@ def ensure_project(
                 suspend_seconds,
             )
     return _endpoint_facts(api, project_id, deadline=deadline)
+
+
+def _purged_project(
+    api: _WorkspaceApi, project_id: str, deadline: float | None
+) -> dict[str, Any] | None:
+    # Docstring: The project once its tombstone is purged: None, or one another process
+    # made since. Raises when the tombstone outlasts the wait.
+
+    limit = time.monotonic() + _OPERATION_TIMEOUT_SECONDS
+    limit = limit if deadline is None else min(limit, deadline)
+    deadline_kwargs = {"deadline": deadline} if deadline is not None else {}
+    while True:
+        existing = api.request(
+            "GET",
+            f"/api/2.0/postgres/projects/{project_id}",
+            tolerate_missing=True,
+            **deadline_kwargs,
+        )
+        if existing is None or not existing.get("delete_time"):
+            return existing
+        if time.monotonic() >= limit:
+            raise LakebaseStateError(f"purged Lakebase project {project_id} is still visible")
+        time.sleep(_PURGE_POLL_SECONDS)
 
 
 def _endpoint_facts(
@@ -1598,6 +1625,7 @@ class LakebaseState:
                 # A deleted project lingers in the list with no endpoint to wait for.
                 continue
             connection = None
+            requested = False
             try:
                 # A candidate is read on a live read's path: wait briefly, not for provisioning.
                 facts = _endpoint_facts(api, project_id, deadline=time.monotonic() + 60)
@@ -1667,15 +1695,20 @@ class LakebaseState:
                 connection = None
                 # On a read's path: the delete is asked for and given a minute, not the
                 # quarter of an hour provisioning may take. It goes on at the server.
-                api.await_operation(
-                    api.request("DELETE", f"/api/2.0/postgres/projects/{project_id}"),
-                    deadline=time.monotonic() + 60,
-                )
+                deleting = api.request("DELETE", f"/api/2.0/postgres/projects/{project_id}")
+                requested = True
+                api.await_operation(deleting, deadline=time.monotonic() + 60)
             except Exception:
-                _LOGGER.warning(
-                    "Skipping Lakebase project GC candidate %s", project_id, exc_info=True
+                if not requested:
+                    _LOGGER.warning(
+                        "Skipping Lakebase project GC candidate %s", project_id, exc_info=True
+                    )
+                    continue
+                # Asked for and going on at the server past the wait: the endpoint this
+                # process provisioned names a project going away, so it is forgotten too.
+                _LOGGER.info(
+                    "Lakebase project %s is still being deleted", project_id, exc_info=True
                 )
-                continue
             finally:
                 if connection is not None:
                     connection.close()

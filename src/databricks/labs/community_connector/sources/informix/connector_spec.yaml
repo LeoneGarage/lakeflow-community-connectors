@@ -167,8 +167,8 @@ connection:
       description: >
         Optional secret response for PAM echo-on prompts. The built-in provider
         uses `password` for echo-off prompts and this value for echo-on prompts;
-        when absent, `password` is the fallback for both prompt styles. Ignored
-        by a custom authentication provider factory.
+        when absent, an echo-on prompt fails the login rather than receive
+        `password`. Ignored by a custom authentication provider factory.
 
     - name: authentication.pam.max.rounds
       type: string

@@ -183,8 +183,10 @@ class Informix:
             capture_output=True,
             text=True,
             check=True,
-        ).stdout.split()[0]
-        self.args = CC.make_args(instance_id)
+        ).stdout.split()
+        if not instance_id:
+            raise SystemExit("no running EC2 instance tagged informix-cdc in us-east-1")
+        self.args = CC.make_args(instance_id[0])
 
     def sql(self, statements: str) -> str:
         """Run ``statements`` in one dbaccess session; fail with its output on an error."""

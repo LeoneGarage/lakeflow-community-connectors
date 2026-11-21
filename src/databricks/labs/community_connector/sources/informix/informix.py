@@ -17,6 +17,7 @@ import dataclasses
 import dis
 import errno
 import fnmatch
+import functools
 import gzip
 import hashlib
 import hmac
@@ -410,6 +411,8 @@ _TABLE_MIGRATION_OPTION = "table.migration"
 # old key of a key-changing UPDATE on a keyed append table is handled the same way.
 _HANDOFF_CHANNEL_UPSERT = 0
 _HANDOFF_CHANNEL_DELETE = 1
+# On a parked upsert token: its flow had a delete flow beside it, which parks its own.
+_HANDOFF_KEYED = "handoff_keyed"
 _DEFAULT_SNAPSHOT_MODE = "incremental"
 # The modes whose snapshot a snapshot.source extract serves: the extract is the table's
 # initial snapshot, and no other mode takes one from it.
@@ -2151,6 +2154,11 @@ def _serialized_sqli_operation(method: Callable[..., Any]) -> Callable[..., Any]
                 if not depth:
                     self._end_ansi_transaction()
             except BaseException as error:
+                if not depth:
+                    # Failed after its statements ran (a refused value, a nonzero cdc_*
+                    # status), the operation left their transaction open, its locks held.
+                    with contextlib.suppress(Exception):
+                        self._end_ansi_transaction(rollback=True)
                 if lost():
                     # 13: Informix connection-capacity lease was lost during the SQLI operation
                     raise ConnectionCapacityUnavailable(_m(13)) from error
@@ -2382,16 +2390,17 @@ class PurePythonInformixBridge:
         if callable(connect):
             connect()
 
-    def _end_ansi_transaction(self) -> None:
+    def _end_ansi_transaction(self, *, rollback: bool = False) -> None:
         # Docstring: End the transaction an operation's statements opened in an ANSI database,
         # where every statement opens one and it keeps what it read locked until a COMMIT
         # WORK. Left open, a CDC shard leader's catalog and log position reads held their
         # locks on systables and the rest through a whole catch-up, and DDL on the tables
-        # waited. A snapshot's transaction ends itself (_repeatable_read_transaction).
+        # waited. A snapshot's transaction ends itself (_repeatable_read_transaction). A
+        # failed operation's is rolled back.
 
         if self.__dict__.get("_is_ansi_database") and getattr(self.transport, "uncommitted", False):
             try:
-                self.transport.execute_command("COMMIT WORK")
+                self.transport.execute_command("ROLLBACK WORK" if rollback else "COMMIT WORK")
             except (SqliProtocolError, OSError):
                 # A session that broke under it ended its transaction, and the operation
                 # stands: it read and returned. The next one connects again.
@@ -2830,9 +2839,11 @@ class PurePythonInformixBridge:
                     self._connection_slot = f"slot-{slot.slot_id:04d}"
                     self._lakebase_slot = slot
                     stop = threading.Event()
+                    # Told which lease it was: a later read's is not this heartbeat's to end.
+                    lost = functools.partial(self._poison_connection_slot_lease, slot, stop)
                     heartbeat = threading.Thread(
                         target=self._heartbeat_connection_slot,
-                        args=(slot, stop, self._poison_connection_slot_lease),
+                        args=(slot, stop, lost),
                         daemon=True,
                         name="informix-lakebase-slot-heartbeat",
                     )
@@ -2993,15 +3004,25 @@ class PurePythonInformixBridge:
                 exc_info=True,
             )
 
-    def _poison_connection_slot_lease(self) -> None:
+    def _poison_connection_slot_lease(
+        self, slot: Any = None, stop: threading.Event | None = None
+    ) -> None:
         # Docstring: Abandon a lease that can no longer be renewed, closing the transport.
         #
         # Called from the heartbeat when renewal is rejected or fails persistently.
         # The reader has provably lost its capacity slot, so continuing to use the
         # SQLI connection would exceed the configured concurrency: another reader
         # already owns the slot. Nothing here is Volume-specific -- it is about the
-        # Informix transport and the operation in flight on it.
+        # Informix transport and the operation in flight on it. ``slot`` and ``stop`` are
+        # the heartbeat's: a slot released meanwhile is left alone, and so is one claimed
+        # since, which is another read's.
 
+        def superseded() -> bool:
+            held = getattr(self, "_lakebase_slot", None)
+            return slot is not None and ((stop is not None and stop.is_set()) or held is not slot)
+
+        if superseded():
+            return
         lease_lost = getattr(self, "_connection_lease_lost", None)
         if lease_lost is not None:
             # Publish loss before waiting. The active operation can finish its
@@ -3034,6 +3055,13 @@ class PurePythonInformixBridge:
                 )
         with context:
             with self._connect_lock:
+                if superseded():
+                    # Released while this waited for the operation lock: release_connection
+                    # closed the transport and cleared the loss, unless it ran before the loss
+                    # was set. A slot held now is a later read's, its transport too.
+                    if lease_lost is not None and getattr(self, "_lakebase_slot", None) is None:
+                        lease_lost.clear()
+                    return
                 # 26: Informix connection-slot lease renewal failed persistently; closing SQLI
                 # transport after the active operation exits
                 logging.getLogger(__name__).error(_m(26))
@@ -3980,14 +4008,16 @@ class PurePythonInformixBridge:
         # abandoned CDC session on its own, and the validation returns no value derived
         # from them. A teardown that merely *times out* under heavy syscdcv1 load must not
         # fail an otherwise-successful validation -- doing so was observed wedging a flow
-        # (e.g. tw101) purely on a slow teardown. Poison the transport so the next use
-        # reconnects rather than resuming a half-torn-down session, and treat it as
-        # non-fatal. A non-timeout cleanup failure, or any failure alongside a real primary
-        # error, is still surfaced.
+        # (e.g. tw101) purely on a slow teardown. Nor one on a dropped connection, which
+        # ends the session with it, as a poll's teardown takes one (_settle_poll_cleanup):
+        # raised as 42, it was taken for a refused schema transition and recorded as one.
+        # Poison the transport so the next use reconnects rather than resuming a
+        # half-torn-down session, and treat it as non-fatal. Any other cleanup failure, or
+        # any failure alongside a real primary error, is still surfaced.
 
         cleanup_errors = []
-        cleanup_timed_out = False
-        if started:
+        # A failed primary call that closed the client ended the CDC session with it.
+        if started and not _transport_closed(self.transport):
             try:
                 _expect_zero(
                     self.transport.execute(
@@ -3998,7 +4028,6 @@ class PurePythonInformixBridge:
                 )
             except Exception as error:
                 cleanup_errors.append(error)
-                cleanup_timed_out = cleanup_timed_out or _is_timeout_error(error)
         if not _transport_closed(self.transport):
             # A failed call closes the SQLI connection, and the CDC session ends with it:
             # cdc_closesess would then fail only for want of a connection.
@@ -4011,23 +4040,22 @@ class PurePythonInformixBridge:
                 )
             except Exception as error:
                 cleanup_errors.append(error)
-                cleanup_timed_out = cleanup_timed_out or _is_timeout_error(error)
         if set_socket_timeout is not None and previous_socket_timeout is not None:
             try:
                 set_socket_timeout(float(previous_socket_timeout))
             except Exception as error:
                 cleanup_errors.append(error)
         if cleanup_errors and primary_error is None:
-            if cleanup_timed_out and all(_is_timeout_error(e) for e in cleanup_errors):
+            if all(_is_timeout_error(e) or reconnectable_error(e) for e in cleanup_errors):
                 # The socket is mid-read on a half-torn-down CDC session; drop the
                 # transport so the next operation reconnects instead of resuming it,
                 # keeping the connection slot (this is not a capacity problem).
                 reset_transport = getattr(self, "reset_transport", None)
                 if callable(reset_transport):
                     reset_transport()
-                # 41: Informix CDC validation succeeded but session teardown timed out; treating as
-                # non-fatal and reconnecting. Raise cdc.read.timeout.seconds or reduce concurrent
-                # CDC sessions if this recurs.
+                # 41: Informix CDC validation succeeded but session teardown timed out or lost its
+                # connection; treating as non-fatal and reconnecting. Raise cdc.read.timeout.seconds
+                # or reduce concurrent CDC sessions if this recurs.
                 logging.getLogger(__name__).warning(
                     _m(41),
                     exc_info=cleanup_errors[0],
@@ -4318,7 +4346,10 @@ class PurePythonInformixBridge:
             execute_command("COMMIT WORK")
         except BaseException as primary_error:
             try:
-                execute_command("ROLLBACK WORK")
+                # A client that closed on the failure ended the transaction with its session:
+                # sent there, the rollback only failed, as a note on every such error.
+                if not _transport_closed(self.transport):
+                    execute_command("ROLLBACK WORK")
             except Exception as cleanup_error:
                 add_informix_exception_note(
                     primary_error,
@@ -7621,9 +7652,10 @@ def _newest_created_entry_mtime(path: str, recursive: bool = False) -> float:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     root = os.open(path, flags)
     newest: float | None = None
-    root_mtime = os.fstat(root).st_mtime
     stack = [root]
     try:
+        # Inside: a mount that dropped between the open and the stat left the root open.
+        root_mtime = os.fstat(root).st_mtime
         while stack:
             descriptor = stack.pop()
             try:
@@ -7655,9 +7687,9 @@ def _created_since(path: str, cutoff: float) -> bool:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     root = os.open(path, flags)
     stack = [root]
-    root_mtime = os.fstat(root).st_mtime
     files = False
     try:
+        root_mtime = os.fstat(root).st_mtime
         while stack:
             descriptor = stack.pop()
             try:
@@ -7862,22 +7894,31 @@ def _open_state_entry_with_retry(path: str, flags: int, *, dir_fd: int | None = 
 
 def _open_state_directory(root: str, path: str) -> int:
     # Docstring: Open a directory beneath root without following a replaceable symlink.
+    #
+    # Both are normalised first: commonpath keeps "..", so a path that climbed out of the
+    # root passed and was walked out of it a part at a time, and a root given with a
+    # trailing slash refused every path beneath it.
 
+    root, path = os.path.normpath(root), os.path.normpath(path)
     if os.path.commonpath((root, path)) != root:
         # 122: Informix shared-state path escapes '{}': '{}'
         raise InformixError(_m(122, root, path))
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = _open_state_entry_with_retry(root, flags)
+
+    def entry(name: str, **kwargs: Any) -> int:
+        try:
+            return _open_state_entry_with_retry(name, flags, **kwargs)
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                # 123: Informix shared-state path traverses symlink or non-directory: '{}'
+                raise InformixError(_m(123, path)) from error
+            raise
+
+    descriptor = entry(root)
     try:
         relative = os.path.relpath(path, root)
         for part in () if relative == "." else relative.split(os.sep):
-            try:
-                child = _open_state_entry_with_retry(part, flags, dir_fd=descriptor)
-            except OSError as error:
-                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
-                    # 123: Informix shared-state path traverses symlink or non-directory: '{}'
-                    raise InformixError(_m(123, path)) from error
-                raise
+            child = entry(part, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = child
         return descriptor
@@ -8653,11 +8694,15 @@ class _SharedCdcShard:
         # checkpoint.
         with self.condition:
             existing = self.subscribers.get(identity)
+            expired = (
+                existing is not None
+                and time.monotonic() - existing["last_seen"] > self.subscriber_ttl
+            )
             if (
                 existing is not None
                 and owner is not None
                 and existing.get("owner") not in (None, owner)
-                and time.monotonic() - existing["last_seen"] <= self.subscriber_ttl
+                and not expired
             ):
                 # A second flow reading the same table with the same layout (two
                 # destinations, say). The table has one buffer, cut at one checkpoint:
@@ -8665,7 +8710,20 @@ class _SharedCdcShard:
                 # yet to read, which it then never saw, or each start-over wiped the
                 # other's coverage. The first keeps the shard until it stops polling.
                 return False
-            if (
+            own = existing is not None and (
+                expired or (owner is not None and existing.get("owner") == owner)
+            )
+            if own and (
+                existing["capture"] != capture
+                or _schema_fingerprint(existing["table"]) != _schema_fingerprint(table)
+            ):
+                # This flow's own place, or one whose flow stopped polling, under a table that
+                # changed since: a schema or key change the capture does not show too. Taken
+                # for another flow's, it read directly until the place expired, and the
+                # place's buffer, its checkpoint frozen, grew to the cap and held the shard.
+                self._restart_table_locked(identity)
+                existing = None
+            elif (
                 existing is not None
                 and existing["capture"] == capture
                 and _schema_fingerprint(existing["table"]) != _schema_fingerprint(table)
@@ -8674,7 +8732,7 @@ class _SharedCdcShard:
                 # changes the capture): the shard keeps the first one's table, buffer and
                 # coverage, and this one reads directly.
                 return False
-            if (
+            elif (
                 existing is not None
                 and existing["capture"] != capture
                 and existing["table"].column_selection != table.column_selection
@@ -8685,16 +8743,12 @@ class _SharedCdcShard:
                 # buffer and coverage at every poll, and neither was ever served. The
                 # shard keeps the first one's, and this one reads directly.
                 return False
-            if existing is not None and existing["capture"] != capture:
+            elif existing is not None and existing["capture"] != capture:
                 # The table's columns changed (its consumer moved to a new schema): what
                 # was buffered under the old capture lacks the new columns, so drop it and
                 # treat the table as new, re-read from its floor under the new capture.
-                self.buffers.pop(identity, None)
-                self.cursors.pop(identity, None)
+                self._restart_table_locked(identity)
                 existing = None
-                # And read the table's catalog entry at the daemon's next cycle, not the
-                # next scheduled check.
-                self.catalog.force_check()
             elif existing is not None and (
                 checkpoint_commit_lsn < existing["checkpoint"] or floor_lsn < existing["floor"]
             ):
@@ -8737,6 +8791,15 @@ class _SharedCdcShard:
                 self.shared_restart = min(self.shared_restart, floor_lsn)
             self.condition.notify_all()
             return True
+
+    def _restart_table_locked(self, identity) -> None:
+        # Docstring: Drop a table's buffer and cursor, so it is re-read from its floor as a
+        # new one, and read its catalog entry at the daemon's next cycle, not the next
+        # scheduled check. The caller makes its subscriber entry anew.
+
+        self.buffers.pop(identity, None)
+        self.cursors.pop(identity, None)
+        self.catalog.force_check()
 
     def poll(self, identity, table, capture, checkpoint_commit_lsn, floor_lsn, owner=None):
         # Docstring: Subscribe and take the view in one hold of the lock, so no other flow's
@@ -11261,14 +11324,13 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         self._pipeline_scope(checkpoint),
                         owner=True,
                     )
-                    result = self._read_stream(
-                        current_table, checkpoint, table_options, deletes=False
+                    # A copy in flight goes on, as under any mode (below).
+                    read = (
+                        self._read_incremental
+                        if self._offset_is_incremental_reader(checkpoint)
+                        else functools.partial(self._read_stream, deletes=False)
                     )
-                elif snapshot_mode == "initial_only" and effective_start.get("phase") == "stream":
-                    self._cleanup_completed_snapshot_stage(table, effective_start)
-                    result = (iter(()), dict(effective_start))
-                elif snapshot_mode == "cdc_only" and not effective_start:
-                    result = self._read_cdc_only(table, table_options)
+                    result = read(current_table, checkpoint, table_options)
                 elif (
                     snapshot_mode == "auto_snapshot"
                     and effective_start.get("phase") == "stream"
@@ -11293,13 +11355,18 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     )
                     if replaying:
                         result = result[0], {**result[1], _REPLAY_REESTABLISHED: True}
+                elif self._offset_is_incremental_reader(effective_start):
+                    # A copy in flight finishes whatever snapshot.mode says now, as a snapshot
+                    # does: under another mode its cursor was dropped, or its stream stopped
+                    # (initial_only), and the rows it had yet to copy were never read.
+                    result = self._read_incremental(table, effective_start, table_options)
+                elif snapshot_mode == "initial_only" and effective_start.get("phase") == "stream":
+                    self._cleanup_completed_snapshot_stage(table, effective_start)
+                    result = (iter(()), dict(effective_start))
+                elif snapshot_mode == "cdc_only" and not effective_start:
+                    result = self._read_cdc_only(table, table_options)
                 elif snapshot_mode in {"incremental", "auto_snapshot"} and not effective_start:
                     result = self._read_incremental(table, None, table_options)
-                elif (
-                    snapshot_mode in {"incremental", "auto_snapshot"}
-                    and "incremental" in effective_start
-                ):
-                    result = self._read_incremental(table, effective_start, table_options)
                 elif not effective_start or effective_start.get("phase", "snapshot") == "snapshot":
                     result = self._read_snapshot(table, effective_start, table_options)
                 else:
@@ -11867,6 +11934,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # boundary was pinned by latest_offset; take snapshot_lsn from end_offset and
             # the resume point from the start offset's split index (0 on the first read).
             snapshot_lsn = int((end_offset or {})["commit_lsn"])
+            # A batch re-planned after a restart has had no latest_offset to check drift
+            # (_served_offset): checked here, a first window by the fingerprint its end pinned.
+            table = self._served_snapshot_table(table, effective_start, end_offset)
             start_split, start_record = _unl_position(effective_start)
             splits = self._unl_all_splits(table, table_options)
             end_split, end_record = _unl_position(end_offset or {}, terminal=len(splits))
@@ -11925,11 +11995,20 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 window=end_split - start_split,
                 all_splits=splits,
             )
-        batch = (
-            self._snapshot_page_batch(table, effective_start, table_options)
-            or self._partition_page_batches.pop(self._partition_offset_key(start_offset), None)
-            or self._bootstrap_page_batch(table, effective_start, end_offset or {}, table_options)
-        )
+        batch = self._snapshot_page_batch(table, effective_start, table_options)
+        cached = self._partition_page_batches.pop(self._partition_offset_key(start_offset), None)
+        checked_by = effective_start
+        if batch is None and cached is None:
+            batch = self._bootstrap_page_batch(
+                table, effective_start, end_offset or {}, table_options
+            )
+            # The first batch re-planned after a restart (or a resnapshot's): checked by the
+            # fingerprint its end pinned, not its start's.
+            checked_by = {}
+        if batch is not None:
+            # As for a .unl window. A batch its own read just staged (cached) needs no check.
+            table = self._served_snapshot_table(table, checked_by, end_offset)
+        batch = batch or cached
         if batch is not None:
             scope, schema_id, snapshot_lsn, start_page, end_page, page_count = batch
             # The pages Spark logged for the batch: a re-plan after a restart computes its
@@ -13938,16 +14017,24 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 pass
 
     def _write_handoff_token(
-        self, table: Table, offset: dict, channel: int = _HANDOFF_CHANNEL_UPSERT
+        self,
+        table: Table,
+        offset: dict,
+        channel: int = _HANDOFF_CHANNEL_UPSERT,
+        *,
+        keyed: bool = False,
     ) -> None:
         # Docstring: Park a stream-phase offset so a later flow can resume from it.
 
         _, table_key = self._table_state_keys(table)
         namespace = self._lakebase_state_namespace()
         # The position alone: a busy flow's retry counters went on into the new flow's seed.
-        offset_json = json.dumps(
-            _validated_offset({k: v for k, v in offset.items() if k not in _OFFSET_ADVISORY_FIELDS})
-        )
+        position = {k: v for k, v in offset.items() if k not in _OFFSET_ADVISORY_FIELDS}
+        # A keyed flow's token says so: a delete flow with no checkpoint at capture parks no
+        # token, which the append cutover would otherwise take for a table with none.
+        if keyed:
+            position[_HANDOFF_KEYED] = True
+        offset_json = json.dumps(_validated_offset(position))
         schema_fp = str(offset.get("schema_fingerprint") or _schema_fingerprint(table))
         self._state(
             put_cdc_handoff,
@@ -14062,6 +14149,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # keyed path, where capture and cutover share _read_handoff. The token is dropped
         # only when that marked offset arrives, so a crash before commit re-seeds.
         seeded = _validated_offset(json.loads(token["offset_json"]))
+        seeded.pop(_HANDOFF_KEYED, None)
         # Where the pages live: a serve relocated once already keeps them under its first
         # capture's scope (stage_scope), not under the scope that parked it again.
         origin_scope = seeded.get("stage_scope") or seeded.get("pipeline_scope")
@@ -14151,7 +14239,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # stop. A snapshot offset's staged pages stay under this (capturing) scope; the
         # cutover records that scope on stage_scope so the new flow can read them, and
         # after Restore finishes the snapshot from the parked page_index before streaming.
-        self._write_handoff_token(table, effective_start)
+        self._write_handoff_token(table, effective_start, keyed=True)
         return iter(()), dict(effective_start)
 
     def _read_handoff_deletes(
@@ -15894,6 +15982,16 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         validate_snapshot_arity(cursor, primary_keys)
         return tuple(cursor)
 
+    def _served_snapshot_table(
+        self, table: Table, effective_start: dict, end_offset: dict | None
+    ) -> Table:
+        # Docstring: ``table`` for a served snapshot batch, failing 243 on drift: checked by
+        # its start's fingerprint, or a first batch's by the one its end pinned.
+        if effective_start and effective_start.get("phase") not in (None, "snapshot"):
+            return table
+        expected = (effective_start or end_offset or {}).get("schema_fingerprint")
+        return self._snapshot_schema_held(table, expected) if expected else table
+
     def _snapshot_schema_held(self, table: Table, expected: str | None) -> Table:
         # Docstring: ``table`` for a snapshot read on from its checkpoint, failing 243 where the
         # schema or a fingerprinted option no longer gives the snapshot's ``expected``.
@@ -17599,8 +17697,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # stream's offsets name that update (scan_scope, see _read_stream) until the stream
         # is past the scan's end, since a later update's offsets carry its own scope.
 
-        if (table.primary_keys and not table.key_only_from_option) or self._snapshot_cursor_scan(
-            options
+        if (table.primary_keys and not table.key_only_from_option) or (
+            # snapshot.scan as it is now says nothing of a scan the snapshot took: set to
+            # cursor before the stream was past its end, the offset lost the scan's name
+            # (_read_stream) and the changes the pages hold were replayed.
+            self._snapshot_cursor_scan(options) and not checkpoint.get("scan_scope")
         ):
             # No scan to be within: an offset stops naming one (see _read_stream).
             self.__dict__.setdefault("_index_scan_live", {})[table.identity] = None
@@ -18323,6 +18424,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 "scope": pipeline_scope,
                 "schema_id": schema_id,
                 "snapshot_lsn": str(snapshot_lsn),
+                "layout": self._unl_layout(table_options),
                 "files": [
                     {
                         "name": entry["name"],
@@ -18337,6 +18439,38 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         )
         self._validate_immutable_record_header(winner, "unl-extract", table.exposed_name)
         self._compare_unl_extract(table, winner, entries, fingerprint_paths=None)
+        self._compare_unl_layout(table, winner, table_options)
+
+    def _unl_layout(self, table_options: dict[str, str]) -> dict[str, Any]:
+        # Docstring: The options a file snapshot's position depends on, as the serve takes them.
+        #
+        # A position is a split index into the plan snapshot.split.bytes and the escape give,
+        # and a record index counted by the delimiter and escape. Pinned with the manifest.
+
+        delimiter, escape = self._unl_field_format(table_options)
+        split_bytes = self._table_int_option(
+            table_options, _UNL_SPLIT_BYTES_OPTION, _UNL_SPLIT_TARGET_BYTES, minimum=1
+        )
+        return {
+            _UNL_SPLIT_BYTES_OPTION: split_bytes,
+            _UNL_DELIMITER_OPTION: delimiter,
+            _UNL_ESCAPE_OPTION: escape,
+        }
+
+    def _compare_unl_layout(self, table: Table, record: dict, table_options: dict[str, str]):
+        # Docstring: Raise if an option the snapshot's position depends on changed since it was
+        # pinned. A manifest pinned before these were recorded names none.
+
+        pinned = record.get("layout")
+        if not isinstance(pinned, dict):
+            return
+        for name, value in self._unl_layout(table_options).items():
+            if name in pinned and pinned[name] != value:
+                # 490: Option '{}' for '{}' changed from {!r} to {!r} after its file snapshot
+                # started, and the snapshot's position is a place in the split plan or the
+                # records the old value gave: resuming would skip or repeat rows. Set it back
+                # until the snapshot is done, or run a full refresh
+                raise InformixError(_m(490, name, table.exposed_name, pinned[name], value))
 
     def _verify_unl_extract(
         self,
@@ -18366,6 +18500,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             self._pin_unl_extract(table, table_options, pipeline_scope, schema_id, snapshot_lsn)
             return
         self._validate_immutable_record_header(record, "unl-extract", table.exposed_name)
+        self._compare_unl_layout(table, record, table_options)
         entries = self._unl_extract_files(table, table_options)
         self._compare_unl_extract(table, record, entries, fingerprint_paths=set(read_paths))
 
@@ -19006,16 +19141,24 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 raise InformixError(_m(273, table.exposed_name))
             # A keyed table's two flows park their own positions, and the append stream
             # goes on from the upsert flow's alone: the deletes between the two were lost
-            # (the delete flow behind) or sent again (ahead). A copy parked mid-way
-            # (incremental) finishes on its own terms.
+            # (the delete flow behind) or sent again (ahead). So too for a copy parked
+            # mid-way (incremental): its upsert flow went on past deletes it skipped.
             deletes = self._read_handoff_token(table, _HANDOFF_CHANNEL_DELETE)
             parked = [json.loads(token["offset_json"])]
+            if deletes is None and parked[0].get(_HANDOFF_KEYED) and parked[0]["phase"] == "stream":
+                # 489: table.migration for '{}' parked its upsert flow at LSN {} but no position
+                # for its delete flow, which had no checkpoint at capture, and an append stream
+                # goes on from the upsert position: the deletes after the delete flow's start
+                # would be lost. Put the keyed configuration back without table.migration, run
+                # one triggered update with no writes to the table while it runs, and capture
+                # again
+                raise InformixError(_m(489, table.exposed_name, parked[0].get("commit_lsn")))
             if deletes is not None and parked[0].get("phase") == "stream":
                 parked.append(json.loads(deletes["offset_json"]))
                 upsert_at, delete_at = (
                     (str(p.get("commit_lsn")), str(p.get("change_lsn"))) for p in parked
                 )
-                if upsert_at != delete_at and "incremental" not in parked[0]:
+                if upsert_at != delete_at:
                     # 488: table.migration for '{}' parked its upsert flow at LSN {} but its
                     # delete flow at {}, and an append stream goes on from one position: the
                     # deletes between them would be lost or sent again. Put the keyed

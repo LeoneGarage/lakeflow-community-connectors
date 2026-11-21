@@ -1758,6 +1758,39 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         api.request.assert_any_call("DELETE", "/api/2.0/postgres/projects/informix-state-old")
         connection.close.assert_called_once()
 
+    def test_a_project_still_being_deleted_past_the_wait_is_forgotten_by_the_process(self):
+        # The delete goes on at the server after the minute it is given: the process kept
+        # the endpoint it had provisioned in that project, and its later connects failed.
+        lakebase_state.LakebaseState._project_gc_checked.clear()
+        state = lakebase_state.LakebaseState({}, "current")
+        api = mock.MagicMock()
+        api.request.side_effect = [
+            {"projects": [{"name": "projects/informix-state-old"}]},
+            {"name": "operations/delete"},
+        ]
+        api.await_operation.side_effect = lakebase_state.LakebaseStateError("timed out")
+        state._api_client = mock.Mock(return_value=api)
+        connection = mock.MagicMock()
+        _answer_sweep_queries(connection.cursor.return_value.__enter__.return_value)
+        state._open = mock.Mock(return_value=connection)
+        state._admin_user = mock.Mock(return_value="admin")
+        key = ("informix-state-old", "elsewhere")
+        lakebase_state.LakebaseState._provisioned[key] = {"host": "gone"}
+        self.addCleanup(lakebase_state.LakebaseState._provisioned.pop, key, None)
+
+        with (
+            mock.patch.object(
+                lakebase_state,
+                "_endpoint_facts",
+                return_value={"endpoint": "endpoint", "host": "host"},
+            ),
+            mock.patch.object(lakebase_state, "generate_credential", return_value="token"),
+            mock.patch.object(lakebase_state.time, "time", return_value=100_000_000),
+        ):
+            self.assertEqual(state.collect_unused_projects(90, 24), 1)
+
+        self.assertNotIn(key, lakebase_state.LakebaseState._provisioned)
+
     def test_the_admin_password_is_taken_as_given(self):
         # It signs in an admin role set up outside, as the Informix password does: stripped,
         # one beginning or ending with a blank failed provisioning's sign-in.
@@ -2564,6 +2597,7 @@ class LakebaseProjectCreationTests(unittest.TestCase):
                 mock.call(
                     "DELETE",
                     "/api/2.0/postgres/projects/proj?purge=true",
+                    tolerate_missing=True,
                 ),
                 mock.call(
                     "GET",
@@ -2625,8 +2659,36 @@ class LakebaseProjectCreationTests(unittest.TestCase):
         tombstone = {"name": "projects/proj", "delete_time": "2026-08-10T06:51:32Z"}
         api.request.side_effect = [tombstone, {"done": True}, tombstone]
 
-        with self.assertRaisesRegex(lakebase_state.LakebaseStateError, "is still visible"):
+        with (
+            mock.patch.object(lakebase_state, "_OPERATION_TIMEOUT_SECONDS", 0),
+            self.assertRaisesRegex(lakebase_state.LakebaseStateError, "is still visible"),
+        ):
             lakebase_state.ensure_project(api, "proj")
+
+    def test_a_tombstone_another_process_purges_is_waited_out_not_a_failure(self):
+        # Every flow's process provisions on its own: the purge another process had done
+        # (404) or had under way (a conflict) failed this one, and so did the project that
+        # process made from it, taken for the tombstone still there.
+        tombstone = {"name": "projects/proj", "delete_time": "2026-08-10T06:51:32Z"}
+        for purge, after, created in (
+            (lakebase_state.LakebaseStateError("conflict"), [tombstone, {"name": "p"}], False),
+            (None, [None], True),
+        ):
+            with self.subTest(purge=purge):
+                api = mock.MagicMock()
+                api.request.side_effect = [tombstone, purge, *after, {"name": "operations/c"}]
+                with (
+                    mock.patch.object(lakebase_state, "_PURGE_POLL_SECONDS", 0),
+                    mock.patch.object(
+                        lakebase_state, "_endpoint_facts", return_value={"host": "host"}
+                    ),
+                ):
+                    self.assertEqual(lakebase_state.ensure_project(api, "proj"), {"host": "host"})
+                posted = [call for call in api.request.call_args_list if call.args[0] == "POST"]
+                self.assertEqual(bool(posted), created)
+                api.await_operation.assert_has_calls(
+                    [mock.call({"name": "operations/c"})] if created else []
+                )
 
 
 class LakebaseAdminIdentityTests(unittest.TestCase):
