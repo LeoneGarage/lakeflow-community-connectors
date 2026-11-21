@@ -918,6 +918,23 @@ class SqliPacketTests(unittest.TestCase):
         )
         self.assertEqual(client._input.tell(), len(transcript))
 
+    def test_a_command_after_a_query_leaves_the_columns_it_changed(self):
+        # Reset by every statement, the COMMIT WORK ending a read cleared them before the
+        # caller could check the rows' keys (see _ScanReads); a query's own rows reset them.
+        client = InformixSqliClient("host", 9088, "db", "user", "password")
+        client.state = _sqli.ConnectionState.DATABASE_OPEN
+        client._output = io.BytesIO()
+        client._input = io.BytesIO(
+            struct.pack(">hhhh", 99, 1, 2, 1) + struct.pack(">hhiii", 15, 0, 0, 0, 0)
+            + struct.pack(">h", 12)
+        )
+        client.altered = {"value"}
+        client.execute_command("COMMIT WORK")
+        self.assertEqual(client.altered, {"value"})
+        client._input = io.BytesIO(struct.pack(">h", SQ_EOT))
+        client._read_query_group(None)
+        self.assertEqual(client.altered, set())
+
     def test_non_row_command_consumes_zero_column_description(self):
         client = InformixSqliClient("host", 9088, "db", "user", "password")
         output = io.BytesIO()

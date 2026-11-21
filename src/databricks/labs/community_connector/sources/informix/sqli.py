@@ -1352,8 +1352,9 @@ class InformixSqliClient:
     _input: BinaryIO | None = field(default=None, init=False, repr=False)
     _output: BinaryIO | None = field(default=None, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
-    # The columns string.null.byte changed a value of in the last statement's rows, which
-    # the bridge doesn't page on (see PurePythonInformixBridge._unaltered).
+    # The columns string.null.byte changed a value of in the last query's rows, which the
+    # bridge doesn't page on (see PurePythonInformixBridge._unaltered); a command after the
+    # query, such as the COMMIT WORK ending its read, leaves them.
     altered: set[str] = field(default_factory=set, init=False, repr=False)
 
     def connect(self) -> "InformixSqliClient":
@@ -1650,8 +1651,6 @@ class InformixSqliClient:
             or self._output is None
         ):
             raise SqliProtocolError("SQLI database session is not open")
-        # Each statement's own: see altered.
-        self.altered = set()
         return self._input, self._output
 
     def _ca_file_context(self, deadline: float) -> ssl.SSLContext:
@@ -1984,6 +1983,10 @@ class InformixSqliClient:
     ) -> tuple[ResultDescription | None, list[dict[str, object]], bool]:
         if self._input is None:
             raise SqliProtocolError("SQLI input is unavailable")
+        if description is None:
+            # A query's first result group: its rows' own (see altered). Not a command's,
+            # which left none of the COMMIT WORK after a read to check.
+            self.altered = set()
         rows, exhausted = [], False
         # Fixed for the whole result, so decided once per batch rather than per tuple.
         variable_layout = None

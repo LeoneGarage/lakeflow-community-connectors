@@ -4531,6 +4531,38 @@ class LakeflowContractTests(unittest.TestCase):
                 table, {"commit_lsn": str(boundary), "schema_id": "s"}, {}, transactions
             )
 
+    def test_a_scan_read_refuses_a_changed_primary_keys_value_after_its_commit(self):
+        # Through the bridge's own transaction: its COMMIT WORK comes before the scan's
+        # check of the rows' primary.keys values, which the client keeps for it.
+        class Transport:
+            altered: set = set()
+
+            def execute(self, sql, parameters=(), max_result_bytes=None):
+                if "is_ansi" in sql:
+                    self.altered = set()
+                    return [{"is_ansi": 0}]
+                self.altered = {"value"}
+                return [{"id": 1, "value": "az"}]
+
+            def execute_command(self, sql):
+                del sql  # a command leaves the query's columns, as the client does
+
+        bridge = object.__new__(PurePythonInformixBridge)
+        bridge.options = {}
+        bridge.config = {"database": "demo"}
+        bridge._null_byte = "empty"
+        bridge.transport = Transport()
+        connector = mock.Mock(_bridge=bridge)
+        connector._snapshot_read_with_reconnect.side_effect = lambda read, **_: read()
+        keyed = dataclasses.replace(
+            Table.parse(_table(primary_keys=()), "demo"),
+            primary_keys=("value",),
+            key_only_from_option=True,
+        )
+        reads = informix_module._ScanReads(connector, keyed)
+        with self.assertRaisesRegex(InformixError, "key or index column value, which"):
+            reads.key_rows("demo.app.orders", ["id", "value"], ["id"], [1], "REPEATABLE READ")
+
     def test_an_update_names_the_columns_either_image_had_changed(self):
         # The UPDATE was made from its after-image, and a before-image's changed index
         # value (see decode_frame's "nul") went unseen.
@@ -4561,7 +4593,8 @@ class LakeflowContractTests(unittest.TestCase):
         informix_module._ScanReads(connector, keyed).snapshot_chunk("demo.app.orders")
         self.assertEqual(checked, [(("value",), "demo.app.orders")])
         checked.clear()
-        informix_module._ScanReads(connector, Table.parse(_table(primary_keys=()), "demo")).snapshot_chunk()
+        keyless = Table.parse(_table(primary_keys=()), "demo")
+        informix_module._ScanReads(connector, keyless).snapshot_chunk()
         self.assertEqual(checked, [])
 
     def test_an_index_scan_refuses_too_many_moved_rows_of_a_keyed_table(self):
@@ -17370,6 +17403,23 @@ class LakeflowContractTests(unittest.TestCase):
             InformixError, "table 'app.orders' changed so that its table options no longer apply"
         ):
             connector._refresh_table_schema(table, None)
+
+    def test_an_initial_snapshot_counts_the_rows_that_land_against_its_limit(self):
+        # Counted as read, before the NUL byte filter, rows the row_filter left out (see
+        # _landed_rows) made one too many for snapshot.max.rows, unlike a snapshot-only read.
+        for rows_filter, fails in (("value = 'a'", False), ("value <> 'z'", True)):
+            with self.subTest(row_filter=rows_filter):
+                bridge = FakeBridge()
+                connector = self.connector(
+                    bridge, registration_scope=f"limit-{fails}", **{"snapshot.max.rows": "1"}
+                )
+                options = {"row_filter": rows_filter}
+                if fails:
+                    with self.assertRaisesRegex(InformixError, "snapshot.max.rows=1"):
+                        list(connector.read_table("app.orders", {}, options)[0])
+                    continue
+                rows, _ = connector.read_table("app.orders", {}, options)
+                self.assertEqual([row["id"] for row in rows], [1])
 
     def test_snapshot_only_applies_table_byte_limit(self):
         bridge = FakeBridge()

@@ -5783,8 +5783,9 @@ def register_lakeflow_source(spark):
         _input: BinaryIO | None = field(default=None, init=False, repr=False)
         _output: BinaryIO | None = field(default=None, init=False, repr=False)
         _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
-        # The columns string.null.byte changed a value of in the last statement's rows, which
-        # the bridge doesn't page on (see PurePythonInformixBridge._unaltered).
+        # The columns string.null.byte changed a value of in the last query's rows, which the
+        # bridge doesn't page on (see PurePythonInformixBridge._unaltered); a command after the
+        # query, such as the COMMIT WORK ending its read, leaves them.
         altered: set[str] = field(default_factory=set, init=False, repr=False)
 
         def connect(self) -> "InformixSqliClient":
@@ -6081,8 +6082,6 @@ def register_lakeflow_source(spark):
                 or self._output is None
             ):
                 raise SqliProtocolError("SQLI database session is not open")
-            # Each statement's own: see altered.
-            self.altered = set()
             return self._input, self._output
 
         def _ca_file_context(self, deadline: float) -> ssl.SSLContext:
@@ -6415,6 +6414,10 @@ def register_lakeflow_source(spark):
         ) -> tuple[ResultDescription | None, list[dict[str, object]], bool]:
             if self._input is None:
                 raise SqliProtocolError("SQLI input is unavailable")
+            if description is None:
+                # A query's first result group: its rows' own (see altered). Not a command's,
+                # which left none of the COMMIT WORK after a read to check.
+                self.altered = set()
             rows, exhausted = [], False
             # Fixed for the whole result, so decided once per batch rather than per tuple.
             variable_layout = None
@@ -11778,6 +11781,9 @@ def register_lakeflow_source(spark):
             }
         )
 
+        # The reads whose rows' primary.keys values are checked after them (see read).
+        _ROWS = frozenset({"key_rows", "rows_by_values", "snapshot_chunk"})
+
         def __init__(self, connector: Any, table: Table) -> None:
             self._connector, self._table = connector, table
 
@@ -11794,7 +11800,7 @@ def register_lakeflow_source(spark):
                 # row is found by them and taken out of the pages, and a value string.null.byte
                 # changed found another row (the bridge checks the index columns it pages by).
                 unaltered = getattr(self._connector._bridge, "_unaltered", None)
-                if unaltered is not None and self._table.primary_keys:
+                if unaltered is not None and self._table.primary_keys and name in self._ROWS:
                     unaltered(self._table.primary_keys, self._table.identity)
                 return result
 
@@ -13962,14 +13968,20 @@ def register_lakeflow_source(spark):
             yield _expression_column(node[1])
 
 
-    def _filtered_pages(consume: Callable, predicate: tuple) -> Callable:
+    def _filtered_pages(consume: Callable, predicate: tuple, max_rows: int = 0) -> Callable:
         # Docstring: ``consume`` given only the rows of each page that pass ``predicate``, its
-        # pages numbered on without a gap where none does.
+        # pages numbered on without a gap where none does, and no more than ``max_rows`` of them
+        # (0, any number): counted before the filter, a snapshot whose rows passed it read as
+        # too many, unlike the snapshot-only read's (see _read_snapshot_only).
 
-        kept = [0]
+        kept = [0, 0]
 
         def consumer(lsn: int, _index: int, rows: list) -> None:
             rows = [row for row in rows if _row_filter_matches(predicate, row)]
+            kept[1] += len(rows)
+            if max_rows and kept[1] > max_rows:
+                # 52: Initial snapshot exceeds snapshot.max.rows={}
+                raise InformixError(_m(52, max_rows))
             if rows:
                 consume(lsn, kept[0], rows)
                 kept[0] += 1
@@ -22796,7 +22808,8 @@ def register_lakeflow_source(spark):
                 page_consumer = pipeline.submit if pipeline is not None else stage_page
                 landed = self._landed_predicate(table)
                 if landed is not None:
-                    page_consumer = _filtered_pages(page_consumer, landed)
+                    # The limit counts the rows that land, so the bridge reads with none.
+                    page_consumer = _filtered_pages(page_consumer, landed, max_rows)
                 try:
                     snapshot_lsn, rows = (
                         (snapshot_lsn, [])
@@ -22806,7 +22819,7 @@ def register_lakeflow_source(spark):
                             [c.name for c in table.columns],
                             scan_keys,
                             page_size,
-                            max_rows,
+                            0 if landed is not None else max_rows,
                             self._table_int_option(options, "snapshot.max.bytes", 0, minimum=0),
                             datetime_primary_key=any(
                                 column.name in scan_keys
@@ -22859,7 +22872,7 @@ def register_lakeflow_source(spark):
                 if not isinstance(rows, list):
                     # 255: Consistent snapshot bridge must return rows as a list
                     raise InformixError(_m(255))
-                if max_rows and len(rows) > max_rows:
+                if max_rows and len(rows) > max_rows and landed is None:
                     # 52: Initial snapshot exceeds snapshot.max.rows={}
                     raise InformixError(_m(52, max_rows))
                 if rows:
@@ -22867,7 +22880,7 @@ def register_lakeflow_source(spark):
                         # 256: Consistent snapshot bridge returned rows after consuming pages
                         raise InformixError(_m(256))
                     if landed is not None:
-                        _filtered_pages(stage_page, landed)(snapshot_lsn, 0, rows)
+                        _filtered_pages(stage_page, landed, max_rows)(snapshot_lsn, 0, rows)
                     else:
                         stage_page(snapshot_lsn, 0, rows)
                 retained_bytes = _deep_size(rows) if max_bytes else 0
