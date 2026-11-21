@@ -486,5 +486,6 @@
 "Option '{}' compares {} with {}, which has more than the 32 significant digits Informix reads of a number; the snapshot would filter otherwise than the stream",
 "Informix table '{}' is left out of the table list: {}",
 "Informix table '{}' holds a NUL byte in key or index column {}, which string.null.byte={} changes, so the read can't page on or look up the value Informix holds; set snapshot.scan=cursor to read the table without paging on it",
-"The schema of Informix table '{}' changed so that its table options no longer apply ({}); change them for the new schema and run a full refresh"
+"The schema of Informix table '{}' changed so that its table options no longer apply ({}); change them for the new schema and run a full refresh",
+"table.migration for '{}' parked its upsert flow at LSN {} but its delete flow at {}, and an append stream goes on from one position: the deletes between them would be lost or sent again. Put the keyed configuration back without table.migration, run one triggered update with no writes to the table while it runs, and capture again"
 ]

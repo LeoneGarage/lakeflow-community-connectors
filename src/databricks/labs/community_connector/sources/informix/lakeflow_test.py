@@ -11460,6 +11460,24 @@ class LakeflowContractTests(unittest.TestCase):
             "expected at least one non-terminal snapshot batch",
         )
 
+    def test_a_partitioned_snapshot_read_on_refuses_a_schema_changed_since(self):
+        # Its continuations carried the fingerprint on unchecked and served the rest of the
+        # snapshot under the new schema; initial_only, whose stream never reads, to its end.
+        for mode in ("initial", "initial_only"):
+            with self.subTest(mode=mode):
+                bridge = FakeBridge()
+                bridge.rows = [{"id": i, "value": f"v{i}"} for i in range(1, 5)]
+                options = {"snapshot.page.size": "1", "snapshot.mode": mode}
+                scope = f"drift-{mode}"
+                first = self._partitioned_connector(
+                    bridge, registration_scope=scope, **options
+                ).latest_offset("app.orders", {}, {})
+                self.assertEqual(first["phase"], "snapshot")
+                bridge.tables[0]["columns"].append({"name": "added", "type_name": "INTEGER"})
+                resumed = self._partitioned_connector(bridge, registration_scope=scope, **options)
+                with self.assertRaisesRegex(InformixError, "schema changed"):
+                    resumed.latest_offset("app.orders", {}, first)
+
     def test_a_replanned_page_batch_serves_the_pages_spark_logged(self):
         # get_partitions re-plans an uncommitted batch after a restart with no latest_offset
         # to share its window. pages.per.batch changed since: the batch still serves the
@@ -15200,6 +15218,29 @@ class LakeflowContractTests(unittest.TestCase):
         self.connector(bridge).read_table("app.orders", seeded, options)
 
         self.assertEqual(self._lakebase.database.handoff, {})
+
+    def test_an_append_cutover_refuses_flows_parked_at_different_positions(self):
+        # The append stream goes on from the upsert flow's position alone: the deletes
+        # between the two were lost (the delete flow behind) or sent again (ahead).
+        options = {"table.migration": "true", "append.only.ingestion": "true"}
+        for deletes_at, refused in ((120, True), (130, True), (125, False)):
+            with self.subTest(deletes_at=deletes_at):
+                self._lakebase.database.handoff.clear()
+                bridge = FakeBridge()
+                capture = self.connector(bridge)
+                capture.read_table("app.orders", _stream_offset(125), {"table.migration": "true"})
+                capture.read_table_deletes(
+                    "app.orders", _stream_offset(deletes_at), {"table.migration": "true"}
+                )
+                cutover = self.connector(bridge)
+                if refused:
+                    with self.assertRaisesRegex(
+                        InformixError, f"upsert flow at LSN 125 but its delete flow at {deletes_at}"
+                    ):
+                        cutover.read_table("app.orders", {}, options)
+                    continue
+                _, seeded = cutover.read_table("app.orders", {}, options)
+                self.assertEqual(seeded["commit_lsn"], "125")
 
     def test_handoff_cutover_without_a_parked_offset_fails_closed(self):
         bridge = FakeBridge()
@@ -24769,6 +24810,17 @@ class ShardCatalogTests(unittest.TestCase):
 
         self.assertEqual(self.bridge.calls, [("versions", (11, 12))])
 
+    def test_a_table_the_connector_cannot_read_leaves_the_shard_alone(self):
+        # Its Table.parse failed the shard's whole read, and every table of the shard went
+        # to direct reads for as long as it stayed subscribed.
+        self.tables(0)
+        self.bridge.tables["app.b"]["unreadable"] = "unsupported Informix column type"
+        self.bridge.versions[12] = 2
+
+        tables = self.tables(30)
+
+        self.assertEqual(sorted(name for name, table in tables.items() if table), ["a"])
+
     def test_a_check_re_reads_only_the_tables_whose_version_moved(self):
         self.tables(0)
         self.bridge.calls.clear()
@@ -24920,6 +24972,28 @@ class BatchedCatalogReadTests(unittest.TestCase):
         self.assertEqual(batched["demo.app.indexed"]["primary_keys"], ["code"])
         # Columns, keys, and the keyless table's unique indexes: three queries in all.
         self.assertEqual(len(bridge.transport.statements), 3)
+
+    def test_one_table_the_connector_cannot_read_is_marked_not_the_batch_failed(self):
+        # A shard's batch failed with it, and every table of the shard went to direct reads.
+        bridge = self.bridge()
+        parse = PurePythonInformixBridge._table_from_catalog_rows
+
+        def catalog_rows(self, owner, name, *args):
+            if name == "indexed":
+                raise InformixError("unsupported Informix column type")
+            return parse(self, owner, name, *args)
+
+        with mock.patch.object(PurePythonInformixBridge, "_table_from_catalog_rows", catalog_rows):
+            batched = bridge.get_tables(["demo.app.keyed", "demo.app.indexed"])
+
+        self.assertNotIn("unreadable", batched["demo.app.keyed"])
+        unreadable = batched["demo.app.indexed"]["unreadable"]
+        self.assertEqual(unreadable, "unsupported Informix column type")
+        capture = {"identity": "demo:app.indexed", "columns": [], "descriptors": []}
+        with self.assertRaisesRegex(InformixError, "unsupported Informix column type"):
+            bridge._assert_capture_layout(
+                capture, "latin-1", {("app", "indexed"): batched["demo.app.indexed"]}
+            )
 
     def test_get_tables_keeps_only_the_owners_asked_for(self):
         batched = self.bridge().get_tables(["demo.app.keyed"])

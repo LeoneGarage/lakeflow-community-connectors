@@ -3339,9 +3339,18 @@ class PurePythonInformixBridge:
             if table not in columns:
                 continue
             ordered = sorted(columns[table], key=lambda row: int(_field(row, "colno", 3)))
-            described[table] = self._table_from_catalog_rows(
-                table[0], table[1], ordered, keys.get(table, [])[:1], unique_indexes.get(table, [])
-            )
+            try:
+                described[table] = self._table_from_catalog_rows(
+                    table[0],
+                    table[1],
+                    ordered,
+                    keys.get(table, [])[:1],
+                    unique_indexes.get(table, []),
+                )
+            except InformixError as error:
+                # Its own, as list_tables marks one: a shard's batch failed with it, and every
+                # table of the shard went to direct reads (see _ShardCatalog).
+                described[table] = {"owner": table[0], "name": table[1], "unreadable": str(error)}
         return described
 
     @staticmethod
@@ -3375,6 +3384,8 @@ class PurePythonInformixBridge:
             # 32: Informix schema changed for {!r} during CDC; run a full refresh before decoding
             # additional records
             raise InformixError(_m(32, native))
+        if described.get("unreadable"):
+            raise InformixError(described["unreadable"])
         refreshed = _capture_descriptor(Table.parse(described, database), encoding)
 
         def layout(value: dict[str, Any]) -> dict[str, tuple[Any, ...]]:
@@ -9618,12 +9629,19 @@ class _ShardCatalog:
             described = {name: bridge.get_table(name) for name in sorted(set(logical.values()))}
         for identity, version in stale.items():
             raw = described.get(logical[identity])
-            if raw is None:
+            try:
+                fresh = (
+                    None
+                    if raw is None or raw.get("unreadable")
+                    else Table.parse(raw, check[identity].database)
+                )
+            except (InformixError, ValueError):
+                fresh = None  # unreadable (see _describe_tables): the same, for that table alone
+            if fresh is None:
                 # The name no longer names a table: the subscriber is left to its own
                 # direct read, which reports that.
                 self.entries.pop(identity, None)
                 continue
-            fresh = Table.parse(raw, check[identity].database)
             if fresh.incarnation != known[identity].incarnation:
                 # Re-created under a new table ID, whose version wasn't asked for: the
                 # next check reads it again with its version.
@@ -11658,6 +11676,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     self._release_worker_connection()
             with self._metadata_access():
                 table = self._table(table_name, table_options)
+                expected = effective_start.get("schema_fingerprint") if effective_start else None
+                if expected and effective_start.get("phase") == "snapshot":
+                    table = self._snapshot_schema_held(table, expected)
                 batch = None
                 if not unl:
                     batch = self._snapshot_page_batch(table, effective_start, table_options)
@@ -15873,6 +15894,30 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         validate_snapshot_arity(cursor, primary_keys)
         return tuple(cursor)
 
+    def _snapshot_schema_held(self, table: Table, expected: str | None) -> Table:
+        # Docstring: ``table`` for a snapshot read on from its checkpoint, failing 243 where the
+        # schema or a fingerprinted option no longer gives the snapshot's ``expected``.
+        #
+        # Staged serve reads immutable, self-describing pages from the Volume, so it needs
+        # no live Informix schema. Re-query it only every _snapshot_schema_refresh_interval
+        # seconds to catch mid-snapshot drift; between refreshes, validate the pinned
+        # fingerprint against the cached table (no connection, no catalog query). The first
+        # resume microbatch always refreshes (no timestamp yet). Both readers check here:
+        # the partitioned one's continuations carried the fingerprint on unchecked, and
+        # served the rest of a snapshot under changed options (initial_only, whose stream
+        # never reads, to its end).
+
+        now = time.monotonic()
+        last = self._snapshot_schema_refreshed_at.get(table.identity)
+        if last is None or now - last >= self._snapshot_schema_refresh_interval:
+            table = self._refresh_table_schema(table, expected)
+            self._snapshot_schema_refreshed_at[table.identity] = now
+        elif expected != _schema_fingerprint(table):
+            # 243: Informix schema changed for '{}' during ingestion; run a full refresh before
+            # reading additional snapshot or CDC records
+            raise InformixError(_m(243, table.exposed_name))
+        return table
+
     def _read_snapshot(
         self,
         table: Table,
@@ -15895,23 +15940,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             raise InformixError(_m(242, table.exposed_name))
         expected_fingerprint = checkpoint.get("schema_fingerprint") if checkpoint else None
         if checkpoint:
-            # Staged serve reads immutable, self-describing pages from the Volume, so it
-            # needs no live Informix schema. Re-query it only every
-            # _snapshot_schema_refresh_interval seconds to catch mid-snapshot drift;
-            # between refreshes, validate the pinned fingerprint against the cached table
-            # (no connection, no catalog query). The first resume microbatch always
-            # refreshes (no timestamp yet), and drift is caught within the interval and at
-            # the snapshot->CDC transition -- a change cannot invalidate pages frozen
-            # as-of snapshot_lsn, so serving a few extra before an abort is harmless.
-            now = time.monotonic()
-            last = self._snapshot_schema_refreshed_at.get(table.identity)
-            if last is None or now - last >= self._snapshot_schema_refresh_interval:
-                table = self._refresh_table_schema(table, expected_fingerprint)
-                self._snapshot_schema_refreshed_at[table.identity] = now
-            elif expected_fingerprint != _schema_fingerprint(table):
-                # 243: Informix schema changed for '{}' during ingestion; run a full refresh before
-                # reading additional snapshot or CDC records
-                raise InformixError(_m(243, table.exposed_name))
+            table = self._snapshot_schema_held(table, expected_fingerprint)
         else:
             table = self._refresh_table_schema(table, expected_fingerprint)
         if not _cdc_capable(table) and not (
@@ -18975,6 +19004,24 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 # switch. To start fresh instead, clear table.migration and use
                 # snapshot.mode=cdc_only (no history) or snapshot.mode=initial (full snapshot).
                 raise InformixError(_m(273, table.exposed_name))
+            # A keyed table's two flows park their own positions, and the append stream
+            # goes on from the upsert flow's alone: the deletes between the two were lost
+            # (the delete flow behind) or sent again (ahead). A copy parked mid-way
+            # (incremental) finishes on its own terms.
+            deletes = self._read_handoff_token(table, _HANDOFF_CHANNEL_DELETE)
+            parked = [json.loads(token["offset_json"])]
+            if deletes is not None and parked[0].get("phase") == "stream":
+                parked.append(json.loads(deletes["offset_json"]))
+                upsert_at, delete_at = (
+                    (str(p.get("commit_lsn")), str(p.get("change_lsn"))) for p in parked
+                )
+                if upsert_at != delete_at and "incremental" not in parked[0]:
+                    # 488: table.migration for '{}' parked its upsert flow at LSN {} but its
+                    # delete flow at {}, and an append stream goes on from one position: the
+                    # deletes between them would be lost or sent again. Put the keyed
+                    # configuration back without table.migration, run one triggered update with
+                    # no writes to the table while it runs, and capture again
+                    raise InformixError(_m(488, table.exposed_name, upsert_at[0], delete_at[0]))
             # Seed from the parked position and stop (no rows); migration never streams.
             # Adopts this flow's scope -- the seam is carried by the scope-independent LSNs,
             # and the first stream read (after Restore clears table.migration) re-publishes

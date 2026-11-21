@@ -1734,7 +1734,12 @@ your pipeline spec.
 1. **Capture.** On the existing (keyed) configuration, add `table.migration: true`
    and run the pipeline. The table parks its CDC position and stops. Make this the
    **last** run before the switch — a normal run in between moves the table past the
-   parked position. (Re-running the capture step itself is safe.)
+   parked position. (Re-running the capture step itself is safe.) A keyed table's upsert
+   and delete flows each park their own position, and the append stream goes on from
+   one: if they differ, the cutover fails rather than lose the deletes between them or
+   send them again. They can differ after a run that ends while the table is written to;
+   put the keyed configuration back without `table.migration`, run one triggered update
+   with no writes to the table while it runs, and capture again.
 
    ```json
    {
