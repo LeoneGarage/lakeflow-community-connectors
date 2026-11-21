@@ -4487,6 +4487,83 @@ class LakeflowContractTests(unittest.TestCase):
         ):
             self._index_scan(source, 3)
 
+    def test_an_index_scan_refuses_a_change_whose_primary_keys_value_was_changed(self):
+        # primary.keys names the rows a moved row is found by and taken out of the pages:
+        # read changed, the value found another row, and both left the pages.
+        class NulKeySource(_KeyedIndexScanSource):
+            def read_changes(self, *args, **kwargs):
+                records = super().read_changes(*args, **kwargs)
+                for record in records:
+                    if record["op"] == "INSERT":
+                        record["nul"] = ["value"]
+                return records
+
+        raw = _table(primary_keys=())
+        raw["columns"].append({"name": "note", "type_name": "VARCHAR", "length": 20})
+        table = dataclasses.replace(
+            Table.parse(raw, "demo"), primary_keys=("value",), key_only_from_option=True
+        )
+        with (
+            mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0),
+            self.assertRaisesRegex(InformixError, "key or index column value, which"),
+        ):
+            self._index_scan(
+                NulKeySource(random_module.Random(9001), transactions=200),
+                3,
+                table=table,
+                options={"append.only.ingestion": "true"},
+            )
+
+    def test_the_stream_refuses_a_change_the_scan_may_hold_whose_index_value_was_changed(self):
+        # The follower refuses one it reads; one it never read (after an unproven end, or
+        # through a shared shard) was placed by the value read, not the one Informix sorts.
+        source = _IndexScanSource(random_module.Random(5))
+        with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
+            boundary, _staged, scan, connector, table = self._index_scan(source, 3)
+        transactions = informix_module._transaction_batch(source.history(boundary))[0]
+        end = int(scan["index_scan"]["end"])
+        changed = next(tx for tx in transactions if tx.commit_lsn <= end and tx.records)
+        changed.records[0]["nul"] = ["id"]
+        connector._read_snapshot_stage_manifest = lambda *_: scan
+        connector._offset_scopes = lambda checkpoint: ("scope", "scope")
+        with self.assertRaisesRegex(InformixError, "key or index column id, which"):
+            connector._drop_scanned_changes(
+                table, {"commit_lsn": str(boundary), "schema_id": "s"}, {}, transactions
+            )
+
+    def test_an_update_names_the_columns_either_image_had_changed(self):
+        # The UPDATE was made from its after-image, and a before-image's changed index
+        # value (see decode_frame's "nul") went unseen.
+        buffer = informix_module.TransactionBuffer()
+        for record in (
+            {"op": "BEGIN", "tx_id": 1, "lsn": 10},
+            {"op": "BEFORE_UPDATE", "tx_id": 1, "lsn": 11, "row": {"k": "az"}, "nul": ["k"]},
+            {"op": "AFTER_UPDATE", "tx_id": 1, "lsn": 12, "row": {"k": "b"}},
+        ):
+            buffer.feed(record)
+        committed = buffer.feed({"op": "COMMIT", "tx_id": 1, "lsn": 13})
+        self.assertEqual(committed.records[0]["nul"], ["k"])
+
+    def test_the_scans_reads_check_the_keys_primary_keys_gives_the_rows(self):
+        # The bridge checks the index columns it pages by; the rows' primary.keys values,
+        # which find a moved row and take it out of the pages, are checked as they come.
+        checked = []
+        bridge = mock.Mock()
+        bridge.snapshot_chunk.return_value = (5, [])
+        bridge._unaltered.side_effect = lambda keys, identity: checked.append((keys, identity))
+        connector = mock.Mock(_bridge=bridge)
+        connector._snapshot_read_with_reconnect.side_effect = lambda read, **_: read()
+        keyed = dataclasses.replace(
+            Table.parse(_table(primary_keys=()), "demo"),
+            primary_keys=("value",),
+            key_only_from_option=True,
+        )
+        informix_module._ScanReads(connector, keyed).snapshot_chunk("demo.app.orders")
+        self.assertEqual(checked, [(("value",), "demo.app.orders")])
+        checked.clear()
+        informix_module._ScanReads(connector, Table.parse(_table(primary_keys=()), "demo")).snapshot_chunk()
+        self.assertEqual(checked, [])
+
     def test_an_index_scan_refuses_too_many_moved_rows_of_a_keyed_table(self):
         source = _KeyedIndexScanSource(random_module.Random(9001), transactions=200)
         raw = _table(primary_keys=())
@@ -8625,8 +8702,11 @@ class LakeflowContractTests(unittest.TestCase):
         }
         for name, read in reads.items():
             with self.subTest(read=name):
+                # By the table's name, as each read is called with it.
                 with self.assertRaisesRegex(
-                    InformixError, "key or index column id, which string.null.byte=empty"
+                    InformixError,
+                    r"table 'demo\.app\.t' holds a NUL byte in key or index column id, which "
+                    "string.null.byte=empty",
                 ):
                     read(bridge({"id"}))
                 read(bridge({"v"}))

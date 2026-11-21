@@ -386,6 +386,23 @@ class FrameTests(unittest.TestCase):
                     (expected, len(raw)),
                 )
 
+    def test_a_datetime_digit_below_an_odd_fraction_is_refused(self):
+        # FRACTION(1), (3) and (5) leave the low digit of their last base-100 group unused:
+        # one set there was cut, 12:34:56.78 read as 12:34:56.7, where a finer group failed.
+        column = ColumnDescriptor("t", "DATETIME", length=0x060B)  # HOUR TO FRACTION(1)
+        self.assertEqual(
+            decode_value(memoryview(bytes([0xC3, 12, 34, 56, 70])), column), ("12:34:56.7", 5)
+        )
+        for qualifier, raw in (
+            (0x060B, bytes([0xC3, 12, 34, 56, 78])),
+            (0x060D, bytes([0xC3, 12, 34, 56, 12, 31])),  # FRACTION(3)
+            (0x080F, bytes([0xC2, 34, 56, 12, 34, 51])),  # FRACTION(5)
+        ):
+            with self.subTest(qualifier=qualifier), self.assertRaisesRegex(
+                CdcProtocolError, "more precision than"
+            ):
+                decode_value(memoryview(raw), ColumnDescriptor("t", "DATETIME", length=qualifier))
+
     def test_datetime_partial_qualifiers_reject_out_of_range_fields(self):
         cases = (
             (0x060A, bytes([0xC3, 24, 0, 0])),

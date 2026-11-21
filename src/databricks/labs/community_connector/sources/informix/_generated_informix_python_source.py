@@ -1181,8 +1181,10 @@ def register_lakeflow_source(spark):
             raise CdcProtocolError(f"DATETIME exponent {exponent} exceeds its qualifier width")
         combined = [0] * (whole_groups - exponent) + list(groups)
         # A non-zero group shifted past the fraction's resolution would be a value finer than
-        # the qualifier -- silent data loss rather than a decode we can trust.
-        if any(combined[grid:]):
+        # the qualifier -- silent data loss rather than a decode we can trust. So would the low
+        # digit of an odd fraction's last group, which FRACTION(1), (3) and (5) leave unused.
+        odd = combined[grid - 1 : grid] if fraction_digits % 2 else []
+        if any(combined[grid:]) or any(group % 10 for group in odd):
             raise CdcProtocolError(
                 f"DATETIME value carries more precision than its {start} TO {end} qualifier"
             )
@@ -10978,7 +10980,7 @@ def register_lakeflow_source(spark):
             table_ref = f"{database}:{_sql_name(owner)}.{_sql_name(name)}"
             if primary_keys and not chunk_exprs:
                 return self._max_key_stepwise(
-                    table_ref, list(primary_keys), snapshot_filter, list(key_descending or [])
+                    table_ref, list(primary_keys), snapshot_filter, list(key_descending or []), identity
                 )
             select_terms = [
                 f"{chunk_exprs[key]} AS {_sql_name(f'__chunk_{key}')}"
@@ -11017,6 +11019,7 @@ def register_lakeflow_source(spark):
             primary_keys: list[str],
             snapshot_filter: str | None,
             descending: list[bool],
+            identity: str = "",
         ) -> list[Any] | None:
             # Docstring: Resolve the maximum key tuple one column at a time.
             #
@@ -11061,7 +11064,7 @@ def register_lakeflow_source(spark):
                         f"FROM {table_ref}{where} ORDER BY {term} {fetch_order}"
                     )
                     rows = self.transport.execute(sql, tuple(params))
-                    self._unaltered([key], table_ref)
+                    self._unaltered([key], identity or table_ref)
                     if not rows:
                         # No row at the first column means the table (or filtered set)
                         # is empty. A later column cannot come up empty under the
@@ -11784,9 +11787,16 @@ def register_lakeflow_source(spark):
                 return attribute
 
             def read(*args: Any, **kwargs: Any) -> Any:
-                return self._connector._snapshot_read_with_reconnect(
+                result = self._connector._snapshot_read_with_reconnect(
                     lambda: attribute(*args, **kwargs), table=self._table, operation=f"scan {name}"
                 )
+                # The keys of the rows read too, where primary.keys gives the table some: a moved
+                # row is found by them and taken out of the pages, and a value string.null.byte
+                # changed found another row (the bridge checks the index columns it pages by).
+                unaltered = getattr(self._connector._bridge, "_unaltered", None)
+                if unaltered is not None and self._table.primary_keys:
+                    unaltered(self._table.primary_keys, self._table.identity)
+                return result
 
             return read
 
@@ -14737,6 +14747,11 @@ def register_lakeflow_source(spark):
                 # tombstone for a key-changing UPDATE is sequenced there, so it never ties
                 # with the new key's after-image on the cursor.
                 merged["before_lsn"] = _lsn(self.pending_before)
+                # The columns string.null.byte changed in either image (see decode_frame): the
+                # after-image's alone left a before-image's changed index value unseen.
+                nul = [*self.pending_before.get("nul", ()), *record.get("nul", ())]
+                if nul:
+                    merged["nul"] = nul
                 self.pending_before = None
                 self.records.append(merged)
                 return
@@ -14851,12 +14866,21 @@ def register_lakeflow_source(spark):
 
 
     def _refuse_altered_changes(records, keys, table: "Table", options: dict[str, str]) -> None:
-        # Docstring: Refuse changes whose ``keys`` values string.null.byte changed (decode_frame's
-        # "nul"). An index-ordered snapshot places a change by the value read, not the one
-        # Informix sorts: settled as staged, or under a later page, an insert was dropped, and a
-        # delete was sent for a row no page had. The pages refuse such values too (_unaltered).
+        # Docstring: Refuse ``table``'s changes whose ``keys`` values string.null.byte changed
+        # (decode_frame's "nul"). An index-ordered snapshot places a change by the value read,
+        # not the one Informix sorts: settled as staged, or under a later page, an insert was
+        # dropped, and a delete was sent for a row no page had. The pages refuse such values too
+        # (_unaltered). A shared shard's transaction holds other tables' changes as well.
 
-        altered = sorted({name for r in records for name in r.get("nul", ()) if name in keys})
+        altered = sorted(
+            {
+                name
+                for r in records
+                if _record_matches(r, table)
+                for name in r.get("nul", ())
+                if name in keys
+            }
+        )
         if altered:
             mode = _null_byte_mode(options)
             # 486: Informix table '{}' holds a NUL byte in key or index column {}, which
@@ -23465,7 +23489,7 @@ def register_lakeflow_source(spark):
                         until=target,
                         seconds=_INDEX_SCAN_POLL_SECONDS,
                     )
-                    _refuse_altered_changes(records, keys, table, self.options)
+                    _refuse_altered_changes(records, (*keys, *table.primary_keys), table, self.options)
                     committed, _caught_up, open_begin, reached = _transaction_batch(records)
                     if self._drain_progress is not None:
                         # A poll that returned shows the reader is not hung, whatever it
@@ -24226,10 +24250,14 @@ def register_lakeflow_source(spark):
                 return False
 
             kept = []
+            checked = (*keys, *(moved["keys"] if relocated else ()), *table.primary_keys)
             for tx in transactions:
                 if tx.commit_lsn > end:
                     kept.append(tx)
                     continue
+                # The follower refuses such a change too, but one it never read (after an
+                # unproven end, or through a shared shard) was placed by the value read.
+                _refuse_altered_changes(tx.records, checked, table, self.options)
                 # A shared shard hands each table the whole transaction, other tables' changes
                 # included: those are the projection's to leave out. Read as this table's, a
                 # row without its index columns failed, and one with them named a change the

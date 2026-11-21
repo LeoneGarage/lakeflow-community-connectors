@@ -542,8 +542,10 @@ def _decode_datetime(
         raise CdcProtocolError(f"DATETIME exponent {exponent} exceeds its qualifier width")
     combined = [0] * (whole_groups - exponent) + list(groups)
     # A non-zero group shifted past the fraction's resolution would be a value finer than
-    # the qualifier -- silent data loss rather than a decode we can trust.
-    if any(combined[grid:]):
+    # the qualifier -- silent data loss rather than a decode we can trust. So would the low
+    # digit of an odd fraction's last group, which FRACTION(1), (3) and (5) leave unused.
+    odd = combined[grid - 1 : grid] if fraction_digits % 2 else []
+    if any(combined[grid:]) or any(group % 10 for group in odd):
         raise CdcProtocolError(
             f"DATETIME value carries more precision than its {start} TO {end} qualifier"
         )
