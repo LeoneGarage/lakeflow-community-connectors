@@ -1765,6 +1765,15 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         self.assertEqual(state._admin_password, " pw\t")
         self.assertEqual(lakebase_state.LakebaseState({}, "current")._admin_password, "")
 
+    def test_a_stale_pipelines_own_records_go_with_its_scoped_ones(self):
+        # Keyed by the pipeline, not scoped to an update, its delete-floor and own-start
+        # records for a table outlived it while another pipeline read the table, and stayed
+        # when its other records went (run on a local PostgreSQL 16: those two are deleted
+        # now, the other pipeline's and other tables' kept).
+        sql = lakebase_state._DELETE_STALE_PIPELINE_STATE
+        for kind in ("delete-floor", "own-start"):
+            self.assertIn(f"'/{kind}/' || (activity.record->>'pipeline_id')", sql)
+
     def test_an_unused_project_is_swept_with_the_admin_password_where_one_is_set(self):
         # Provisioning connects with lakebase.admin_password where one is set; the sweep
         # minted an OAuth token instead and gave it as that role's password, so where

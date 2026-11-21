@@ -3628,6 +3628,7 @@ class PurePythonInformixBridge:
                 ),
                 tuple(value for values in value_sets for value in values if value is not None),
             )
+            self._unaltered(keys, identity)
         return [
             dict(row) if isinstance(row, dict) else dict(zip(columns, row, strict=True))
             for row in rows
@@ -8226,6 +8227,21 @@ def _spill_run(layout: str, begin: int, tx_id: int, record: dict[str, Any]) -> s
         [record.get("lsn"), record.get("op"), record.get("row")], sort_keys=True, default=str
     )
     return f"{layout}-{begin}-{tx_id}-{hashlib.sha256(first.encode()).hexdigest()[:12]}"
+
+
+def _refuse_altered_changes(records, keys, table: "Table", options: dict[str, str]) -> None:
+    # Docstring: Refuse changes whose ``keys`` values string.null.byte changed (decode_frame's
+    # "nul"). An index-ordered snapshot places a change by the value read, not the one
+    # Informix sorts: settled as staged, or under a later page, an insert was dropped, and a
+    # delete was sent for a row no page had. The pages refuse such values too (_unaltered).
+
+    altered = sorted({name for r in records for name in r.get("nul", ()) if name in keys})
+    if altered:
+        mode = _null_byte_mode(options)
+        # 486: Informix table '{}' holds a NUL byte in key or index column {}, which
+        # string.null.byte={} changes, so the read can't page on or look up the value
+        # Informix holds; set snapshot.scan=cursor to read the table without paging on it
+        raise InformixError(_m(486, table.exposed_name, ", ".join(altered), mode))
 
 
 def _spill_bytes(record: dict[str, Any]) -> int:
@@ -16828,6 +16844,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     until=target,
                     seconds=_INDEX_SCAN_POLL_SECONDS,
                 )
+                _refuse_altered_changes(records, keys, table, self.options)
                 committed, _caught_up, open_begin, reached = _transaction_batch(records)
                 if self._drain_progress is not None:
                     # A poll that returned shows the reader is not hung, whatever it
@@ -20831,7 +20848,15 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # come along, so a mixed-direction override keeps paging in its index order. A
         # wildcard key is every column, so it is re-expanded instead: an added column
         # joins the key, which the schema transition accepts for a streaming table.
-        refreshed = _carry_table_options(refreshed, table)
+        try:
+            refreshed = _carry_table_options(refreshed, table)
+        except (InformixError, ValueError) as error:
+            # Options that were taken: the table changed under them (an INTEGER widened to a
+            # FLOAT no ABS reads), which their own error, about an option no one changed,
+            # didn't say.
+            # 487: The schema of Informix table '{}' changed so that its table options no
+            # longer apply ({}); change them for the new schema and run a full refresh
+            raise InformixError(_m(487, table.exposed_name, error)) from error
         _ensure_materializable(refreshed)
         fingerprint = _schema_fingerprint(refreshed)
         if expected_fingerprint is not None and expected_fingerprint != fingerprint:
@@ -25134,8 +25159,9 @@ def _lines_only(code: types.CodeType) -> types.CodeType:
 
 def _shorten_merged_definitions(namespace: dict[str, Any]) -> None:
     # Docstring: In the merged single file, strip ``register_lakeflow_source.<locals>.``
-    # from every definition's qualname, drop function annotations and docstrings, and keep
-    # lines but not columns in each code object's location table (see _lines_only).
+    # from every class's qualname, give each function and code object its name as its
+    # qualname, drop function annotations and docstrings, and keep lines but not columns
+    # in each code object's location table (see _lines_only).
     #
     # The merge nests the whole connector inside register_lakeflow_source, so Spark
     # pickles every function and class by value. Each function carries that prefix twice
@@ -25149,24 +25175,20 @@ def _shorten_merged_definitions(namespace: dict[str, Any]) -> None:
     seen: set[int] = set()
     codes: dict[int, types.CodeType] = {}
 
-    def short(qualname: str) -> str:
-        # Interned, so code objects sharing a qualname (a function's generator expressions
-        # and lambdas, a decorator's wrappers) share one string, which the pickle writes
-        # once and then refers back to: some 10 KB. cloudpickle copies each co_name and a
-        # function's own __name__ and __qualname__, so those are written apiece.
-        return sys.intern(qualname.removeprefix(prefix))
-
     def shorten(code: types.CodeType) -> types.CodeType:
         if id(code) not in codes:
             consts = tuple(
                 shorten(c) if isinstance(c, types.CodeType) else c for c in code.co_consts
             )
-            qualname = getattr(code, "co_qualname", None)
-            if qualname is None:  # Python 3.10: only the function carries a qualname
+            if not hasattr(code, "co_qualname"):  # Python 3.10: only the function carries one
                 codes[id(code)] = code.replace(co_consts=consts)
             else:
+                # Its qualname as its name: nothing a reader sees shows it (a traceback names
+                # co_name), and as one interned string the pickle writes it once for both,
+                # where the class and enclosing names of every method, lambda and
+                # comprehension came to some 32 KB.
                 codes[id(code)] = _lines_only(
-                    code.replace(co_consts=consts, co_qualname=short(qualname))
+                    code.replace(co_consts=consts, co_qualname=sys.intern(code.co_name))
                 )
         return codes[id(code)]
 

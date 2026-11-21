@@ -168,10 +168,11 @@ _DEFAULT_PROVISION_TIMEOUT_SECONDS = 180.0
 # UC Volume FUSE mount (see the connector's snapshot.staging.transport option), which
 # sidesteps the FUSE-mount disconnects that recur under sustained write frequency.
 # Reaching the Files API needs a bearer token, but the reader processes that stage
-# pages have no ambient identity -- only the driver, at module-load, does. So a
-# personal access token is minted from the driver-captured credential, carried to the
-# reader in _CAPTURED_WORKSPACE, and thereafter refreshed by the still-valid token
-# minting its own successor -- no ambient identity is needed after the first mint.
+# pages have no ambient identity -- only the driver, at module-load, does. So the
+# driver-captured credential is carried to each reader in _CAPTURED_WORKSPACE, the reader
+# mints its own personal access token from it on first use (StagingCredentialProvider),
+# and that token is thereafter refreshed by minting its own successor -- no ambient
+# identity is needed after the first mint.
 # Each token is tagged with the pipeline id and update id, so a mint can revoke the tokens of
 # the pipeline's earlier updates while leaving those its sibling flow processes hold.
 STAGING_TOKEN_COMMENT_PREFIX = "informix-snapshot-staging:"
@@ -2489,6 +2490,9 @@ RETURNING record
 """
 )
 
+# A pipeline's records for a table it no longer reads: its updates', and the two of its own
+# that no update's cleanup takes (keyed by the pipeline, not scoped to an update), which
+# outlived it while another pipeline read the table, and stayed when its others went.
 _DELETE_STALE_PIPELINE_STATE = _sql(
     """
 DELETE FROM state_records AS target
@@ -2498,7 +2502,10 @@ WHERE target.namespace = %(namespace)s
   AND activity.record_type = 'table-activity'
   AND (activity.record->>'last_used_at')::double precision < %(cutoff_epoch)s
   AND target.record_key LIKE activity.record->>'table_prefix' || '/%%'
-  AND target.record->>'scope' LIKE activity.record->>'pipeline_id' || '_@_%%'
+  AND (target.record->>'scope' LIKE activity.record->>'pipeline_id' || '_@_%%'
+    OR target.record_key IN (
+      activity.record->>'table_prefix' || '/delete-floor/' || (activity.record->>'pipeline_id'),
+      activity.record->>'table_prefix' || '/own-start/' || (activity.record->>'pipeline_id')))
 RETURNING target.record_key
 """
 )

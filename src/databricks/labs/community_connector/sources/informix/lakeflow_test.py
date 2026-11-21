@@ -2061,10 +2061,12 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(shape_delete.__annotations__, {})
         self.assertEqual(table.__qualname__, "Table")
         # A function's own qualname is its name, which cloudpickle writes a copy of for each
-        # (the class prefixes came to some 13 KB); its code keeps the whole one.
+        # (the class prefixes came to some 13 KB), and so is its code's, which nothing a
+        # reader sees shows: a traceback names co_name (some 32 KB more).
         self.assertEqual(table.parse.__qualname__, "parse")
         if sys.version_info >= (3, 11):
-            self.assertEqual(table.parse.__code__.co_qualname, "Table.parse")
+            self.assertEqual(table.parse.__code__.co_qualname, "parse")
+            self.assertIs(table.parse.__code__.co_qualname, table.parse.__code__.co_name)
         # A docstring has two copies, the function's __doc__ and its code's first constant;
         # both go (the framework's interface methods held some 15 KB of them).
         interface = next(
@@ -4465,6 +4467,25 @@ class LakeflowContractTests(unittest.TestCase):
             [(7, "abc"), (7, "abc "), (7, "abd"), (8, "abc")]
         )
         self.assertEqual(lookups, [(7, "abc"), (7, "abd"), (8, "abc")])
+
+    def test_an_index_scan_refuses_a_change_whose_index_value_string_null_byte_changed(self):
+        # The read placed the change by the value read, not the one Informix sorts: settled
+        # as staged, or put under a later page, an insert was dropped, and a delete sent for
+        # a row no page held. The pages refuse such a value (see _unaltered); so does this.
+        class NulChangeSource(_IndexScanSource):
+            def read_changes(self, *args, **kwargs):
+                records = super().read_changes(*args, **kwargs)
+                for record in records:
+                    if record["op"] == "INSERT":
+                        record["nul"] = ["id"]
+                return records
+
+        source = NulChangeSource(random_module.Random(3), transactions=200)
+        with (
+            mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0),
+            self.assertRaisesRegex(InformixError, "key or index column id, which string.null"),
+        ):
+            self._index_scan(source, 3)
 
     def test_an_index_scan_refuses_too_many_moved_rows_of_a_keyed_table(self):
         source = _KeyedIndexScanSource(random_module.Random(9001), transactions=200)
@@ -8594,6 +8615,9 @@ class LakeflowContractTests(unittest.TestCase):
             "page": lambda live: live.snapshot_page("demo.app.t", columns, ["id"], None, 2),
             "chunk": lambda live: live.snapshot_chunk("demo.app.t", columns, ["id"], None, 2),
             "key rows": lambda live: live.key_rows("demo.app.t", columns, ["id"], ["az"], "RR"),
+            "rows by values": lambda live: live.rows_by_values(
+                "demo.app.t", columns, ["id"], [["az"]], "RR"
+            ),
             "max key": lambda live: live.max_primary_key("demo.app.t", ["id"]),
             "chunked max key": lambda live: live.max_primary_key(
                 "demo.app.t", ["id", "ts"], chunk_exprs={"ts": "TO_CHAR(ts)"}
@@ -17253,6 +17277,19 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(bridge.snapshot_isolations, ["REPEATABLE READ"])
         with self.assertRaisesRegex(InformixError, "exceeds snapshot.max.rows=1"):
             self.connector(bridge).read_table("app.orders", {}, {"snapshot.max.rows": "1"})
+
+    def test_options_a_schema_change_leaves_behind_fail_as_that_change(self):
+        # An INTEGER widened to a FLOAT, which no ABS reads: the refresh failed with the
+        # transform's own error, about an option nobody had changed.
+        bridge = FakeBridge()
+        bridge.tables[0]["columns"].append({"name": "qty", "type_name": "INTEGER"})
+        connector = self.connector(bridge)
+        table = connector._table("app.orders", {"transform_columns": '{"qty": "ABS(qty)"}'})
+        bridge.tables[0]["columns"][-1]["type_name"] = "FLOAT"
+        with self.assertRaisesRegex(
+            InformixError, "table 'app.orders' changed so that its table options no longer apply"
+        ):
+            connector._refresh_table_schema(table, None)
 
     def test_snapshot_only_applies_table_byte_limit(self):
         bridge = FakeBridge()

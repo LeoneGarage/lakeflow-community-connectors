@@ -198,7 +198,7 @@ def decode_frame(
         columns = columns_by_label.get(label)
         if columns is None:
             raise CdcProtocolError(f"operation references unknown capture label {label}")
-        record["row"] = decode_row(payload, columns, null_byte=null_byte)
+        _operation_row(record, payload, columns, null_byte)
     elif kind == 1:
         _require_header(header, 24, op)
         lsn, tx_id, timestamp, user_id = struct.unpack_from(">Qiqi", header)
@@ -245,13 +245,32 @@ def frame_log_file(frame: bytes) -> int | None:
     return struct.unpack_from(">Q", frame, FIXED_HEADER)[0] >> 32
 
 
+def _operation_row(
+    record: dict, payload: memoryview, columns: tuple[ColumnDescriptor, ...], null_byte: str
+) -> None:
+    # Docstring: Decode an operation's row into ``record``, with "nul" naming the columns
+    # string.null.byte changed a value of: an index-ordered snapshot can't place the change
+    # by them, as the SQLI client tells its reads.
+
+    altered: list[str] = []
+    record["row"] = decode_row(payload, columns, null_byte=null_byte, altered=altered)
+    if altered:
+        record["nul"] = altered
+
+
 def decode_row(
-    payload: memoryview, columns: Iterable[ColumnDescriptor], *, null_byte: str = "keep"
+    payload: memoryview,
+    columns: Iterable[ColumnDescriptor],
+    *,
+    null_byte: str = "keep",
+    altered: list[str] | None = None,
 ) -> dict[str, Any]:
+    # Docstring: The row's values; ``altered`` gets the columns string.null.byte changed.
+
     offset, row = 0, {}
     for column in columns:
         try:
-            value, consumed = decode_value(payload[offset:], column, null_byte=null_byte)
+            value, consumed = _decode_value_bytes(payload[offset:], column)
         except (CdcProtocolError, UnicodeDecodeError, ArithmeticError) as error:
             # A DATE past the calendar (OverflowError) or a DECIMAL past its precision
             # (decimal.InvalidOperation) are bytes of another row, as a bad length is.
@@ -266,7 +285,9 @@ def decode_row(
             ) from error
         if consumed <= 0 or offset + consumed > len(payload):
             raise CdcProtocolError(f"invalid width for CDC column {column.name}")
-        row[column.name] = value
+        row[column.name] = apply_null_byte(value, null_byte)
+        if altered is not None and row[column.name] is not value:
+            altered.append(column.name)
         offset += consumed
     if offset != len(payload):
         raise CdcProtocolError(f"CDC row has {len(payload) - offset} trailing bytes")

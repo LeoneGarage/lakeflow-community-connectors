@@ -485,5 +485,6 @@
 "Informix CDC poll read its changes, but ending its session failed on a dropped or stalled connection; resetting the transport, which ends the session",
 "Option '{}' compares {} with {}, which has more than the 32 significant digits Informix reads of a number; the snapshot would filter otherwise than the stream",
 "Informix table '{}' is left out of the table list: {}",
-"Informix table '{}' holds a NUL byte in key or index column {}, which string.null.byte={} changes, so the read can't page on or look up the value Informix holds; set snapshot.scan=cursor to read the table without paging on it"
+"Informix table '{}' holds a NUL byte in key or index column {}, which string.null.byte={} changes, so the read can't page on or look up the value Informix holds; set snapshot.scan=cursor to read the table without paging on it",
+"The schema of Informix table '{}' changed so that its table options no longer apply ({}); change them for the new schema and run a full refresh"
 ]

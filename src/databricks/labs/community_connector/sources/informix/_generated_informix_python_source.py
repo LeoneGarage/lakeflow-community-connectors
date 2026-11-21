@@ -837,7 +837,7 @@ def register_lakeflow_source(spark):
             columns = columns_by_label.get(label)
             if columns is None:
                 raise CdcProtocolError(f"operation references unknown capture label {label}")
-            record["row"] = decode_row(payload, columns, null_byte=null_byte)
+            _operation_row(record, payload, columns, null_byte)
         elif kind == 1:
             _require_header(header, 24, op)
             lsn, tx_id, timestamp, user_id = struct.unpack_from(">Qiqi", header)
@@ -884,13 +884,32 @@ def register_lakeflow_source(spark):
         return struct.unpack_from(">Q", frame, FIXED_HEADER)[0] >> 32
 
 
+    def _operation_row(
+        record: dict, payload: memoryview, columns: tuple[ColumnDescriptor, ...], null_byte: str
+    ) -> None:
+        # Docstring: Decode an operation's row into ``record``, with "nul" naming the columns
+        # string.null.byte changed a value of: an index-ordered snapshot can't place the change
+        # by them, as the SQLI client tells its reads.
+
+        altered: list[str] = []
+        record["row"] = decode_row(payload, columns, null_byte=null_byte, altered=altered)
+        if altered:
+            record["nul"] = altered
+
+
     def decode_row(
-        payload: memoryview, columns: Iterable[ColumnDescriptor], *, null_byte: str = "keep"
+        payload: memoryview,
+        columns: Iterable[ColumnDescriptor],
+        *,
+        null_byte: str = "keep",
+        altered: list[str] | None = None,
     ) -> dict[str, Any]:
+        # Docstring: The row's values; ``altered`` gets the columns string.null.byte changed.
+
         offset, row = 0, {}
         for column in columns:
             try:
-                value, consumed = decode_value(payload[offset:], column, null_byte=null_byte)
+                value, consumed = _decode_value_bytes(payload[offset:], column)
             except (CdcProtocolError, UnicodeDecodeError, ArithmeticError) as error:
                 # A DATE past the calendar (OverflowError) or a DECIMAL past its precision
                 # (decimal.InvalidOperation) are bytes of another row, as a bad length is.
@@ -905,7 +924,9 @@ def register_lakeflow_source(spark):
                 ) from error
             if consumed <= 0 or offset + consumed > len(payload):
                 raise CdcProtocolError(f"invalid width for CDC column {column.name}")
-            row[column.name] = value
+            row[column.name] = apply_null_byte(value, null_byte)
+            if altered is not None and row[column.name] is not value:
+                altered.append(column.name)
             offset += consumed
         if offset != len(payload):
             raise CdcProtocolError(f"CDC row has {len(payload) - offset} trailing bytes")
@@ -1490,10 +1511,11 @@ def register_lakeflow_source(spark):
     # UC Volume FUSE mount (see the connector's snapshot.staging.transport option), which
     # sidesteps the FUSE-mount disconnects that recur under sustained write frequency.
     # Reaching the Files API needs a bearer token, but the reader processes that stage
-    # pages have no ambient identity -- only the driver, at module-load, does. So a
-    # personal access token is minted from the driver-captured credential, carried to the
-    # reader in _CAPTURED_WORKSPACE, and thereafter refreshed by the still-valid token
-    # minting its own successor -- no ambient identity is needed after the first mint.
+    # pages have no ambient identity -- only the driver, at module-load, does. So the
+    # driver-captured credential is carried to each reader in _CAPTURED_WORKSPACE, the reader
+    # mints its own personal access token from it on first use (StagingCredentialProvider),
+    # and that token is thereafter refreshed by minting its own successor -- no ambient
+    # identity is needed after the first mint.
     # Each token is tagged with the pipeline id and update id, so a mint can revoke the tokens of
     # the pipeline's earlier updates while leaving those its sibling flow processes hold.
     STAGING_TOKEN_COMMENT_PREFIX = "informix-snapshot-staging:"
@@ -3811,6 +3833,9 @@ def register_lakeflow_source(spark):
     """
     )
 
+    # A pipeline's records for a table it no longer reads: its updates', and the two of its own
+    # that no update's cleanup takes (keyed by the pipeline, not scoped to an update), which
+    # outlived it while another pipeline read the table, and stayed when its others went.
     _DELETE_STALE_PIPELINE_STATE = _sql(
         """
     DELETE FROM state_records AS target
@@ -3820,7 +3845,10 @@ def register_lakeflow_source(spark):
       AND activity.record_type = 'table-activity'
       AND (activity.record->>'last_used_at')::double precision < %(cutoff_epoch)s
       AND target.record_key LIKE activity.record->>'table_prefix' || '/%%'
-      AND target.record->>'scope' LIKE activity.record->>'pipeline_id' || '_@_%%'
+      AND (target.record->>'scope' LIKE activity.record->>'pipeline_id' || '_@_%%'
+        OR target.record_key IN (
+          activity.record->>'table_prefix' || '/delete-floor/' || (activity.record->>'pipeline_id'),
+          activity.record->>'table_prefix' || '/own-start/' || (activity.record->>'pipeline_id')))
     RETURNING target.record_key
     """
     )
@@ -10221,6 +10249,7 @@ def register_lakeflow_source(spark):
                     ),
                     tuple(value for values in value_sets for value in values if value is not None),
                 )
+                self._unaltered(keys, identity)
             return [
                 dict(row) if isinstance(row, dict) else dict(zip(columns, row, strict=True))
                 for row in rows
@@ -14819,6 +14848,21 @@ def register_lakeflow_source(spark):
             [record.get("lsn"), record.get("op"), record.get("row")], sort_keys=True, default=str
         )
         return f"{layout}-{begin}-{tx_id}-{hashlib.sha256(first.encode()).hexdigest()[:12]}"
+
+
+    def _refuse_altered_changes(records, keys, table: "Table", options: dict[str, str]) -> None:
+        # Docstring: Refuse changes whose ``keys`` values string.null.byte changed (decode_frame's
+        # "nul"). An index-ordered snapshot places a change by the value read, not the one
+        # Informix sorts: settled as staged, or under a later page, an insert was dropped, and a
+        # delete was sent for a row no page had. The pages refuse such values too (_unaltered).
+
+        altered = sorted({name for r in records for name in r.get("nul", ()) if name in keys})
+        if altered:
+            mode = _null_byte_mode(options)
+            # 486: Informix table '{}' holds a NUL byte in key or index column {}, which
+            # string.null.byte={} changes, so the read can't page on or look up the value
+            # Informix holds; set snapshot.scan=cursor to read the table without paging on it
+            raise InformixError(_m(486, table.exposed_name, ", ".join(altered), mode))
 
 
     def _spill_bytes(record: dict[str, Any]) -> int:
@@ -23421,6 +23465,7 @@ def register_lakeflow_source(spark):
                         until=target,
                         seconds=_INDEX_SCAN_POLL_SECONDS,
                     )
+                    _refuse_altered_changes(records, keys, table, self.options)
                     committed, _caught_up, open_begin, reached = _transaction_batch(records)
                     if self._drain_progress is not None:
                         # A poll that returned shows the reader is not hung, whatever it
@@ -27424,7 +27469,15 @@ def register_lakeflow_source(spark):
             # come along, so a mixed-direction override keeps paging in its index order. A
             # wildcard key is every column, so it is re-expanded instead: an added column
             # joins the key, which the schema transition accepts for a streaming table.
-            refreshed = _carry_table_options(refreshed, table)
+            try:
+                refreshed = _carry_table_options(refreshed, table)
+            except (InformixError, ValueError) as error:
+                # Options that were taken: the table changed under them (an INTEGER widened to a
+                # FLOAT no ABS reads), which their own error, about an option no one changed,
+                # didn't say.
+                # 487: The schema of Informix table '{}' changed so that its table options no
+                # longer apply ({}); change them for the new schema and run a full refresh
+                raise InformixError(_m(487, table.exposed_name, error)) from error
             _ensure_materializable(refreshed)
             fingerprint = _schema_fingerprint(refreshed)
             if expected_fingerprint is not None and expected_fingerprint != fingerprint:
@@ -31727,8 +31780,9 @@ def register_lakeflow_source(spark):
 
     def _shorten_merged_definitions(namespace: dict[str, Any]) -> None:
         # Docstring: In the merged single file, strip ``register_lakeflow_source.<locals>.``
-        # from every definition's qualname, drop function annotations and docstrings, and keep
-        # lines but not columns in each code object's location table (see _lines_only).
+        # from every class's qualname, give each function and code object its name as its
+        # qualname, drop function annotations and docstrings, and keep lines but not columns
+        # in each code object's location table (see _lines_only).
         #
         # The merge nests the whole connector inside register_lakeflow_source, so Spark
         # pickles every function and class by value. Each function carries that prefix twice
@@ -31742,24 +31796,20 @@ def register_lakeflow_source(spark):
         seen: set[int] = set()
         codes: dict[int, types.CodeType] = {}
 
-        def short(qualname: str) -> str:
-            # Interned, so code objects sharing a qualname (a function's generator expressions
-            # and lambdas, a decorator's wrappers) share one string, which the pickle writes
-            # once and then refers back to: some 10 KB. cloudpickle copies each co_name and a
-            # function's own __name__ and __qualname__, so those are written apiece.
-            return sys.intern(qualname.removeprefix(prefix))
-
         def shorten(code: types.CodeType) -> types.CodeType:
             if id(code) not in codes:
                 consts = tuple(
                     shorten(c) if isinstance(c, types.CodeType) else c for c in code.co_consts
                 )
-                qualname = getattr(code, "co_qualname", None)
-                if qualname is None:  # Python 3.10: only the function carries a qualname
+                if not hasattr(code, "co_qualname"):  # Python 3.10: only the function carries one
                     codes[id(code)] = code.replace(co_consts=consts)
                 else:
+                    # Its qualname as its name: nothing a reader sees shows it (a traceback names
+                    # co_name), and as one interned string the pickle writes it once for both,
+                    # where the class and enclosing names of every method, lambda and
+                    # comprehension came to some 32 KB.
                     codes[id(code)] = _lines_only(
-                        code.replace(co_consts=consts, co_qualname=short(qualname))
+                        code.replace(co_consts=consts, co_qualname=sys.intern(code.co_name))
                     )
             return codes[id(code)]
 

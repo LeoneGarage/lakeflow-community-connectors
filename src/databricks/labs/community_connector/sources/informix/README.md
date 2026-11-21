@@ -705,9 +705,10 @@ Requirements and limits:
   keyed by `primary.keys` and merged by it pages in Informix's own order, each key whole
   within one read, and follows no changes, so it needs no such check. NCHAR and NVARCHAR columns, which collate by locale (and ignore case
   in an `NLSCASE INSENSITIVE` database), are not used as index-scan columns.
-- An index value holding a NUL byte fails the snapshot under any `string.null.byte`: under
-  `null` or `empty` the value read isn't the one Informix holds, and under `keep` Informix
-  SQL can't be given it.
+- An index value holding a NUL byte, in a row a page reads or a change made during the
+  scan, fails the snapshot under `string.null.byte` `null` or `empty`, as the value read
+  isn't the one Informix holds. Under `keep` it fails where the scan has to give the value
+  to Informix SQL, which can't take it. `snapshot.scan: cursor` reads such a table.
 - One index value may have at most a million rows: they are read and staged together.
 - A `TRUNCATE` during the snapshot fails it. So does a transaction larger than
   `cdc.spill.records` that commits during the scan. Set `snapshot.scan: cursor` if a

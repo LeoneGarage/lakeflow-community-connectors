@@ -129,6 +129,22 @@ class FrameTests(unittest.TestCase):
         record = decode_frame(_frame(40, header, payload), columns)
         self.assertEqual(record["row"], {"s": 12, "i": 34, "v": "abc", "b": True})
 
+    def test_a_change_names_the_columns_string_null_byte_changed(self):
+        # An index-ordered snapshot places a change by its index values: one changed is not
+        # the value Informix sorts, so the record names its columns (see "nul").
+        header = struct.pack(">Qii", 9, 4, 3)
+        payload = b"\x03a\x00z" + b"\x02ab"
+        columns = {3: (ColumnDescriptor("k", "VARCHAR"), ColumnDescriptor("v", "VARCHAR"))}
+        for mode, row, named in (
+            ("empty", {"k": "az", "v": "ab"}, ["k"]),
+            ("null", {"k": None, "v": "ab"}, ["k"]),
+            ("keep", {"k": "a\x00z", "v": "ab"}, None),
+        ):
+            with self.subTest(mode=mode):
+                record = decode_frame(_frame(40, header, payload), columns, null_byte=mode)
+                self.assertEqual(record["row"], row)
+                self.assertEqual(record.get("nul"), named)
+
     def test_bounds_reject_oversize(self):
         parser = CdcFrameParser(32)
         with self.assertRaises(CdcProtocolError):
