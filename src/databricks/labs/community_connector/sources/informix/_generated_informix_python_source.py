@@ -8506,19 +8506,35 @@ def register_lakeflow_source(spark):
                 options[_REPLAY_END_SEED_OPTION] = previous_seed
 
 
+    def _pipeline_update(spark_session: Any | None) -> tuple[str | None, str | None]:
+        # Docstring: The pipeline and update the Spark session runs, or (None, None) outside a
+        # pipeline. A serverless (Spark Connect) session outside one raises CONFIG_NOT_AVAILABLE
+        # for these settings, default or not. Any other failure is raised: a pipeline given a
+        # random scope for a passing one would not find its update's state.
+
+        if spark_session is None:
+            return None, None
+        try:
+            conf = spark_session.conf
+            return (
+                conf.get("spark.pipelines.pipelineId", None),
+                conf.get("spark.pipelines.updateId", None),
+            )
+        except (AttributeError, TypeError):
+            return None, None
+        except Exception as exc:  # pylint: disable=broad-except
+            condition = getattr(exc, "getCondition", getattr(exc, "getErrorClass", lambda: ""))
+            if "CONFIG_NOT_AVAILABLE" in f"{condition()} {exc}":
+                return None, None
+            raise
+
+
     def _registration_identity(spark_session: Any | None) -> tuple[str, str | None, float | None]:
         # Docstring: The scope of this registration, from the pipeline and update the Spark
         # session runs under (a random one outside a pipeline), what the update was started for
         # (see _update_request), and when the pipeline's targets were last reset (_last_reset).
 
-        pipeline_id: str | None = None
-        update_id: str | None = None
-        if spark_session is not None:
-            try:
-                pipeline_id = spark_session.conf.get("spark.pipelines.pipelineId", None)
-                update_id = spark_session.conf.get("spark.pipelines.updateId", None)
-            except (AttributeError, TypeError):
-                pass
+        pipeline_id, update_id = _pipeline_update(spark_session)
         if not pipeline_id or not update_id:
             return secrets.token_hex(16), None, None
         registration_scope = f"{pipeline_id}_@_{update_id}".lower()
@@ -8542,14 +8558,8 @@ def register_lakeflow_source(spark):
         # The update this session runs, when it says: a driver kept warm between updates, or
         # one that registers again, must gather anew for the new update. With no session to
         # ask, a process that was handed these hands the same on.
-        running = None
-        if spark_session is not None:
-            try:
-                pipeline_id = spark_session.conf.get("spark.pipelines.pipelineId", None)
-                update_id = spark_session.conf.get("spark.pipelines.updateId", None)
-                running = f"{pipeline_id}_@_{update_id}".lower() if pipeline_id and update_id else None
-            except (AttributeError, TypeError):
-                pass
+        pipeline_id, update_id = _pipeline_update(spark_session)
+        running = f"{pipeline_id}_@_{update_id}".lower() if pipeline_id and update_id else None
         held = _INFORMIX_REGISTRATION_CONTEXT["scope"]
         now = time.monotonic()
         if held is None or (running is not None and running != held):

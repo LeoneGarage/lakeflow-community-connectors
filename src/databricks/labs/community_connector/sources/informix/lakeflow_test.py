@@ -4132,6 +4132,54 @@ class LakeflowContractTests(unittest.TestCase):
                 informix_module._driver_registration(None)
         capture.assert_not_called()
 
+    def test_registration_outside_a_pipeline_on_serverless_takes_a_random_scope(self):
+        # A serverless (Spark Connect) session outside a pipeline raises
+        # CONFIG_NOT_AVAILABLE for spark.pipelines.*, default or not, and register()
+        # failed in a serverless job. Any other failure still raises: a pipeline given a
+        # random scope for a passing one would not find its update's state.
+        class SparkError(Exception):
+            def __init__(self, condition):
+                super().__init__(f"[{condition}] Configuration spark.pipelines.pipelineId")
+                self.condition = condition
+
+            def getCondition(self):  # noqa: N802 - PySpark's name
+                return self.condition
+
+        def session(error):
+            asker = mock.Mock()
+            asker.conf.get.side_effect = error
+            return asker
+
+        context = informix_module._INFORMIX_REGISTRATION_CONTEXT
+        self.addCleanup(context.update, dict(context))
+        self.addCleanup(informix_module._CREDENTIAL_CAPTURED.clear)
+        unset = {"scope": None, "request": None, "reset_at": None}
+        missing = SparkError("CONFIG_NOT_AVAILABLE.WITHOUT_SUGGESTION")
+        with mock.patch.object(informix_module, "_update_request") as request:
+            with mock.patch.object(informix_module, "_last_reset") as reset:
+                scope, update_request, reset_at = informix_module._registration_identity(
+                    session(missing)
+                )
+        request.assert_not_called()
+        reset.assert_not_called()
+        self.assertRegex(scope, r"^[0-9a-f]{32}$")
+        self.assertEqual((update_request, reset_at), (None, None))
+        context.update(unset)
+        with mock.patch.object(informix_module, "capture_workspace_credentials"):
+            informix_module._driver_registration(session(missing))
+        self.assertRegex(context["scope"], r"^[0-9a-f]{32}$")
+        # A PySpark without getCondition says it in the message.
+        older = Exception("[CONFIG_NOT_AVAILABLE.WITHOUT_SUGGESTION] Configuration x")
+        self.assertEqual(informix_module._pipeline_update(session(older)), (None, None))
+        for error in (SparkError("INTERNAL_ERROR"), ConnectionError("channel closed")):
+            with self.subTest(error=str(error)):
+                with self.assertRaises(type(error)):
+                    informix_module._registration_identity(session(error))
+                context.update(unset)
+                with mock.patch.object(informix_module, "capture_workspace_credentials"):
+                    with self.assertRaises(type(error)):
+                        informix_module._driver_registration(session(error))
+
     def test_a_merged_connector_captures_its_credential_again_when_pickled(self):
         # The merged file's globals carry the registration; it was never captured again,
         # as it had no capture time, and a worker first reaching the control plane after
