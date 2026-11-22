@@ -11,10 +11,11 @@
 #
 # informix-pipeline lands append-only change logs (bronze). informix-silver-pipeline
 # (tests/cycles/informix_silver.sql) builds the current tables from them, and the compares
-# read silver. Silver runs while bronze is stopped: a full refresh after the cycle's first
-# bronze update that ran to its end (bronze's full refresh emptied the change logs silver's
-# streams read), an update after the cycle's last bronze update, and one after the extra
-# run. Its updates go to the events with the label of the bronze run they follow.
+# read silver. Silver runs while bronze is stopped: a full refresh right after bronze's full
+# refresh (run 1, stopped part-way by the resume test or not), since that emptied the
+# change logs silver's streams read; an update after the cycle's last bronze update; and
+# one after the extra run. Its updates go to the events with the label of the bronze run
+# they follow.
 #
 # With resume_test=true (the default) the full refresh is stopped on purpose, part-way
 # through the index-ordered snapshot of RESUME_TABLE: as soon as that scan has recorded a few
@@ -567,7 +568,6 @@ def pipeline_runs(cycle, workload_started):
     deadline = workload_started + TRIGGERED_SECONDS
     stopped = None
     after_workload = False
-    silver_refreshed = False
     run = 1
     while run <= 2 or time.time() < deadline or not after_workload:
         full_refresh = run == 1
@@ -588,14 +588,15 @@ def pipeline_runs(cycle, workload_started):
             if stopped:
                 if stopped["state"] == "FAILED":
                     fail_pipeline(cycle, f"run {run}", update_id)
+                # Silver's full refresh follows bronze's, stopped part-way or not.
+                silver_run(cycle, f"run {run}", full_refresh=True)
                 run += 1
                 continue
         run_for(cycle, f"run {run}", update_id, UPDATE_CAP_SECONDS)
         if stopped and run == 2:
             RESUME_RESULTS[cycle] = resume_check(cycle, stopped, update_id)
-        if not silver_refreshed:
+        if full_refresh:
             silver_run(cycle, f"run {run}", full_refresh=True)
-            silver_refreshed = True
         run += 1
     silver_run(cycle, f"run {run - 1}")
 
