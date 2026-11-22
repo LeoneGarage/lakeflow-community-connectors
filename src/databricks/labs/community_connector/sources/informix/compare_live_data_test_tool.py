@@ -73,16 +73,16 @@ DEFAULT_TABLES = (
     "tw304",
     "tw316",
     "tw316_ovhc",
-    # Keyless: tw900_member_tag is keyed on the whole row in informix-pipeline, and
-    # tw901_claim_note is a change log of an insert-only table, so its target holds the
-    # table's rows (the compare ignores the _informix_* columns).
+    # Keyless: silver (informix_silver.sql) rebuilds each row from bronze's change log,
+    # as many copies as the source holds.
     "tw900_member_tag",
     "tw901_claim_note",
 )
-# Keyless tables the demo pipeline keys on the whole row (primary.keys "*"): their SCD1
-# destination holds each distinct row once, so exact duplicates in the source land as one
-# row, and their compare is by distinct rows rather than by row counts.
-WHOLE_ROW_KEY_TABLES = ("tw221d", "tw900_member_tag")
+# Keyless tables a pipeline keys on the whole row (primary.keys "*"): an SCD1 destination
+# then holds each distinct row once, so exact duplicates in the source land as one row,
+# and their compare is by distinct rows rather than by row counts (--whole-row-key-tables).
+# None in the demo since it lands change logs: silver keeps every copy.
+WHOLE_ROW_KEY_TABLES: tuple[str, ...] = ()
 INTERNAL_COLUMNS = {
     "_informix_change_lsn",
     "_informix_commit_lsn",
@@ -880,7 +880,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--databricks-profile", default="demo1")
     parser.add_argument("--catalog", default="members")
-    parser.add_argument("--schema", default="connector_bronze")
+    # Silver: bronze holds change logs, several rows to a key.
+    parser.add_argument("--schema", default="connector_silver")
     parser.add_argument("--s3-bucket", default="leone-sandbox-metastore")
     parser.add_argument("--s3-prefix", default="tmp/informix-comparisons")
     parser.add_argument("--output", type=pathlib.Path)

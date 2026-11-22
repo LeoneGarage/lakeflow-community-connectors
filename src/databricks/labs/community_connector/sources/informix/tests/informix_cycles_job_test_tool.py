@@ -9,6 +9,13 @@
 # position the update began at, so a flow that gives up early, or waits for another, shows
 # as a difference instead of being caught up by a continuous run before the compares.
 #
+# informix-pipeline lands append-only change logs (bronze). informix-silver-pipeline
+# (tests/cycles/informix_silver.sql) builds the current tables from them, and the compares
+# read silver. Silver runs while bronze is stopped: a full refresh after the cycle's first
+# bronze update that ran to its end (bronze's full refresh emptied the change logs silver's
+# streams read), an update after the cycle's last bronze update, and one after the extra
+# run. Its updates go to the events with the label of the bronze run they follow.
+#
 # With resume_test=true (the default) the full refresh is stopped on purpose, part-way
 # through the index-ordered snapshot of RESUME_TABLE: as soon as that scan has recorded a few
 # pages on the staging Volume. The triggered update after it must go on from the last page
@@ -37,13 +44,14 @@
 # fresh run that restarts the container. stop_on_mismatch=false runs every cycle regardless.
 #
 # Parameters: cycles, triggered_minutes (default 35, counted from the workload's start; the
-# workload runs 30), pipeline_name (default informix-pipeline), stop_on_mismatch (default true),
+# workload runs 30), pipeline_name (default informix-pipeline), silver_pipeline_name (default
+# informix-silver-pipeline), stop_on_mismatch (default true),
 # resume_test (default true), staging_location (the connection's snapshot.staging.location,
 # where the scan's progress is read from; without access to it the resume test is skipped),
 # and smoke=true, which checks AWS, SSM, the pipeline API, both compares and the event
-# tables without restarting the container or running the pipeline. The pipeline is found by
-# name and its tables in the catalog and schema it writes to, so a recreated pipeline or
-# workspace needs no edit.
+# tables without restarting the container or running the pipelines. The pipelines are found
+# by name and their tables in the catalog and schema each writes to, so a recreated pipeline
+# or workspace needs no edit.
 
 # COMMAND ----------
 import datetime as dt
@@ -59,6 +67,7 @@ dbutils.widgets.text("cycles", "5")
 dbutils.widgets.text("triggered_minutes", "35")
 dbutils.widgets.dropdown("smoke", "false", ["false", "true"])
 dbutils.widgets.text("pipeline_name", "informix-pipeline")
+dbutils.widgets.text("silver_pipeline_name", "informix-silver-pipeline")
 dbutils.widgets.dropdown("stop_on_mismatch", "true", ["true", "false"])
 dbutils.widgets.dropdown("resume_test", "true", ["true", "false"])
 dbutils.widgets.text("staging_location", "/Volumes/members/connector_bronze/informix_cdc_state")
@@ -69,6 +78,7 @@ TRIGGERED_SECONDS = int(float(dbutils.widgets.get("triggered_minutes")) * 60)
 UPDATE_CAP_SECONDS = 3600
 SMOKE = dbutils.widgets.get("smoke") == "true"
 PIPELINE_NAME = dbutils.widgets.get("pipeline_name")
+SILVER_PIPELINE_NAME = dbutils.widgets.get("silver_pipeline_name")
 STOP_ON_MISMATCH = dbutils.widgets.get("stop_on_mismatch") == "true"
 RESUME_TEST = dbutils.widgets.get("resume_test") == "true"
 STAGING = dbutils.widgets.get("staging_location").rstrip("/")
@@ -181,24 +191,35 @@ def ssm(command, timeout=600):
 
 
 # COMMAND ----------
-# The pipeline, through the REST API as this job's run-as user.
+# The pipelines, through the REST API as this job's run-as user.
 from databricks.sdk import WorkspaceClient  # noqa: E402
 
 WORKSPACE = WorkspaceClient()
 API = WORKSPACE.api_client
-_named = [
-    p.pipeline_id
-    for p in WORKSPACE.pipelines.list_pipelines(filter=f"name LIKE '{PIPELINE_NAME}'")
-    if p.name == PIPELINE_NAME
-]
-if len(_named) != 1:
-    raise RuntimeError(f"expected one pipeline named {PIPELINE_NAME}, found {len(_named)}")
-PIPELINE_ID = _named[0]
-BASE = f"/api/2.0/pipelines/{PIPELINE_ID}"
-_spec = API.do("GET", BASE)["spec"]
-# The destination the pipeline writes to; older pipelines name the schema `target`.
-TARGET = f"{_spec['catalog']}.{_spec.get('schema') or _spec['target']}"
-event(0, "pipeline", f"pipeline {PIPELINE_NAME} {PIPELINE_ID} writes to {TARGET}")
+
+
+def _pipeline(name):
+    named = [
+        p.pipeline_id
+        for p in WORKSPACE.pipelines.list_pipelines(filter=f"name LIKE '{name}'")
+        if p.name == name
+    ]
+    if len(named) != 1:
+        raise RuntimeError(f"expected one pipeline named {name}, found {len(named)}")
+    base = f"/api/2.0/pipelines/{named[0]}"
+    spec = API.do("GET", base)["spec"]
+    # The destination the pipeline writes to; older pipelines name the schema `target`.
+    target = f"{spec['catalog']}.{spec.get('schema') or spec['target']}"
+    event(0, "pipeline", f"pipeline {name} {named[0]} writes to {target}")
+    return {"name": name, "id": named[0], "base": base, "target": target}
+
+
+# Bronze lands the change logs and holds the resume test's snapshot rows; silver builds
+# the current tables from them, which the compares read. The helpers below take a
+# pipeline (p) and default to bronze.
+BRONZE = _pipeline(PIPELINE_NAME)
+SILVER = _pipeline(SILVER_PIPELINE_NAME)
+PIPELINE_ID, BASE, TARGET = BRONZE["id"], BRONZE["base"], BRONZE["target"]
 
 
 def _call(method, path, body=None, attempts=6, delay=10):
@@ -219,12 +240,12 @@ def _get(path):
     return _call("GET", path)
 
 
-def pipeline_state():
-    return _get(BASE)
+def pipeline_state(p=None):
+    return _get((p or BRONZE)["base"])
 
 
-def update_info(update_id):
-    return _get(f"{BASE}/updates/{update_id}")["update"]
+def update_info(update_id, p=None):
+    return _get(f"{(p or BRONZE)['base']}/updates/{update_id}")["update"]
 
 
 def latest_update():
@@ -232,52 +253,61 @@ def latest_update():
     return updates[0]["update_id"] if updates else None
 
 
-def set_continuous(cycle, continuous):
-    spec = pipeline_state()["spec"]
+def set_continuous(cycle, continuous, p=None):
+    p = p or BRONZE
+    spec = pipeline_state(p)["spec"]
     spec["continuous"] = continuous
-    _call("PUT", BASE, body=spec)
-    event(cycle, "pipeline", f"pipeline set to continuous={str(continuous).lower()}")
+    _call("PUT", p["base"], body=spec)
+    event(cycle, "pipeline", f"pipeline {p['name']} set to continuous={str(continuous).lower()}")
 
 
-def stop_and_wait(timeout=1200):
-    _call("POST", f"{BASE}/stop")
+def stop_and_wait(timeout=1200, p=None):
+    p = p or BRONZE
+    _call("POST", f"{p['base']}/stop")
     deadline = time.time() + timeout
     state = None
     while time.time() < deadline:
-        state = pipeline_state().get("state")
+        state = pipeline_state(p).get("state")
         if state == "IDLE":
             return
         time.sleep(10)
     # Restarting Informix under a live update would fail it and blame the connector.
-    event(0, "stop", f"pipeline still {state} {timeout}s after stop; aborting the run")
-    raise RuntimeError(f"pipeline did not reach IDLE within {timeout}s (state {state})")
+    event(0, "stop", f"pipeline {p['name']} still {state} {timeout}s after stop; aborting the run")
+    raise RuntimeError(f"pipeline {p['name']} did not reach IDLE within {timeout}s ({state})")
 
 
-def start_update(cycle, label, full_refresh=False):
+def stop_both():
+    stop_and_wait(p=BRONZE)
+    stop_and_wait(p=SILVER)
+
+
+def start_update(cycle, label, full_refresh=False, p=None):
+    p = p or BRONZE
     # A start refused while a failed update is still being retried: stop and try again.
     for attempt in range(1, 6):
         try:
-            return API.do("POST", f"{BASE}/updates", body={"full_refresh": full_refresh})[
+            return API.do("POST", f"{p['base']}/updates", body={"full_refresh": full_refresh})[
                 "update_id"
             ]
         except Exception as error:  # noqa: BLE001
             event(cycle, "refused", f"{label}: start refused (attempt {attempt}): {error}"[:500])
-            stop_and_wait()
+            stop_and_wait(p=p)
             time.sleep(20)
-    raise RuntimeError(f"{label}: could not start an update")
+    raise RuntimeError(f"{label}: could not start an update of {p['name']}")
 
 
-def stop_update(cycle, label, update_id):
+def stop_update(cycle, label, update_id, p=None):
+    p = p or BRONZE
     # Retry until the update has really ended: one failed stop would leave a continuous
     # update running far past its time.
     state = None
     for attempt in range(1, 21):
         try:
-            API.do("POST", f"{BASE}/stop")
+            API.do("POST", f"{p['base']}/stop")
         except Exception as error:  # noqa: BLE001
             event(cycle, "stop", f"{label}: stop attempt {attempt} failed: {error}"[:500])
         for _ in range(60):
-            state = update_info(update_id)["state"]
+            state = update_info(update_id, p)["state"]
             if state in TERMINAL:
                 return state
             time.sleep(10)
@@ -299,30 +329,41 @@ def undrained():
     return pending
 
 
-def run_for(cycle, label, update_id, seconds, from_creation=True):
-    info = update_info(update_id)
+def run_for(cycle, label, update_id, seconds, from_creation=True, p=None):
+    p = p or BRONZE
+    info = update_info(update_id, p)
     start = int(info["creation_time"]) / 1000 if from_creation else time.time()
     deadline = start + seconds
     state = info["state"]
     while time.time() < deadline and state not in TERMINAL:
         time.sleep(15)
-        state = update_info(update_id)["state"]
+        state = update_info(update_id, p)["state"]
     minutes = round((time.time() - start) / 60, 1)
     if state in TERMINAL:
         # "ended before" marks an end before the cap, as every triggered update should.
         when = f"before {seconds // 60}" if time.time() < deadline else f"after {minutes}"
         event(cycle, "ended", f"{label}: update {update_id} ended {when} minutes: {state}")
         if state == "FAILED":
-            fail_pipeline(cycle, label, update_id)
+            fail_pipeline(cycle, label, update_id, p)
         return state
     event(
         cycle, "stopping", f"{label}: stopping update {update_id} after {minutes} minutes ({state})"
     )
-    state = stop_update(cycle, label, update_id)
+    state = stop_update(cycle, label, update_id, p)
     event(cycle, "ended", f"{label}: update {update_id} final state {state}")
     if state == "FAILED":
-        fail_pipeline(cycle, label, update_id)
+        fail_pipeline(cycle, label, update_id, p)
     return state
+
+
+def silver_run(cycle, label, full_refresh=False):
+    # One silver update to its end, while bronze is stopped (see the top). The events carry
+    # the label of the bronze run it follows; "silver" in the update type tells them apart.
+    kind = "triggered full-refresh silver" if full_refresh else "triggered silver"
+    event(cycle, "starting", f"{label}: starting {kind} update")
+    update_id = start_update(cycle, label, full_refresh, p=SILVER)
+    event(cycle, "started", f"{label}: started {kind} update {update_id}")
+    run_for(cycle, label, update_id, UPDATE_CAP_SECONDS, p=SILVER)
 
 
 # COMMAND ----------
@@ -457,7 +498,8 @@ class PipelineFailed(RuntimeError):
     pass
 
 
-def fail_pipeline(cycle, label, update_id):
+def fail_pipeline(cycle, label, update_id, p=None):
+    p = p or BRONZE
     # An update ended FAILED: record it with its error and fail the run (see the top).
     # The update's own error, for the record: the first exception its event log holds. A
     # flow's exception is on the WARN event of each failed attempt; the ERROR event that
@@ -465,7 +507,7 @@ def fail_pipeline(cycle, label, update_id):
     try:
         row = spark.sql(
             f"SELECT message, error.exceptions[0].message AS cause "
-            f"FROM event_log('{PIPELINE_ID}') "
+            f"FROM event_log('{p['id']}') "
             f"WHERE origin.update_id = '{update_id}' AND level IN ('ERROR', 'WARN') "
             f"AND (error IS NOT NULL OR level = 'ERROR') "
             f"ORDER BY error IS NULL, timestamp LIMIT 1"
@@ -473,11 +515,11 @@ def fail_pipeline(cycle, label, update_id):
         cause = "" if row is None else f"{row['message']} {(row['cause'] or '')[-600:]}"
     except Exception as error:  # noqa: BLE001 - the failure is reported either way
         cause = f"(its error could not be read: {error})"
-    message = f"{label}: update {update_id} FAILED; failing the run. {cause}"[:2000]
+    message = f"{label}: {p['name']} update {update_id} FAILED; failing the run. {cause}"[:2000]
     event(cycle, "failed", message)
     save_result(cycle, "PIPELINE FAILED", line=message)
     # Also ends the retry the pipeline starts by itself.
-    stop_and_wait()
+    stop_and_wait(p=p)
     event(0, "summary", f"run failed in cycle {cycle}: {label}: a pipeline update failed")
     raise PipelineFailed(message)
 
@@ -521,9 +563,11 @@ def pipeline_runs(cycle, workload_started):
     # started after the workload had ended (it alone reads the workload's last changes).
     event(cycle, "cycle", "pipeline runs starting")
     set_continuous(cycle, False)
+    set_continuous(cycle, False, p=SILVER)
     deadline = workload_started + TRIGGERED_SECONDS
     stopped = None
     after_workload = False
+    silver_refreshed = False
     run = 1
     while run <= 2 or time.time() < deadline or not after_workload:
         full_refresh = run == 1
@@ -549,23 +593,31 @@ def pipeline_runs(cycle, workload_started):
         run_for(cycle, f"run {run}", update_id, UPDATE_CAP_SECONDS)
         if stopped and run == 2:
             RESUME_RESULTS[cycle] = resume_check(cycle, stopped, update_id)
+        if not silver_refreshed:
+            silver_run(cycle, f"run {run}", full_refresh=True)
+            silver_refreshed = True
         run += 1
+    silver_run(cycle, f"run {run - 1}")
 
 
 def extra_run(cycle):
-    # One more triggered update, to its end. An update that fails fails the run.
+    # One more triggered update of each pipeline, to its end. An update that fails fails
+    # the run.
     event(cycle, "starting", "extra run: starting triggered update")
     update_id = start_update(cycle, "extra run")
     event(cycle, "started", f"extra run: started triggered update {update_id}")
     run_for(cycle, "extra run", update_id, UPDATE_CAP_SECONDS)
+    silver_run(cycle, "extra run")
 
 
 def count_compare(cycle):
+    # Silver's tables: bronze holds change logs, several rows to a key.
     informix = CC.informix_counts(HOST)
     pipeline = {}
+    target = SILVER["target"]
     for table in CC.TABLES:
         try:
-            pipeline[table] = spark.sql(f"SELECT COUNT(*) c FROM {TARGET}.`{table}`").first()["c"]
+            pipeline[table] = spark.sql(f"SELECT COUNT(*) c FROM {target}.`{table}`").first()["c"]
         except Exception:  # noqa: BLE001 - a missing target table counts as a difference
             pipeline[table] = None
     differing = [
@@ -584,7 +636,7 @@ def data_compare(cycle):
     output = pathlib.Path(f"/tmp/informix-cycles/{RUN_ID}/c{cycle}")
     output.mkdir(parents=True, exist_ok=True)
     argv = sys.argv
-    catalog, schema = TARGET.split(".")
+    catalog, schema = SILVER["target"].split(".")
     sys.argv = [
         "compare_live_data_test_tool",
         "--output",
@@ -636,13 +688,14 @@ def data_compare(cycle):
 # COMMAND ----------
 if SMOKE:
     event(0, "smoke", f"SSM: {ssm('echo ok').strip()}")
-    state = pipeline_state()
-    event(
-        0,
-        "smoke",
-        f"pipeline {state.get('name')} {state.get('state')} "
-        f"continuous={state['spec'].get('continuous')}",
-    )
+    for each in (BRONZE, SILVER):
+        state = pipeline_state(each)
+        event(
+            0,
+            "smoke",
+            f"pipeline {state.get('name')} {state.get('state')} "
+            f"continuous={state['spec'].get('continuous')}",
+        )
     event(
         0,
         "smoke",
@@ -665,10 +718,10 @@ if SMOKE:
 summary = []
 for cycle in range(1, CYCLES + 1):
     event(cycle, "cycle", f"cycle {cycle} of {CYCLES} starting")
-    stop_and_wait()
+    stop_both()
     workload_started = restart_container(cycle)
     pipeline_runs(cycle, workload_started)
-    stop_and_wait()
+    stop_both()
     event(cycle, "counts", "comparing counts")
     first, counts_ok, _ = count_compare(cycle)
     final, extra = first, False
@@ -676,7 +729,7 @@ for cycle in range(1, CYCLES + 1):
         event(cycle, "counts", f"counts differ: {first}; one more triggered run")
         extra = True
         extra_run(cycle)
-        stop_and_wait()
+        stop_both()
         event(cycle, "counts", "comparing counts after the extra run")
         final, counts_ok, _ = count_compare(cycle)
     event(cycle, "data", "comparing data")
@@ -703,8 +756,9 @@ for cycle in range(1, CYCLES + 1):
             cycle,
             "cancel",
             f"cycle {cycle} {verdict}: cancelling cycles {cycle + 1}-{CYCLES} so it can be "
-            f"diagnosed; the container is not restarted and pipeline {PIPELINE_NAME} stays "
-            f"stopped. The differing tables and key examples are in this cycle's row in "
+            f"diagnosed; the container is not restarted and pipelines {PIPELINE_NAME} and "
+            f"{SILVER_PIPELINE_NAME} stay stopped. The differing tables and key examples are "
+            f"in this cycle's row in "
             f"{RESULTS} (details); a NO RESUME cycle's resume event says what was found.",
         )
         break

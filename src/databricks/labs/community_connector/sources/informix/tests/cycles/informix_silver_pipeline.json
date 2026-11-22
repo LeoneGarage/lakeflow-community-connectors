@@ -1,0 +1,11 @@
+{
+  "name": "informix-silver-pipeline",
+  "catalog": "<catalog>",
+  "schema": "connector_silver",
+  "serverless": true,
+  "continuous": false,
+  "development": false,
+  "channel": "CURRENT",
+  "libraries": [{"file": {"path": "<workspace path of informix_silver.sql>"}}],
+  "configuration": {"bronze_schema": "<catalog>.connector_bronze"}
+}

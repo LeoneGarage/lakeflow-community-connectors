@@ -29407,7 +29407,9 @@ class UnloadHelperTests(unittest.TestCase):
             compare_live_data_test_tool as tool,
         )
 
-        self.assertIn("tw221d", tool.WHOLE_ROW_KEY_TABLES)
+        # The demo lands change logs and silver keeps every copy, so no table is compared
+        # by distinct rows unless --whole-row-key-tables names it.
+        self.assertEqual(tool.WHOLE_ROW_KEY_TABLES, ())
         with tempfile.TemporaryDirectory() as folder:
             root = pathlib.Path(folder)
             (root / "t.unl").write_text("1|x|\n1|x|\n2|y|\n", encoding="latin-1")
@@ -29497,22 +29499,30 @@ class UnloadHelperTests(unittest.TestCase):
         args = argparse.Namespace(
             source_owner="informix", informix_server="informix", container="c", database="db"
         )
-        with (
-            mock.patch.object(compare, "send_ssm", lambda _args, command: sent.append(command)),
-            mock.patch.object(
-                compare, "wait_ssm", lambda *_: "tbl cnt\ntw221d 3\ntw060 7\ntw900_member_tag 2\n"
-            ),
-        ):
-            counts = tool.informix_counts(args)
-
-        encoded = re.search(r"printf %s (\S+) \| base64 -d", sent[0]).group(1)
-        statements = base64.b64decode(encoded).decode().splitlines()
-        by_table = {line.split("'")[1]: line for line in statements if line.strip()}
-        for table in compare.WHOLE_ROW_KEY_TABLES:
-            self.assertIn(f"FROM (SELECT DISTINCT * FROM informix.{table});", by_table[table])
-        self.assertIn("FROM informix.tw060;", by_table["tw060"])
-        self.assertNotIn("DISTINCT", by_table["tw060"])
-        self.assertEqual(counts, {"tw221d": 3, "tw060": 7, "tw900_member_tag": 2})
+        reply = "tbl cnt\ntw221d 3\ntw060 7\ntw900_member_tag 2\n"
+        whole_row = ("tw221d", "tw900_member_tag")
+        # Whole-row keyed tables by distinct rows; by default (the demo's silver keeps
+        # every copy) none.
+        for keyed in (whole_row, ()):
+            sent.clear()
+            with (
+                mock.patch.object(compare, "WHOLE_ROW_KEY_TABLES", keyed),
+                mock.patch.object(compare, "send_ssm", lambda _args, command: sent.append(command)),
+                mock.patch.object(compare, "wait_ssm", lambda *_: reply),
+            ):
+                counts = tool.informix_counts(args)
+            encoded = re.search(r"printf %s (\S+) \| base64 -d", sent[0]).group(1)
+            statements = base64.b64decode(encoded).decode().splitlines()
+            by_table = {line.split("'")[1]: line for line in statements if line.strip()}
+            for table in whole_row:
+                distinct = f"FROM (SELECT DISTINCT * FROM informix.{table});"
+                if keyed:
+                    self.assertIn(distinct, by_table[table])
+                else:
+                    self.assertIn(f"FROM informix.{table};", by_table[table])
+            self.assertIn("FROM informix.tw060;", by_table["tw060"])
+            self.assertNotIn("DISTINCT", by_table["tw060"])
+            self.assertEqual(counts, {"tw221d": 3, "tw060": 7, "tw900_member_tag": 2})
 
     def test_a_hashed_key_column_may_have_a_name_that_needs_quoting(self):
         # HASH("date") on a key named date was refused: its canonical text quotes the name,

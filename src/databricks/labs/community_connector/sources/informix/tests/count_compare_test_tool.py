@@ -60,15 +60,16 @@ TABLES = [
     "tw304",
     "tw316",
     "tw316_ovhc",
-    # Keyless: tw900_member_tag is keyed on the whole row in informix-pipeline, and
-    # tw901_claim_note is a change log of an insert-only table, so its target holds the
-    # table's rows (the compare ignores the _informix_* columns).
+    # Keyless: silver (informix_silver.sql) rebuilds each row from bronze's change log,
+    # as many copies as the source holds.
     "tw900_member_tag",
     "tw901_claim_note",
 ]
 
 PROFILE = "demo1"  # Databricks CLI profile of the demo workspace
 PIPELINE_NAME = "informix-pipeline"
+# The pipeline whose tables the count compare counts: bronze holds change logs.
+SILVER_PIPELINE_NAME = "informix-silver-pipeline"
 STARTER_WAREHOUSE = "Serverless Starter Warehouse"
 
 
@@ -226,7 +227,7 @@ def main() -> int:
     )
     _p.add_argument(
         "--pipeline-id",
-        help=f"Pipeline whose tables to count (default: the one named {PIPELINE_NAME}).",
+        help=f"Pipeline whose tables to count (default: the one named {SILVER_PIPELINE_NAME}).",
     )
     _p.add_argument(
         "--profile", default=PROFILE, help=f"Databricks CLI profile (default {PROFILE})."
@@ -234,7 +235,8 @@ def main() -> int:
     _cli = _p.parse_args()
     warehouse_id = resolve_warehouse(_cli.profile, _cli.warehouse_id)
     target = resolve_target(
-        _cli.profile, resolve_pipeline(_cli.profile, pipeline_id=_cli.pipeline_id)
+        _cli.profile,
+        resolve_pipeline(_cli.profile, SILVER_PIPELINE_NAME, pipeline_id=_cli.pipeline_id),
     )
 
     # The sandbox SSO profile is not logged in here, but the ambient default AWS
