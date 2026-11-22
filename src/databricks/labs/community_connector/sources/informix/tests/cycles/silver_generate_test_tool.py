@@ -2,12 +2,15 @@
 
 Named *_test* so the connector's merge and wheel leave it out.
 
-A table the connector reports a key for gets a streaming table with an explicit schema
-(key columns NOT NULL, an informational PRIMARY KEY) kept by AUTO CDC from its change log.
-A table with no key gets counts per distinct row, as the orders test's order_items does:
-+1 per r, c or u row, -1 per d row, then each distinct row repeated once per copy. A table
-keyed only by primary.keys "*" has no key of its own and is keyless here too: the count
-views keep its duplicate rows, which a whole-row key would merge.
+AUTO CDC is used only for a table whose key, as the connector reports it, is a primary key
+or a unique index of the Informix table: a streaming table with an explicit schema (key
+columns NOT NULL and an informational PRIMARY KEY, when the source has them NOT NULL) kept
+by AUTO CDC from its change log. Every other table gets counts per distinct row, as the
+orders test's order_items does: +1 per r, c or u row, -1 per d row, then each distinct
+row repeated once per copy. That includes a table with no key and one keyed only by its
+configuration (primary.keys, "*" or columns no unique index covers), whose rows the
+source does not keep unique: the count views keep its duplicates, which a merge by that
+key would collapse.
 
 Inputs:
   --spec     the bronze pipeline source (informix_pipeline_test_ingest.py), for the table
@@ -17,15 +20,20 @@ Inputs:
   --columns  information_schema.columns rows (table_name, column_name, ordinal_position,
              full_data_type) of the bronze schema, as JSON; or --profile and
              --bronze-schema to query them with the databricks CLI
+  --informix-catalog  a directory with the Informix catalog's unique indexes
+             (unique_indexes.unl: table, index, 1 if a primary key's, part1..part16) and
+             columns (columns.unl: table, colno, name, 1 if NOT NULL), as dbaccess UNLOADs
+             them from the statements --catalog-sql prints
 
   silver_generate_test_tool.py --spec informix_pipeline_test_ingest.py --keys keys.txt \\
-      --profile demo1 --bronze-schema members.connector_bronze > informix_silver.sql
+      --informix-catalog catalog/ --profile demo1 > informix_silver.sql
 """
 
 import argparse
 import ast
 import collections
 import json
+import os
 import re
 import subprocess
 import sys
@@ -46,6 +54,22 @@ RESERVED = set(
     outer overlaps primary references right select session_user some table then time to
     trailing true union unique unknown user using when where window with""".split()
 )
+
+
+# The catalog the generator reads, unloaded by dbaccess in the source database into DIR.
+CATALOG_SQL = """\
+UNLOAD TO '{dir}/unique_indexes.unl' SELECT t.tabname, i.idxname,
+  (SELECT COUNT(*) FROM sysconstraints c
+    WHERE c.tabid = t.tabid AND c.idxname = i.idxname AND c.constrtype = 'P'),
+  i.part1, i.part2, i.part3, i.part4, i.part5, i.part6, i.part7, i.part8,
+  i.part9, i.part10, i.part11, i.part12, i.part13, i.part14, i.part15, i.part16
+  FROM systables t, sysindexes i
+  WHERE i.tabid = t.tabid AND i.idxtype = 'U' AND t.tabid >= 100 AND t.tabtype = 'T';
+UNLOAD TO '{dir}/columns.unl' SELECT t.tabname, c.colno, c.colname,
+  CASE WHEN c.coltype >= 256 THEN 1 ELSE 0 END
+  FROM systables t, syscolumns c
+  WHERE c.tabid = t.tabid AND t.tabid >= 100 AND t.tabtype = 'T';
+"""
 
 
 def ident(name: str) -> str:
@@ -75,6 +99,42 @@ def read_keys(path: str) -> dict[str, list[str]]:
     return {row["tableName"]: list(row["primary_keys"] or []) for row in rows}
 
 
+def read_catalog(directory: str) -> dict[str, dict]:
+    # Per table: its unique indexes (name, whether a primary key's, column names) and its
+    # NOT NULL columns. A part is a column number, negative for a descending column.
+    def rows(name):
+        with open(os.path.join(directory, name), encoding="latin-1") as handle:
+            return [line.rstrip("\n").split("|") for line in handle if line.strip()]
+
+    catalog: dict[str, dict] = collections.defaultdict(lambda: {"unique": [], "not_null": set()})
+    names = {}
+    for table, colno, name, not_null, *_ in rows("columns.unl"):
+        names[(table.strip(), int(colno))] = name.strip()
+        nulls = catalog[table.strip()]["not_null"]
+        if not_null.strip() == "1":
+            nulls.add(name.strip())
+    for table, index, primary, *parts in rows("unique_indexes.unl"):
+        numbers = [abs(int(part)) for part in parts if part.strip() not in ("", "0")]
+        missing = [number for number in numbers if (table.strip(), number) not in names]
+        if missing:
+            raise SystemExit(
+                f"catalog: index {index.strip()} of {table.strip()} names column(s) {missing}, "
+                "which columns.unl does not hold"
+            )
+        columns = [names[(table.strip(), number)] for number in numbers]
+        catalog[table.strip()]["unique"].append((index.strip(), float(primary or 0) > 0, columns))
+    return catalog
+
+
+def key_source(keys: list[str], tables: dict) -> tuple[str, bool] | None:
+    # The primary key or unique index the key is, as (what it is, whether a primary key's),
+    # or None when it is neither.
+    for index, primary, columns in sorted(tables["unique"], key=lambda u: not u[1]):
+        if keys and set(columns) == set(keys):
+            return ("the primary key" if primary else f"unique index {index}"), primary
+    return None
+
+
 def read_columns(args: argparse.Namespace) -> list[dict]:
     if args.columns:
         with open(args.columns, encoding="utf-8") as handle:
@@ -91,17 +151,26 @@ def read_columns(args: argparse.Namespace) -> list[dict]:
     return json.loads(output.stdout)
 
 
-def keyed_table(table: str, columns: list[tuple[str, str]], keys: list[str]) -> str:
+def keyed_table(
+    table: str, columns: list[tuple[str, str]], keys: list[str], source: str, not_null: set
+) -> str:
+    # A PRIMARY KEY needs its columns NOT NULL; a unique index's nullable column can hold a
+    # NULL, which AUTO CDC matches as a key value, so such a key declares no constraint.
+    constrained = set(keys) <= not_null
     width = max(len(ident(c)) for c, _ in columns)
     lines = [
-        f"  {ident(c).ljust(width)} {t.upper()}{' NOT NULL' if c in keys else ''},"
+        f"  {ident(c).ljust(width)} {t.upper()}{' NOT NULL' if constrained and c in keys else ''},"
         for c, t in columns
     ]
     key_list = ", ".join(ident(k) for k in keys)
-    lines.append(f"  CONSTRAINT {ident(table + '_pk')} PRIMARY KEY ({key_list})")
+    if constrained:
+        lines.append(f"  CONSTRAINT {ident(table + '_pk')} PRIMARY KEY ({key_list})")
+    else:
+        lines[-1] = lines[-1].rstrip(",")
+    note = "" if constrained else "; a key column is nullable, so no PRIMARY KEY"
     return "\n".join(
         [
-            f"-- {table}: primary_keys = [{', '.join(keys)}]",
+            f"-- {table}: key ({', '.join(keys)}), {source}{note}",
             f"CREATE OR REFRESH STREAMING TABLE {ident(table)} (",
             *lines,
             ");",
@@ -147,19 +216,20 @@ def keyless_table(table: str, why: str) -> str:
 
 HEADER = """\
 -- GENERATED by silver_generate_test_tool.py: do not edit. Regenerate when a source table's
--- columns or key change, or when informix_pipeline_test_ingest.py's tables do.
+-- columns, key or indexes change, or when informix_pipeline_test_ingest.py's tables do.
 -- Silver for informix-pipeline: {count} tables ({keyed} keyed, {keyless} keyless).
 -- Keys: the Informix connector's _community_table_metadata (silver_keys_job_test_tool.py),
--- read for each table's configuration without append.only.ingestion.
+-- read for each table's configuration without append.only.ingestion. A table is keyed
+-- here only when that key is a primary key or unique index of the Informix table.
 -- Types: the bronze tables, without the connector's _informix_* columns.
 -- ${{bronze_schema}} is the bronze pipeline's catalog.schema, set in this pipeline's
 -- configuration (informix_silver_pipeline.json). Bronze is append-only: one change-log
 -- row per snapshot row (r) and per change (c, u, d).
 --
--- A table with a key: a streaming table with an explicit schema, key columns NOT NULL and
--- an informational PRIMARY KEY, kept by AUTO CDC from the change log. A row both in the
+-- A keyed table: a streaming table with an explicit schema, key columns NOT NULL and an
+-- informational PRIMARY KEY, kept by AUTO CDC from the change log. A row both in the
 -- snapshot and in the stream merges by its key.
--- A table with no key: how many copies of each distinct row exist now, +1 per r, c or u
+-- Any other table: how many copies of each distinct row exist now, +1 per r, c or u
 -- row and -1 per d row (an UPDATE of a keyless table lands as a d row with the old values
 -- and a u row with the new ones), then each distinct row repeated once per copy. Its
 -- bronze snapshot pages by an index or by named columns, so neither the snapshot nor the
@@ -169,12 +239,23 @@ HEADER = """\
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--spec", required=True)
-    parser.add_argument("--keys", required=True)
+    parser.add_argument("--spec")
+    parser.add_argument("--keys")
     parser.add_argument("--columns")
     parser.add_argument("--profile", default="demo1")
     parser.add_argument("--bronze-schema", default="members.connector_bronze")
+    parser.add_argument("--informix-catalog")
+    parser.add_argument(
+        "--catalog-sql", metavar="DIR", help="print the catalog's UNLOAD statements and exit"
+    )
     args = parser.parse_args(argv)
+    if args.catalog_sql:
+        sys.stdout.write(CATALOG_SQL.format(dir=args.catalog_sql))
+        return
+    for name in ("spec", "keys", "informix_catalog"):
+        if not getattr(args, name):
+            parser.error(f"--{name.replace('_', '-')} is required")
+    catalog = read_catalog(args.informix_catalog)
     spec = pipeline_spec(args.spec)
     keys = read_keys(args.keys)
     columns: dict[str, list[tuple[str, str]]] = collections.defaultdict(list)
@@ -185,6 +266,7 @@ def main(argv: list[str] | None = None) -> None:
     for entry in spec["objects"]:
         table = entry["table"]["source_table"]
         config = entry["table"].get("table_configuration", {})
+        source_table = config.get("qualified_source_table", table).split(".")[-1]
         if table not in keys:
             raise SystemExit(f"no key row for {table}")
         if not columns.get(table):
@@ -192,13 +274,22 @@ def main(argv: list[str] | None = None) -> None:
         missing = [k for k in keys[table] if k not in dict(columns[table])]
         if missing:
             raise SystemExit(f"{table}: key columns {missing} are not in bronze")
-        if config.get("primary.keys", "").strip() == "*":
-            why = 'keyless at the source (primary.keys "*"); counts per distinct row'
+        if source_table not in catalog and source_table.lower() not in catalog:
+            raise SystemExit(f"{table}: Informix table {source_table} is not in the catalog")
+        tables = catalog.get(source_table) or catalog[source_table.lower()]
+        found = key_source(keys[table], tables)
+        if found:
+            blocks.append(
+                keyed_table(table, columns[table], keys[table], found[0], tables["not_null"])
+            )
+            keyed += 1
+        elif keys[table]:
+            why = (
+                f"key ({', '.join(keys[table])}) from its configuration, not a primary key "
+                "or unique index; counts per distinct row"
+            )
             blocks.append(keyless_table(table, why))
             keyless += 1
-        elif keys[table]:
-            blocks.append(keyed_table(table, columns[table], keys[table]))
-            keyed += 1
         else:
             blocks.append(keyless_table(table, "no key; counts per distinct row"))
             keyless += 1

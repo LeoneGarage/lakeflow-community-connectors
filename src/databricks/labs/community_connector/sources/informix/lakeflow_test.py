@@ -29475,6 +29475,130 @@ class UnloadHelperTests(unittest.TestCase):
         self.assertIsNone(bridges[0]._lakebase_conn)
         bridges[0].state.close.assert_called_once()
 
+    def test_the_silver_generator_uses_auto_cdc_only_for_a_primary_key_or_unique_index(self):
+        # AUTO CDC merges by the key, so it is only right where the source keeps the key
+        # unique. A key the connector got from the table's configuration (primary.keys,
+        # "*" or columns), with no primary key or unique index behind it, may name
+        # duplicate rows: those tables take the count views, which keep every copy.
+        import contextlib
+        import importlib.util
+        import io as io_module
+        import json
+
+        path = (
+            pathlib.Path(informix_module.__file__).parent
+            / "tests"
+            / "cycles"
+            / "silver_generate_test_tool.py"
+        )
+        spec = importlib.util.spec_from_file_location("silver_generate_under_test", path)
+        tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tool)
+        tables = {
+            # table: (connector key, unique indexes as (name, primary key's, colnos), NOT NULL)
+            "t_pk": (["id"], [(" 100_1", 1, [1])], {"id"}),
+            "t_uq": (["code"], [("ix_code", 0, [2])], {"id", "code"}),
+            "t_uq_null": (["code"], [("ix_code", 0, [-2])], {"id"}),
+            "t_override": (["id"], [], {"id"}),
+            "t_star": (["id", "code"], [], set()),
+            "t_none": ([], [("ix_other", 0, [2])], set()),
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            root = pathlib.Path(folder)
+            catalog = root / "catalog"
+            catalog.mkdir()
+            (catalog / "columns.unl").write_text(
+                "".join(
+                    f"{t}|{n}|{c}|{int(c in nn)}|\n"
+                    for t, (_, _, nn) in tables.items()
+                    for n, c in ((1, "id"), (2, "code"))
+                ),
+                encoding="latin-1",
+            )
+            (catalog / "unique_indexes.unl").write_text(
+                "".join(
+                    f"{t}|{name}|{pk}.0|"
+                    + "|".join(str(p) for p in (parts + [0] * 16)[:16])
+                    + "|\n"
+                    for t, (_, indexes, _) in tables.items()
+                    for name, pk, parts in indexes
+                ),
+                encoding="latin-1",
+            )
+            objects = [
+                {
+                    "table": {
+                        "source_table": t,
+                        "table_configuration": {"qualified_source_table": f"informix.{t}"},
+                    }
+                }
+                for t in tables
+            ]
+            (root / "ingest.py").write_text(
+                f"pipeline_spec = {json.dumps({'connection_name': 'c', 'objects': objects})}\n"
+            )
+            (root / "keys.json").write_text(
+                json.dumps([{"tableName": t, "primary_keys": k} for t, (k, _, _) in tables.items()])
+            )
+            (root / "columns.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "table_name": t,
+                            "column_name": c,
+                            "ordinal_position": n,
+                            "full_data_type": "int",
+                        }
+                        for t in tables
+                        for n, c in ((1, "id"), (2, "code"), (3, "_informix_op"))
+                    ]
+                )
+            )
+            argv = ["--spec", str(root / "ingest.py"), "--keys", str(root / "keys.json")]
+            argv += ["--columns", str(root / "columns.json"), "--informix-catalog", str(catalog)]
+            out = io_module.StringIO()
+            with contextlib.redirect_stdout(out):
+                tool.main(argv)
+            sql = out.getvalue()
+            blocks = {
+                name.split(":")[0]: text
+                for name, text in (
+                    (part.split("\n", 1)[0], part) for part in ("\n" + sql).split("\n-- ")
+                )
+                if name.split(":")[0] in tables
+            }
+            self.assertIn("AS AUTO CDC INTO t_pk", blocks["t_pk"])
+            self.assertIn("CONSTRAINT t_pk_pk PRIMARY KEY (id)", blocks["t_pk"])
+            self.assertIn("the primary key", blocks["t_pk"])
+            self.assertIn("AS AUTO CDC INTO t_uq", blocks["t_uq"])
+            self.assertIn("unique index ix_code", blocks["t_uq"])
+            self.assertIn("code INT NOT NULL", blocks["t_uq"])
+            self.assertIn("CONSTRAINT t_uq_pk PRIMARY KEY (code)", blocks["t_uq"])
+            # A nullable unique index column can hold NULL: AUTO CDC, no PRIMARY KEY.
+            self.assertIn("AS AUTO CDC INTO t_uq_null", blocks["t_uq_null"])
+            self.assertNotIn("CONSTRAINT", blocks["t_uq_null"])
+            self.assertNotIn("NOT NULL", blocks["t_uq_null"])
+            for keyless in ("t_override", "t_star", "t_none"):
+                with self.subTest(table=keyless):
+                    self.assertNotIn("AUTO CDC", blocks[keyless])
+                    self.assertIn(f"MATERIALIZED VIEW {keyless}_counts", blocks[keyless])
+            self.assertIn("from its configuration, not a primary key", blocks["t_override"])
+            self.assertIn("Silver for informix-pipeline: 6 tables (3 keyed, 3 keyless)", sql)
+            # An index naming a column the catalog lacks, and a table it does not hold, fail
+            # rather than guessing.
+            for name, expected in (
+                ("columns.unl", "index ix_other of t_none names column"),
+                ("unique_indexes.unl", "t_none: Informix table t_none"),
+            ):
+                lines = (catalog / name).read_text(encoding="latin-1").splitlines(True)
+                (catalog / name).write_text(
+                    "".join(line for line in lines if not line.startswith("t_none|")),
+                    encoding="latin-1",
+                )
+                with self.assertRaisesRegex(SystemExit, expected):
+                    with contextlib.redirect_stdout(io_module.StringIO()):
+                        tool.main(argv)
+
     def test_the_count_compare_counts_a_whole_row_keyed_table_by_distinct_rows(self):
         # The cycles' count compare counted every row of a table keyed on the whole row,
         # whose destination holds each distinct row once: a row written twice at the source
