@@ -158,7 +158,7 @@
       "name": "subtitle",
       "multilineTextboxSpec": {
        "lines": [
-        "Each cycle restarts the Informix container, then runs informix-pipeline in triggered updates only: a full refresh, then one update after another, each to its end, until 35 minutes after the workload started and one has started after the workload ended. It compares counts (with one extra triggered run if they differ), then compares the data. From job *Informix cycles*; times are Sydney time (AEST/AEDT)."
+        "Each cycle restarts the Informix container, then runs informix-pipeline (bronze, append-only change logs) in triggered updates only: a full refresh, then one update after another, each to its end, until 35 minutes after the workload started and one has started after the workload ended. informix-silver-pipeline builds the current tables from the change logs while bronze is stopped: a full refresh right after bronze's, and an update after the last bronze update. The counts (with one extra triggered run of each if they differ) and the data compare read silver; silver's updates show under the bronze run they follow, with silver in the update type. From job *Informix cycles*; times are Sydney time (AEST/AEDT)."
        ]
       }
      },
@@ -753,7 +753,7 @@
          },
          {
           "fieldName": "pipeline_rows",
-          "displayName": "Pipeline rows"
+          "displayName": "Silver rows"
          },
          {
           "fieldName": "missing_rows",
@@ -1800,7 +1800,7 @@
          },
          {
           "fieldName": "pipeline_rows",
-          "displayName": "Pipeline rows"
+          "displayName": "Silver rows"
          },
          {
           "fieldName": "missing_rows",
