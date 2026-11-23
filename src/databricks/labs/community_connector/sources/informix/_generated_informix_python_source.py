@@ -17809,17 +17809,21 @@ def register_lakeflow_source(spark):
                 self._check_unl_source_mode(table, table_options, append)
             if append:
                 configured = table_options.get("snapshot.mode", self.options.get("snapshot.mode"))
-                if configured is not None and mode not in {"initial", "cdc_only"}:
+                # incremental too for a table with a key, whose copy follows the stream (see
+                # _begin_incremental).
+                allowed = {"initial", "cdc_only", "incremental" if table.primary_keys else "initial"}
+                if configured is not None and mode not in allowed:
                     if migration:
                         # The cutover to append-only recorded its seed, and the restore then
                         # failed on this, after the migration had moved the table.
                         # 471: table.migration cuts '{}' over to append-only, which accepts only
-                        # snapshot.mode=initial or snapshot.mode=cdc_only, and its restore would
-                        # fail on the snapshot.mode in force: set one of them in the table's
-                        # configuration (an incremental copy in progress still finishes)
+                        # snapshot.mode=initial or snapshot.mode=cdc_only (or incremental for a table
+                        # with a key), and its restore would fail on the snapshot.mode in force: set one
+                        # of them in the table's configuration (an incremental copy in progress still
+                        # finishes)
                         raise ValueError(_m(471, table.exposed_name))
                     # 274: Append-only table '{}' supports only snapshot.mode=initial or
-                    # snapshot.mode=cdc_only
+                    # snapshot.mode=cdc_only, or snapshot.mode=incremental when it has a key
                     raise ValueError(_m(274, table.exposed_name))
             elif not _cdc_capable(table) and mode in {"cdc_only", "recovery"}:
                 # 170: snapshot.mode={} requires a CDC-capable table; '{}' is snapshot-only
@@ -17855,7 +17859,7 @@ def register_lakeflow_source(spark):
                 # 474: Option '{}' of table '{}' is never read: snapshot.mode=cdc_only reads no
                 # snapshot; set snapshot.mode=initial, or leave it unset on an append-only table
                 raise ValueError(_m(474, option, table.exposed_name))
-            if not append and mode not in _UNL_SNAPSHOT_MODES:
+            if (not append or mode == "incremental") and mode not in _UNL_SNAPSHOT_MODES:
                 # 475: Option '{}' of table '{}' is never read: snapshot.mode={} takes no snapshot
                 # from it; set snapshot.mode=initial or snapshot.mode=initial_only
                 raise ValueError(_m(475, option, table.exposed_name, mode))
@@ -21506,7 +21510,9 @@ def register_lakeflow_source(spark):
                 "schema_id": schema_id,
                 "snapshot_lsn": str(snapshot_lsn),
                 "table": table.native_identity,
-                "upper_pk": _encode_snapshot_stage_value([rows[-1][key] for key in table.primary_keys]),
+                # A chunk of a copy can hold no rows.
+                "upper_pk": rows
+                and _encode_snapshot_stage_value([rows[-1][key] for key in table.primary_keys]),
                 "version": _SNAPSHOT_STAGE_VERSION,
             }
             payload, digest = _staged_page_payload(body)
@@ -22374,6 +22380,43 @@ def register_lakeflow_source(spark):
                 # 234: Table '{}' is not CDC-capable; incremental snapshot requires a primary key and
                 # CDC-supported columns
                 raise InformixError(_m(234, table.exposed_name))
+            # On the append path nothing merges what the copy and the stream both hold, so the
+            # copy follows the stream there (see _drop_copied_changes): one paged by a NOT NULL
+            # key of the table's own that the index-ordered snapshot pages by too, so that each
+            # change has one row to compare with. Any other takes the snapshot initial takes.
+            exact = self._append_only_table(table, options)
+            if exact:
+                index = self._scan_index(table, options)
+                keys = list(table.primary_keys)
+                if (
+                    table.key_only_from_option
+                    or index is None
+                    or index[0] != keys
+                    or any(column.nullable for column in table.columns if column.name in keys)
+                ):
+                    return self._read_snapshot(
+                        table, None, options, pipeline_scope_override=pipeline_scope_override
+                    )
+                # A replay of the copy's first batch serves the chunk that batch staged, after the
+                # stream from its boundary: Spark goes on from the end it logged.
+                logged = json.loads(options.get(_REPLAY_INITIAL_END_OPTION) or "{}")
+                copy = logged.get("incremental")
+                if isinstance(copy, dict) and copy.get("exact"):
+                    lsn = copy["boundary_lsn"]
+                    logged.update(
+                        commit_lsn=lsn,
+                        change_lsn=lsn,
+                        begin_lsn=lsn,
+                        tx_id=None,
+                        incremental={
+                            **copy,
+                            "last_pk": None,
+                            "done": False,
+                            "chunks": 0,
+                            "windows": [copy["seed"]],
+                        },
+                    )
+                    return self._read_incremental_step(table, _validated_offset(logged), options)
             # snapshot.scan=cursor reads without key order, so there are no key ranges to
             # chunk by: take the blocking consistent snapshot, which honours the cursor scan.
             # So does a table keyed by primary.keys alone whose snapshot pages by an index: the
@@ -22416,6 +22459,24 @@ def register_lakeflow_source(spark):
                 floor=not _replay_keeps_floor(options),
                 resnapshot=_RESNAPSHOT_OPTION in options,
             )
+            if exact:
+                # Where its chunks are staged, how many it has read, and the windows still open.
+                # The first is the bound's: its read found no row above max_pk, so it holds every
+                # key there, as a chunk with none, from the boundary to the log's end after it.
+                seed = [
+                    -1,
+                    incremental["max_pk"],
+                    None,
+                    incremental["boundary_lsn"],
+                    str(
+                        self._snapshot_read_with_reconnect(
+                            self._bridge.current_lsn, table=table, operation="key bound end"
+                        )
+                    ),
+                ]
+                incremental.update(
+                    exact=[pipeline_scope, schema_id], chunks=0, windows=[seed], seed=seed
+                )
             high_water = int(incremental["boundary_lsn"])
             seed = _offset(
                 high_water,
@@ -22573,8 +22634,22 @@ def register_lakeflow_source(spark):
             self, table: Table, checkpoint: dict, options: dict[str, str]
         ) -> tuple[Iterator[dict], dict]:
             incremental = dict(checkpoint["incremental"])
+            exact = incremental.get("exact")
+            replaying = self._replay_stop_lsn(options) is not None
+            if exact and not replaying:
+                # The pages of chunks whose windows are closed: the batches that read them, and
+                # those that closed them, are committed, so no replay serves or judges by them.
+                self._cleanup_consumed_snapshot_stage_pages(
+                    table,
+                    *exact,
+                    int(incremental["boundary_lsn"]),
+                    min([window[0] for window in incremental["windows"]] + [incremental["chunks"]]),
+                )
             # Stream a bounded batch of committed changes from the current cursor.
             cdc_rows, end = self._read_stream(table, checkpoint, options, deletes=False)
+            if exact:
+                # Less the windows the stream has read through (see _drop_copied_changes).
+                incremental["windows"] = end["incremental"]["windows"]
             output = list(cdc_rows)
             # The stream reader may return a freshly built offset that drops the
             # incremental block; the schema it used is authoritative for chunking.
@@ -22597,9 +22672,10 @@ def register_lakeflow_source(spark):
             # began before that bound was captured, and carries every row inserted above it.
             # Captured again, a bound lowered by rows deleted at the table's top since ended the
             # copy short of the cursor Spark logged, and the replay failed on every restart.
-            if self._replay_stop_lsn(options) is None and self._incremental_bound_is_foreign(
-                incremental
-            ):
+            # Not a copy that follows the stream: its bound rides in one offset with the stream's
+            # position, and a bound moved would leave rows the stream dropped to the copy uncopied,
+            # or those it kept copied again.
+            if not (replaying or exact) and self._incremental_bound_is_foreign(incremental):
                 # A bound from an earlier update was captured before this update's CDC
                 # start, which would orphan rows inserted in between. Recapture it --
                 # and only it, since the cursor still names rows this table holds. After the
@@ -22620,9 +22696,30 @@ def register_lakeflow_source(spark):
                     table, incremental, dict(incremental.get("chunk_exprs") or {})
                 )
             if not incremental["done"]:
-                chunk_rows, incremental = self._next_incremental_chunk(table, incremental, options)
+                chunk_rows, incremental = (
+                    self._copy_chunk(table, incremental, options, int(end["commit_lsn"]))
+                    if exact
+                    else self._next_incremental_chunk(table, incremental, options)
+                )
                 output.extend(chunk_rows)
-            if incremental["done"]:
+            # A copy that follows the stream keeps its block until its last window is closed in
+            # a batch that is committed: a replay of the batch that closed it judges by its page.
+            # A replay, which can read in several polls, drops it as the batch it repeats did.
+            keep = exact and (
+                self._replay_stop_pk(options, table.primary_keys) is not _REPLAY_DRAIN_TO_MAX_PK
+                if replaying
+                else incremental["windows"] or checkpoint["incremental"]["windows"]
+            )
+            if incremental["done"] and not keep:
+                if exact and not replaying:
+                    self._snapshot_cleanup_executor().submit(
+                        self._delete_snapshot_page,
+                        os.path.join(
+                            self._snapshot_stage_namespace(table, *exact),
+                            "runs",
+                            str(incremental["boundary_lsn"]),
+                        ),
+                    )
                 end.pop("incremental", None)
             else:
                 end = dict(end)
@@ -22636,8 +22733,11 @@ def register_lakeflow_source(spark):
                 # was in the incremental phase and none recorded a streak).
                 #
                 # Idempotent with the call inside _read_stream: both derive the new
-                # value from ``checkpoint``, not from ``end``.
-                end = _with_backlog_streak(end, checkpoint, True)
+                # value from ``checkpoint``, not from ``end``. A copy that has read its last
+                # chunk and waits for the stream to pass its windows has no rows left: what
+                # the stream found stands.
+                if not incremental["done"]:
+                    end = _with_backlog_streak(end, checkpoint, True)
             return iter(output), end
 
         def _next_incremental_chunk(
@@ -22817,6 +22917,68 @@ def register_lakeflow_source(spark):
                 done = passed_upper_bound or not has_more or reached_max_key
             result["done"] = done
             return shaped, result
+
+        def _copy_chunk(
+            self, table: Table, incremental: dict, options: dict[str, str], streamed: int
+        ) -> tuple[list[dict[str, Any]], dict]:
+            # Docstring: The next chunk of a copy that follows the stream, read once the stream
+            # is at ``streamed`` and staged as one immutable page; a replay's served from it.
+            #
+            # The page records the chunk's window: its keys, and the log positions it was read
+            # between, from the later of its read's start and ``streamed`` (the stream dropped
+            # the changes to its keys up to there, which the chunk holds) to the log's end after
+            # the read. The stream judges each change to those keys by it (_drop_copied_changes).
+            # Read again, a chunk holds other rows than the page the stream judges by.
+
+            scope, schema_id = incremental["exact"]
+            lsn, number = int(incremental["boundary_lsn"]), incremental["chunks"]
+            stop = self._replay_stop_pk(options, table.primary_keys)
+            if stop is None:
+                rows, result = self._next_incremental_chunk(table, incremental, options)
+                after = self._snapshot_read_with_reconnect(
+                    self._bridge.current_lsn, table=table, operation="chunk end"
+                )
+                meta = {
+                    "window": [
+                        number,
+                        incremental["last_pk"],
+                        result["max_pk"] if result["done"] else result["last_pk"],
+                        str(max(int(result["chunk_lsn"]), streamed)),
+                        str(after),
+                    ],
+                    "last_pk": result["last_pk"],
+                    "done": result["done"],
+                }
+                # In place of a page a read of this chunk staged for a batch never logged.
+                self._delete_snapshot_page(
+                    os.path.join(
+                        self._snapshot_stage_namespace(table, scope, schema_id),
+                        "runs",
+                        str(lsn),
+                        f"page-{number:08d}",
+                    )
+                )
+                self._publish_snapshot_stage_page(
+                    table, scope, schema_id, lsn, number, rows, json.dumps(meta)
+                )
+            elif stop is _REPLAY_BEFORE_FIRST_CHUNK or (
+                stop is not _REPLAY_DRAIN_TO_MAX_PK
+                and incremental["last_pk"] is not None
+                and tuple(_decode_snapshot_stage_value(incremental["last_pk"])) == stop
+            ):
+                # The batch replayed read no chunk: its cursor stayed.
+                return [], incremental
+            else:
+                record = self._read_snapshot_stage_page_record(table, scope, schema_id, lsn, number)
+                meta = json.loads(record["lower_pk"])
+                rows = _decode_snapshot_stage_value(record["rows"])
+            return rows, {
+                **incremental,
+                "last_pk": meta["last_pk"],
+                "done": meta["done"],
+                "chunks": number + 1,
+                "windows": [*incremental["windows"], meta["window"]],
+            }
 
         @staticmethod
         def _replay_stop_pk(
@@ -24774,6 +24936,142 @@ def register_lakeflow_source(spark):
                 kept.append(tx if whole else replace(tx, records=records))
             return kept
 
+        def _drop_copied_changes(self, table, copy, options, transactions):
+            # Docstring: ``transactions`` without the changes an incremental copy that follows the
+            # stream holds or will hold (see _copy_chunk), and what each window of its chunks has
+            # judged before each of them and after the last.
+            #
+            # On the append path nothing merges what the copy and the stream both hold. A change
+            # to a key the copy has yet to read is the chunk's that will read it, and one to a key
+            # above the copy's bound the stream's alone. A chunk holds each change to its keys
+            # that committed before its window and none that committed after it. Of those that
+            # committed during it, it read each key once, so it holds the key's first changes in
+            # commit order, up to the first whose image before or after is the key's staged row;
+            # the rest are the stream's. What a window has judged rides in the offset, so a batch
+            # can end inside one; a key the staged row fits none of fails it once it closes.
+
+            keys = list(table.primary_keys)
+            descending = (
+                list(table.key_descending)
+                if len(table.key_descending) == len(keys)
+                else [False] * len(keys)
+            )
+            scope, schema_id = copy["exact"]
+
+            def order(row):
+                return _index_scan_order(_index_scan_key(row, keys), descending)
+
+            def cursor(value):
+                return order(dict(zip(keys, _decode_snapshot_stage_value(value))))
+
+            top, at = cursor(copy["max_pk"]), copy["last_pk"] and cursor(copy["last_pk"])
+            windows = [
+                (
+                    window[0],
+                    window[1] and cursor(window[1]),
+                    window[2] and cursor(window[2]),
+                    *map(int, window[3:5]),
+                )
+                for window in copy["windows"]
+            ]
+            pages: dict[int, dict] = {}
+            states = {window[0]: dict(window[5] if window[5:] else {}) for window in copy["windows"]}
+            marks = [states]
+            connector_columns = {CURSOR, COMMIT_LSN, TX_ID, OP, COMMIT_TIME}
+
+            def same(image, row) -> bool:
+                # Whether a change's image is a staged row, shaped alike, by the columns of both.
+                if image is None or row is None:
+                    return image is row
+                shaped = _framework_row(_coerce_variable_decimal_values(image, table, options))
+                return all(
+                    shaped[name] == value
+                    for name, value in row.items()
+                    if name in shaped and name not in connector_columns
+                )
+
+            def dropped(tx, row, old, new) -> bool:
+                # Whether the copy holds the change of ``row``'s key from ``old`` to ``new``.
+                nonlocal states
+                point = order(row)
+                if point <= top and not copy["done"] and (at is None or point > at):
+                    return True
+                for number, low, high, before, after in windows:
+                    if (low is None or point > low) and (high is None or point <= high):
+                        break
+                else:
+                    return False
+                if not before < tx.commit_lsn <= after:
+                    return tx.commit_lsn <= before
+                if number not in pages:
+                    # The bound's window (-1) holds no row.
+                    pages[number] = {
+                        _index_scan_key(item, keys): item
+                        for item in _decode_snapshot_stage_value(
+                            self._read_snapshot_stage_page_record(
+                                table, scope, schema_id, int(copy["boundary_lsn"]), number
+                            )["rows"]
+                            if number >= 0
+                            else []
+                        )
+                    }
+                held = pages[number].get(_index_scan_key(row, keys))
+                key = _index_scan_key_text(_index_scan_key(row, keys))
+                if states is marks[-1]:
+                    states = {number: dict(state) for number, state in states.items()}
+                state = states[number]
+                if state.get(key) or same(old, held):
+                    state[key] = 1
+                    return False
+                state[key] = int(same(new, held))
+                return True
+
+            kept = []
+            for tx in transactions:
+                if any(_record_matches(part, table) for part in tx.spilled) and (
+                    not copy["done"] or any(w[3] < tx.commit_lsn <= w[4] for w in windows)
+                ):
+                    # 494: Informix incremental copy of '{}', which lands as a change log, cannot
+                    # judge a transaction over cdc.spill.records while the copy runs; raise
+                    # cdc.spill.records, or set snapshot.mode=initial and run a full refresh
+                    raise InformixError(_m(494, table.exposed_name))
+                _refuse_altered_changes(tx.records, keys, table, self.options)
+                records, changed = [], False
+                for record in tx.records:
+                    op = _operation(record)
+                    old = record.get("before", record.get("row") if op == "DELETE" else None)
+                    new = record.get("after", record.get("row") if op == "INSERT" else None)
+                    if not _record_matches(record, table) or old is new is None:
+                        records.append(record)
+                        continue
+                    if None in (old, new) or _index_scan_key(old, keys) == _index_scan_key(new, keys):
+                        if dropped(tx, old or new, old, new):
+                            changed = True
+                        else:
+                            records.append(record)
+                        continue
+                    # A key-changing UPDATE: each half by its own key, as the DELETE or the INSERT
+                    # it is to that key.
+                    gone, come = dropped(tx, old, old, None), dropped(tx, new, None, new)
+                    if gone or come:
+                        changed = True
+                        if not (gone and come):
+                            half = {
+                                name: value
+                                for name, value in record.items()
+                                if name not in {"before", "after", "before_lsn"}
+                            }
+                            if gone:
+                                half.update(op="INSERT", row=new)
+                            else:
+                                half.update(op="DELETE", row=old, lsn=_before_lsn(record))
+                            records.append(half)
+                        continue
+                    records.append(record)
+                kept.append(replace(tx, records=tuple(records)) if changed else tx)
+                marks.append(states)
+            return kept, marks
+
         @staticmethod
         def _validate_unl_source_options(options: dict[str, str]) -> None:
             # Docstring: Eagerly validate the connection-level `.unl` source options (per-table too).
@@ -25169,7 +25467,7 @@ def register_lakeflow_source(spark):
                 # As registration refuses it: read directly, the partitioned reader served the
                 # extract and then streamed the log.
                 # 274: Append-only table '{}' supports only snapshot.mode=initial or
-                # snapshot.mode=cdc_only
+                # snapshot.mode=cdc_only, or snapshot.mode=incremental when it has a key
                 raise ValueError(_m(274, table.exposed_name))
             boundary = self._resolve_unl_boundary_lsn(options, self._table_snapshot_source(options))
             if boundary is None:
@@ -26094,9 +26392,11 @@ def register_lakeflow_source(spark):
             snapshot_mode = (
                 "initial" if configured_mode is None else str(configured_mode).strip().lower()
             )
+            if snapshot_mode == "incremental" and table.primary_keys:
+                return self._read_incremental(table, start, options)
             if snapshot_mode not in {"initial", "cdc_only"}:
                 # 274: Append-only table '{}' supports only snapshot.mode=initial or
-                # snapshot.mode=cdc_only
+                # snapshot.mode=cdc_only, or snapshot.mode=incremental when it has a key
                 raise ValueError(_m(274, table.exposed_name))
 
             if snapshot_mode == "initial":
@@ -27231,6 +27531,11 @@ def register_lakeflow_source(spark):
             recovered = self._drop_scanned_changes(
                 table, checkpoint, options, _recover(committed, checkpoint), reached
             )
+            # A copy that follows the stream (see _copy_chunk): ``marks`` holds what its windows
+            # had judged before each transaction, and after the last.
+            copy, marks = checkpoint.get("incremental"), None
+            if not deletes and isinstance(copy, dict) and copy.get("exact"):
+                recovered, marks = self._drop_copied_changes(table, copy, options, recovered)
             output: list[dict[str, Any]] = []
             end = dict(start)
             end["pipeline_scope"] = pipeline_scope
@@ -27459,6 +27764,21 @@ def register_lakeflow_source(spark):
                 end["trigger_high_water"] = str(trigger_high_water)
             if update_layout is not None:
                 end["update_fingerprint"] = update_layout
+            if marks is not None:
+                # A window the stream has read through is closed, each of its changes judged; an
+                # open one keeps what it has judged, for the batch that goes on in it.
+                upto = max(int(end["commit_lsn"]), (reached or 0) if drained else 0)
+                states, windows = marks[consumed], []
+                for window in copy["windows"]:
+                    state = states[window[0]]
+                    if int(window[4]) > upto:
+                        windows.append([*window[:5], state] if state else window[:5])
+                    elif 0 in state.values():
+                        # 493: Informix incremental copy of '{}', which lands as a change log, cannot
+                        # tell which changes made to a key while one of its chunks was read the chunk
+                        # holds: the key's staged row fits none of them; run a full refresh
+                        raise InformixError(_m(493, table.exposed_name))
+                end = {**end, "incremental": {**copy, "windows": windows}}
             end = _with_backlog_streak(end, start, row_budget_reached)
             return iter(output), end
 

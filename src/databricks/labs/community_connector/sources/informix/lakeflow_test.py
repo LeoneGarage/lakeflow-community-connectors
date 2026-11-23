@@ -1080,6 +1080,149 @@ class _KeylessIndexBridge(FakeBridge):
         return list(self.changes) + [{"op": "TIMEOUT", "lsn": self.now}]
 
 
+class _CopySource(FakeBridge):
+    """app.orders (id, value) keyed by id, for an incremental copy that lands as a change log.
+    It commits random transactions between the calls the copy and the stream make, and while a
+    chunk reads its rows one at a time, and gives its log position to the page, as Informix
+    does. A chunk reads under repeatable read: the rows it has read stay as they are until it
+    ends, and a row an open transaction inserted is read once that transaction commits."""
+
+    PAGE = 64
+
+    def __init__(self, random, transactions=60):
+        super().__init__()
+        self.random, self.left = random, transactions
+        self.lsn, self.tx_id, self.log, self.pending, self.held = 1000, 0, [], [], set()
+        self.clock = 1_700_000_000
+        self.rows = [
+            {"id": key, "value": random.choice("ab")}
+            for key in range(1, 31)
+            if random.random() < 0.8
+        ]
+
+    def table_indexes(self, identity):
+        return [(["id"], [False], 30, 30)]
+
+    def buffered_logging(self):
+        return False
+
+    def _write(self, op, tx=None, **fields):
+        self.lsn += self.random.randint(8, 40)
+        if op == "COMMIT":
+            self.clock += 1
+            fields["timestamp"] = self.clock
+        self.log.append({"op": op, "tx_id": tx or self.tx_id, "lsn": self.lsn, **fields})
+
+    def _fresh(self):
+        used = {row["id"] for row in self.rows} | {row["id"] for _tx, row in self.pending}
+        return self.random.choice([key for key in range(1, 61) if key not in used])
+
+    def _commit_open(self):
+        tx, row = self.pending.pop()
+        self.rows.append(row)
+        self._write("COMMIT", tx=tx)
+
+    def _tick(self, chance=0.6):
+        if self.pending and self.random.random() < 0.3:
+            self._commit_open()
+        elif not self.pending and self.left > 0 and self.random.random() < 0.1:
+            self.left -= 1
+            self.tx_id += 1
+            row = {"id": self._fresh(), "value": "open"}
+            self._write("BEGIN")
+            self._write("INSERT", row=dict(row))
+            self.pending.append((self.tx_id, row))
+        while self.left > 0 and self.random.random() < chance:
+            self.left -= 1
+            self.tx_id += 1
+            self._write("BEGIN")
+            # One change, or now and then two in one transaction (to one row or two).
+            for _ in range(1 + (self.random.random() < 0.2)):
+                free = [row for row in self.rows if row["id"] not in self.held]
+                row, kind = (self.random.choice(free) if free else None), self.random.random()
+                if row is not None and kind < 0.35:
+                    self._write("BEFORE_UPDATE", row=dict(row))
+                    row["value"] = self.random.choice("abc")
+                    self._write("AFTER_UPDATE", row=dict(row))
+                elif row is not None and kind < 0.5:
+                    # UPDATE ... SET id = other: the key changes.
+                    self._write("BEFORE_UPDATE", row=dict(row))
+                    row["id"] = self._fresh()
+                    self._write("AFTER_UPDATE", row=dict(row))
+                elif row is not None and kind < 0.75:
+                    self.rows.remove(row)
+                    self._write("DELETE", row=dict(row))
+                else:
+                    new = {"id": self._fresh(), "value": self.random.choice("ab")}
+                    self.rows.append(new)
+                    self._write("INSERT", row=dict(new))
+            self._write("COMMIT")
+
+    def prepare_initial_capture(self, identities):
+        self.prepared_identities = list(identities)
+        return self.boundary_lsn()
+
+    def boundary_lsn(self):
+        self._tick()
+        return self.lsn // self.PAGE * self.PAGE
+
+    def current_lsn(self):
+        lsn = (self.lsn // self.PAGE + 1) * self.PAGE
+        self._tick()
+        return lsn
+
+    def current_utc_time(self):
+        return self.clock
+
+    def max_primary_key(self, identity, primary_keys, **kwargs):
+        self._tick()
+        # The read waits for an open insert above the highest key, as for a lock.
+        while self.pending and self.pending[-1][1]["id"] > max(row["id"] for row in self.rows):
+            self._commit_open()
+        return [max(row["id"] for row in self.rows)] if self.rows else None
+
+    def consistent_snapshot(self, *args, **kwargs):
+        self.now = self.boundary_lsn()
+        return super().consistent_snapshot(*args, **kwargs)
+
+    def snapshot_chunk(self, identity, columns, primary_keys, after, limit, *args, **kwargs):
+        stamp = self.boundary_lsn()
+        self._tick()
+        rows, position = [], None if after is None else after[0]
+        while len(rows) < limit:
+            later = [row for row in self.rows if position is None or row["id"] > position]
+            opened = [row for _tx, row in self.pending if position is None or row["id"] > position]
+            first = min(later, key=lambda row: row["id"], default=None)
+            if opened and (first is None or min(row["id"] for row in opened) < first["id"]):
+                self._commit_open()  # the read waits for the open insert's lock
+                continue
+            if first is None:
+                break
+            rows.append(dict(first))
+            self.held.add(first["id"])
+            position = first["id"]
+            self._tick(0.3)
+        self.held = set()
+        return stamp, rows
+
+    def read_changes(self, captures, start, timeout, max_records, *args, **kwargs):
+        self._tick()
+        begins = {r["tx_id"]: r["lsn"] for r in self.log if r["op"] == "BEGIN"}
+        records = [dict(record) for record in self.log if begins[record["tx_id"]] >= start]
+        take, open_now = self.random.randint(1, 4), set()
+        for at, record in enumerate(records[:-1]):
+            if record["op"] == "BEGIN":
+                open_now.add(record["tx_id"])
+            elif record["op"] == "COMMIT":
+                open_now.discard(record["tx_id"])
+                take -= 1
+                if take <= 0 and not open_now and not self.pending:
+                    return records[: at + 1]
+        # An idle session reports the last checkpoint's position; one happens here.
+        self.lsn += self.PAGE
+        return records + [{"op": "TIMEOUT", "lsn": self.lsn}]
+
+
 class LakeflowContractTests(unittest.TestCase):
     def setUp(self):
         self._shared_state = tempfile.TemporaryDirectory()
@@ -24058,6 +24201,164 @@ class IncrementalSnapshotTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires the stream phase"):
             _validated_offset(offset)
+
+    def _copy_log(self, source, options, scope, random):
+        """Read a change-log copy of ``source`` to its end as Spark would, and return its rows
+        in order. Batches are replayed at random, the first one too, and must give the rows
+        they gave; the reader is started afresh at random. Every staged page is gone after."""
+        connectors = [self.connector(source, registration_scope=scope)]
+        offset, rows, quiet = {}, [], 0
+        for _ in range(400):
+            start = offset
+            batch, offset = connectors[-1].read_table("app.orders", start, options)
+            batch = list(batch)
+            if random.random() < 0.25:
+                replayed = informix_module._replay_between_offsets(
+                    start,
+                    offset,
+                    lambda at: connectors[-1].read_table("app.orders", at, options),
+                    options,
+                    {},
+                )
+                # The same rows; read in several polls, its chunk can come before the rest.
+                self.assertCountEqual(list(replayed), batch)
+            if random.random() < 0.15:
+                connectors.append(self.connector(source, registration_scope=scope))
+            rows += batch
+            quiet = 0 if batch or start != offset or source.left or source.pending else quiet + 1
+            if quiet == 3:
+                for connector in connectors:
+                    connector.close()
+                pages = os.path.join(self._shared_state.name, "**", "page-*")
+                self.assertEqual(glob.glob(pages, recursive=True), [])
+                return rows
+        self.fail("the copy and its stream did not settle")
+
+    @staticmethod
+    def _history_fault(source, rows):
+        """Why ``rows``, by key in log order, are not a history of ``source``'s table that holds
+        and gives its final rows: a row only where there is none (``r``, ``c``, and a ``u``
+        moving a row to its key), a change only to the row there; else None."""
+        moved = {
+            record["lsn"]
+            for before, record in zip(source.log, source.log[1:])
+            if record["op"] == "AFTER_UPDATE" and before["row"]["id"] != record["row"]["id"]
+        }
+        state = {}
+        for row in sorted(
+            rows, key=lambda row: (row["_informix_commit_lsn"], row["_informix_change_lsn"])
+        ):
+            key, op = row["id"], row["_informix_op"]
+            fresh = op in "rc" or op == "u" and int(row["_informix_change_lsn"]) in moved
+            if fresh == (key in state) or op == "d" and state[key] != row["value"]:
+                return row
+            if op == "d":
+                del state[key]
+            else:
+                state[key] = row["value"]
+        final = {row["id"]: row["value"] for row in source.rows}
+        return None if state == final else (state, final)
+
+    def test_a_keyed_change_log_copied_incrementally_holds_each_change_once(self):
+        # On the append path nothing merges what an incremental copy and the stream both hold:
+        # a change to a key the copy had not read yet was in its chunk and in the stream, and
+        # one made while its chunk read it could be either. The copy now follows the stream.
+        # The source commits at random between every call, and while a chunk reads; batches
+        # are replayed, and the reader restarted. The log must be a history of the table.
+        judged = []
+        copied = informix_module.InformixLakeflowConnect._drop_copied_changes
+
+        def judge(connector, table, copy, options, transactions):
+            kept, marks = copied(connector, table, copy, options, transactions)
+            judged.append(any(marks[-1].values()))
+            return kept, marks
+
+        def unfiltered(connector, table, copy, options, transactions):
+            # As the merged copy does: every change goes on.
+            return transactions, [{window[0]: {} for window in copy["windows"]}] * (
+                len(transactions) + 1
+            )
+
+        overlapped = 0
+        for seed in range(60):
+            for filtered in (judge, unfiltered):
+                random = random_module.Random(9100 + seed)
+                source = _CopySource(random)
+                options = {
+                    "append.only.ingestion": "true",
+                    "snapshot.mode": "incremental",
+                    "snapshot.page.size": str(random.choice([2, 3, 5])),
+                    "max.records.per.batch": str(random.choice([1, 4, 100])),
+                }
+                with mock.patch.object(
+                    informix_module.InformixLakeflowConnect, "_drop_copied_changes", filtered
+                ):
+                    rows = self._copy_log(source, options, f"{filtered.__name__}-{seed}", random)
+                fault = self._history_fault(source, rows)
+                if filtered is judge:
+                    self.assertIsNone(fault, f"seed {seed}")
+                else:
+                    overlapped += fault is not None
+        # Without the filter the log is no history of the table; with it, keys were judged
+        # by the rows their chunks staged.
+        self.assertGreater(overlapped, 40)
+        self.assertGreater(sum(judged), 10)
+
+    def test_a_keyed_change_log_accepts_incremental_and_a_keyless_one_does_not(self):
+        connector = self.connector(FakeBridge())
+        keyed = Table.parse(_table(), "demo")
+        options = {"append.only.ingestion": "true", "snapshot.mode": "incremental"}
+        connector._check_table_read_options(keyed, options)
+        keyless = Table.parse(_table(primary_keys=()), "demo")
+        with self.assertRaisesRegex(ValueError, "incremental when it has a key"):
+            connector._check_table_read_options(keyless, {"snapshot.mode": "incremental"})
+
+    def test_a_keyed_change_log_with_no_key_to_follow_by_copies_as_initial_does(self):
+        # A copy that follows the stream pages by a NOT NULL key of the table's own that the
+        # index-ordered snapshot can page by too. Otherwise the table takes the snapshot
+        # initial takes: a cursor read here, and the key-paged one with a warning for a filter.
+        options = {"append.only.ingestion": "true", "snapshot.mode": "incremental"}
+        cases = (
+            ((), {"snapshot.scan": "cursor"}, False),
+            (("id",), {"snapshot.filter": "id > 0"}, True),
+        )
+        for paged, extra, warned in cases:
+            source = _CopySource(random_module.Random(5), transactions=0)
+            connector = self.connector(source, registration_scope=str(extra))
+            with mock.patch.object(
+                informix_module.logging.getLogger(informix_module.__name__), "warning"
+            ) as warning:
+                rows, offset = self._drain(connector, {**options, **extra})
+            self.assertEqual(
+                sorted(row["id"] for row in rows), sorted(row["id"] for row in source.rows)
+            )
+            self.assertNotIn("incremental", offset)
+            self.assertEqual(source.snapshot_primary_keys, [paged])
+            self.assertEqual(
+                any(
+                    "without following its changes" in str(call) for call in warning.call_args_list
+                ),
+                warned,
+            )
+
+    def test_a_keyed_change_log_copy_refuses_a_spilled_transaction_it_must_judge(self):
+        connector = self.connector(FakeBridge())
+        table = Table.parse(_table(), "demo")
+        copy = {
+            "max_pk": [9],
+            "last_pk": [3],
+            "done": False,
+            "boundary_lsn": "100",
+            "exact": ["s" * 32, "t" * 32],
+            "windows": [],
+        }
+        part = {"op": "SPILLED", "identity": table.native_identity, "table": table.identity}
+        tx = informix_module.CommittedTransaction(7, 100, 150, 100, (), spilled=(part,))
+        with mock.patch.object(informix_module, "_record_matches", return_value=True):
+            with self.assertRaisesRegex(informix_module.InformixError, "cdc.spill.records"):
+                connector._drop_copied_changes(table, copy, {}, [tx])
+            kept, _marks = connector._drop_copied_changes(table, {**copy, "done": True}, {}, [tx])
+        self.assertEqual(kept, [tx])
 
 
 class SnapshotReconnectTests(unittest.TestCase):

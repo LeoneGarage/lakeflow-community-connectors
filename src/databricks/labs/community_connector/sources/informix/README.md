@@ -214,7 +214,7 @@ other.
 | `table.include.list` | No | all eligible tables | Comma-separated shell-style table patterns. |
 | `tables` | No | | Alias for `table.include.list`; ignored when that option is set. |
 | `table.exclude.list` | No | none | Comma-separated shell-style patterns excluded after inclusion filtering. |
-| `snapshot.mode` | No | `incremental` (`initial` for an append-only table) | Per-table snapshot policy: `incremental`, `initial`, `initial_only`, `cdc_only`, `auto_snapshot`, or `recovery`. An append-only table accepts only `initial` or `cdc_only`. See [Snapshot modes](#snapshot-modes). |
+| `snapshot.mode` | No | `incremental` (`initial` for an append-only table) | Per-table snapshot policy: `incremental`, `initial`, `initial_only`, `cdc_only`, `auto_snapshot`, or `recovery`. An append-only table accepts only `initial` or `cdc_only`, or `incremental` when it has a key. See [Snapshot modes](#snapshot-modes). |
 | `snapshot.source` | No | none | Per-table (also connection-scope) UC Volume directory of Informix UNLOAD (`.unl` or gzip `.unl.gz`) extract files. With `snapshot.mode=initial` or `initial_only` (an append-only table: `initial`), the initial snapshot is served from those files instead of a live scan, then transitions to CDC at the boundary (`initial_only` stops there). Set in a table's configuration with another mode, which takes no snapshot from it, the table fails when the pipeline starts, as does a table's `snapshot.boundary.lsn` without an extract; set on the connection, it applies to the tables whose mode reads it, and the others snapshot from Informix. Files must be newline-terminated delimited text — UNLOAD (`\|` delimiter, backslash escaping, empty field = NULL) or **HPL DELIMITED** output (set `snapshot.unl.delimiter`/`snapshot.unl.escape` when its job uses a different pair; HPL fixed-position/COBOL/binary formats are not supported). Parallel executor reads use ranged GETs over the Files REST API, splitting each plain file into ~`snapshot.split.bytes` (default 50 MiB) pieces at record boundaries. A gzip file (detected by magic bytes, not name) is not seekable, so it is one non-splittable unit — for compressed extracts, parallelism comes from using **multiple `.unl.gz` files**, and mid-snapshot resume from multiple files or `snapshot.gzip.records.per.batch`. The operator must ensure the extract reflects the table at ingest time (quiesce, or extract-then-ingest); the connector does not verify alignment. Once the snapshot starts, the connector pins each file's name, size, modification time and a sampled content fingerprint, and fails with a full-refresh error if a later read finds any file added, removed or changed. It pins `snapshot.split.bytes`, `snapshot.unl.delimiter` and `snapshot.unl.escape` too, which the snapshot's position depends on: changed before the snapshot is done, a read fails until they are set back. Producing the `.unl` files via UNLOAD/HPL is out of scope. See [File-sourced initial snapshot](#file-sourced-initial-snapshot). |
 | `snapshot.boundary.lsn` | No | self-pin | Per-table (also connection-scope) operator-supplied CDC boundary LSN for a `snapshot.source` extract — the LSN the extract was captured at, so the CDC stream resumes at exactly that position. **Resolution per table, first hit wins:** this option; else a `_manifest.json` file in the `snapshot.source` directory containing `{"boundary_lsn": "<X>"}` (other keys ignored); else the connector self-pins its own registration LSN. A supplied boundary is validated against the source's retained/current log range and **fails closed** if below the minimum retained LSN (the logical log recycled past it → gap) or above current. Non-negative integer. |
 | `snapshot.split.bytes` | No | `52428800` | Per-table (also connection-scope) target byte size for each parallel `.unl` split — each executor reads roughly this many bytes, snapped up to the next record boundary. Splitting by bytes rather than rows lets the connector plan splits with a few small reads instead of scanning the whole file. Positive integer; default 50 MiB. Only meaningful with `snapshot.source`. |
@@ -1137,9 +1137,12 @@ the table, unless it is part of the key, which fails the table; `primary.keys: "
   default when no mode is set on the table or the connection), then streams from
   the snapshot's position, so the log starts with every row and can rebuild the
   table. Set `snapshot.mode: cdc_only` to start at the current log position and
-  copy no existing rows instead. Any other mode is rejected for a change-log
-  table, so if you set `snapshot.mode` at connection scope, set it per table here
-  as well.
+  copy no existing rows instead. A table with a key can also take
+  `snapshot.mode: incremental`, which copies its rows in chunks while the stream
+  runs (see [Incremental snapshot and append-only
+  targets](#incremental-snapshot-and-append-only-targets)). Any other mode is
+  rejected for a change-log table, so if you set `snapshot.mode` at connection
+  scope, set it per table here as well.
 
 ### Keyed on a set of columns
 
@@ -1331,7 +1334,7 @@ unset value means 100,000. It suits small reference tables only.
 
 | Approach | Snapshot modes | Default |
 |---|---|---|
-| Change log, with or without a key | `initial`, `cdc_only` | `initial`, existing rows first |
+| Change log, with or without a key | `initial`, `cdc_only`; `incremental` with a key | `initial`, existing rows first |
 | Keyed, on columns or the whole row | any | `incremental` |
 | Snapshot-only | not applicable | the whole table, every run |
 
@@ -1694,8 +1697,9 @@ rows the table holds into durable bounded pages, then continues CDC from the
 snapshot LSN, so the change log starts with every row. The snapshot pages by an
 index or its key and follows the table's changes while it runs (see
 [Exact snapshots of keyless tables](#exact-snapshots-of-keyless-tables)). Such a
-table supports `initial` or `cdc_only`, which copies no existing rows. Other modes
-require key-based snapshot progress and are rejected.
+table supports `initial` or `cdc_only`, which copies no existing rows, and with a key
+`incremental` (see [Incremental snapshot and append-only
+targets](#incremental-snapshot-and-append-only-targets)). Other modes are rejected.
 
 | Mode | Behavior |
 |---|---|
@@ -1787,9 +1791,10 @@ your pipeline spec.
    append rather than re-snapshotted), keeping `table.migration: true`. Run the
    pipeline. The append flow records the parked position as its checkpoint and stops —
    no re-snapshot, no rows yet. (Restoring in step 3 resumes streaming from there.)
-   An append-only table accepts only `snapshot.mode: initial` or `cdc_only`: if the table
-   or the connection names another mode, set one of these two in the table's
-   configuration now, or the cutover stops with an error. An incremental copy the
+   An append-only table accepts only `snapshot.mode: initial` or `cdc_only`, or
+   `incremental` when it has a key: if the table or the connection names another mode,
+   set one of these in the table's configuration now, or the cutover stops with an
+   error. An incremental copy the
    capture parked mid-way still finishes after Restore.
 
    ```json
@@ -1892,17 +1897,43 @@ so a snapshot `r` row is always superseded by any later change to the same key
 and the materialized state is exact.
 
 For `APPEND_ONLY` targets there is no key merge: every emitted row is retained.
-This is a keyed table on its keyed path with `scd_type: APPEND_ONLY` alone, which
-drops deletes (see above); with `append.only.ingestion: "true"` only `initial` and
-`cdc_only` are accepted.
+A keyed table on its keyed path with `scd_type: APPEND_ONLY` alone, which drops
+deletes (see above), copies as for a merged target.
 Because each chunk is read in its own repeatable-read transaction, its `r` rows
 are consistent as-of that chunk's LSN, and no row is ever lost or fabricated.
 The only artifact is that a key changed just before its chunk boundary can
 appear twice — once as the change event and once as an `r` row carrying the same
 value at a nearby LSN. An append-only consumer that reconstructs state by
 ordering on `_informix_change_lsn` (the documented contract) still resolves the
-correct value. If you require an append changelog with no duplicated snapshot
-rows, use `snapshot.mode=initial` for that table.
+correct value.
+
+A change log (`append.only.ingestion: "true"`) with a key reconciles the copy and
+the stream itself, so each change is in its log once. Ordered by
+`_informix_commit_lsn`, then `_informix_change_lsn`, each key's rows are then a
+history of the table: an `r` or `c` row only where the key has none, and a change
+only to the row it has.
+
+- A change to a key the copy has yet to read is left to the chunk that reads it.
+  One to a key above the highest key the copy took at its start is left to the
+  stream.
+- Each chunk is staged on the staging Volume as one immutable page, with the log
+  positions before and after its read. A change to one of its keys that committed
+  before the read is in the chunk, and one that committed after it is not. For one
+  that committed during the read, the staged row tells: the chunk read the key
+  once, so it holds the key's first changes in commit order, up to the first whose
+  row before or after is the staged one. A replayed batch serves its chunk from the
+  page, so it emits the rows it emitted.
+- A page is deleted once the stream has read past its chunk's read in a committed
+  batch. On a log nothing else writes to, pages wait until the log moves on.
+
+This needs a `NOT NULL` key of the table's own (a primary key, or a unique index
+used as its key) that the index-ordered snapshot can page by: integer, decimal,
+date or character columns. A table without one, one keyed by `primary.keys`, one
+with `row_filter`, `snapshot.filter` or `snapshot.scan: cursor`, and one on a
+database with buffered logging takes the snapshot `initial` takes instead. The copy
+fails, for a full refresh, on a transaction to the table larger than
+`cdc.spill.records` while it runs, and on a key whose staged row fits none of the
+changes made during its chunk's read.
 
 #### File-sourced initial snapshot
 

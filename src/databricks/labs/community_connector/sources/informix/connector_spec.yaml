@@ -456,7 +456,8 @@ connection:
         Append-only tables (keyless ones, or with `append.only.ingestion=true`) default
         to `initial` when this option is unset, copying the rows the table holds into
         durable bounded pages before CDC, and accept `initial` or `cdc_only`, which
-        copies no existing rows.
+        copies no existing rows. One with a key also accepts `incremental`, which copies
+        its rows in chunks while CDC runs and keeps each change in the log once.
         To move a table to a new flow without re-snapshotting, keep its snapshot.mode
         and set `table.migration=true` instead (see that option). The extension modes
         `configuration_based` and `custom` are not supported.
