@@ -24304,6 +24304,22 @@ class IncrementalSnapshotTests(unittest.TestCase):
         self.assertGreater(overlapped, 40)
         self.assertGreater(sum(judged), 10)
 
+    def test_a_change_log_with_no_snapshot_mode_copies_incrementally_if_it_has_a_key(self):
+        # Unset, a change log with a key takes incremental, as a merged table does, its copy
+        # following the stream; one without a key takes initial.
+        options = {"append.only.ingestion": "true"}
+        source = _CopySource(random_module.Random(3), transactions=0)
+        connector = self.connector(source, registration_scope="keyed-default")
+        rows, offset = connector.read_table("app.orders", {}, options)
+        rows = list(rows)
+        self.assertTrue(offset["incremental"]["exact"])
+        self.assertTrue(rows and all(row["_informix_op"] == "r" for row in rows))
+        self.assertEqual(
+            connector._table_snapshot_mode(Table.parse(_table(), "demo"), options), "incremental"
+        )
+        keyless = Table.parse(_table(primary_keys=()), "demo")
+        self.assertEqual(connector._table_snapshot_mode(keyless, {}), "initial")
+
     def test_a_keyed_change_log_accepts_incremental_and_a_keyless_one_does_not(self):
         connector = self.connector(FakeBridge())
         keyed = Table.parse(_table(), "demo")
@@ -32005,6 +32021,13 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
             ("cdc_only", FakeBridge(), {"snapshot.source": source}, "cdc_only takes no"),
             ("cdc_only", keyless, {"snapshot.source": source}, "cdc_only reads no snapshot"),
             (None, FakeBridge(), {"snapshot.source": source}, "snapshot.mode=incremental"),
+            # A keyed change log with none set takes incremental too.
+            (
+                None,
+                FakeBridge(),
+                {"snapshot.source": source, "append.only.ingestion": "true"},
+                "snapshot.mode=incremental",
+            ),
             ("initial", FakeBridge(), {"snapshot.boundary.lsn": "50"}, "has no snapshot.source"),
         )
         for mode, bridge, table_options, reason in cases:

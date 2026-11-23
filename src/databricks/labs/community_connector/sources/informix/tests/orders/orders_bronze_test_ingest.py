@@ -11,7 +11,8 @@ source_name = "informix"
 pipeline_spec = {
     "connection_name": "informix",
     "objects": [
-        # orders has a primary key, so it needs both settings to land as a change log.
+        # orders has a primary key, so it needs both settings to land as a change log. Its
+        # copy is incremental, the default for a table with a key: in chunks beside the stream.
         {
             "table": {
                 "source_table": "orders",
@@ -20,7 +21,6 @@ pipeline_spec = {
                     "qualified_source_table": "informix.orders",
                     "append.only.ingestion": "true",
                     "scd_type": "APPEND_ONLY",
-                    "snapshot.mode": "initial",
                 },
             }
         },
@@ -34,7 +34,6 @@ pipeline_spec = {
                 "destination_table": "order_items_log",
                 "table_configuration": {
                     "qualified_source_table": "informix.order_items",
-                    "snapshot.mode": "initial",
                     # Small pages, so that the scan takes many and can be stopped part-way.
                     "keyless.snapshot.page.size": "200",
                 },

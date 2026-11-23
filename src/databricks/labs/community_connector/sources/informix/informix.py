@@ -5568,7 +5568,8 @@ _PRIMARY_KEYS_OPTION = "primary.keys"
 # break is keyset snapshot paging, which compares key values in SQL and in Python;
 # snapshot.scan=cursor avoids it, and the per-page sort an all-column key usually costs.
 # On the append path with snapshot.mode=cdc_only nothing pages by key, so a NULL there is
-# harmless; its default, initial, pages its snapshot by key like any other.
+# harmless; its default, incremental, takes initial's snapshot, which pages by key like any
+# other.
 _PRIMARY_KEYS_WILDCARD = "*"
 # ``"* except(c1, c2)"`` keys the table on every column but the ones named, which suits a
 # table whose rows are unique as a whole bar a few columns that change or are too wide to
@@ -11082,7 +11083,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # would never use.
         #
         # Only snapshot.mode initial and initial_only take a snapshot from the extract (an
-        # append-only table, initial, its default). Set with another, the option did
+        # append-only table without a key, initial, its default). Set with another, the option did
         # nothing: an append-only table's cdc_only skipped the extract, a keyed table's
         # default incremental copied the live table from today's log position instead of
         # loading the extract from its boundary. Checked on the table's own configuration;
@@ -11104,6 +11105,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         if append and mode == "cdc_only":
             # 474: Option '{}' of table '{}' is never read: snapshot.mode=cdc_only reads no
             # snapshot; set snapshot.mode=initial, or leave it unset on an append-only table
+            # without a key
             raise ValueError(_m(474, option, table.exposed_name))
         if (not append or mode == "incremental") and mode not in _UNL_SNAPSHOT_MODES:
             # 475: Option '{}' of table '{}' is never read: snapshot.mode={} takes no snapshot
@@ -13371,11 +13373,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
     def _table_snapshot_mode(self, table: Table, table_options: dict[str, str]) -> str:
         # Docstring: snapshot.mode as this table's reads take it. An append-only table with
-        # none set, on the table or on the connection, takes initial: it copies the rows the
-        # table holds before it streams, where cdc_only, its default before, copied none.
+        # none set, on the table or on the connection, takes incremental as any table with
+        # a key does, its copy following the stream (see _begin_incremental), and initial
+        # without one: either copies the rows the table holds, where cdc_only copied none.
 
-        if not self._snapshot_mode_set(table_options) and self._append_only_table(
-            table, table_options
+        if (
+            not table.primary_keys
+            and not self._snapshot_mode_set(table_options)
+            and self._append_only_table(table, table_options)
         ):
             return "initial"
         return self._snapshot_mode(table_options)
@@ -19547,16 +19552,22 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         #
         # Two startup behaviours, selected by ``snapshot.mode``:
         #
-        # ``initial`` (also the append-only default when snapshot.mode is unset)
+        # ``incremental`` (the default for a table with a key, as for a merged one)
+        #     Copy the rows the table holds in chunks while the stream runs, the copy
+        #     following the stream so that each change is in the log once (see
+        #     _begin_incremental); a table whose key it cannot follow by takes initial's
+        #     snapshot instead.
+        #
+        # ``initial`` (the default for a table without a key)
         #     Copy the rows the table holds, then continue from the snapshot's LSN, so
         #     history is captured and the handoff is gapless. The snapshot pages by an
         #     index, or by its key, and follows the table's changes while it runs (see
         #     the README's exact snapshots of keyless tables); without either it reads
         #     through one forward-only cursor. Fetched rows are written to immutable
         #     staged pages and become visible only after the completed snapshot
-        #     manifest is published. Defaulting to it, a change log starts with the rows
-        #     the table holds, as a keyed table's default incremental copy does: one
-        #     that started from today's log alone could not be rebuilt from it.
+        #     manifest is published. Either default starts a change log with the rows the
+        #     table holds: one that started from today's log alone could not be rebuilt
+        #     from it.
         #
         # ``cdc_only``
         #     Start at the server's current log position and emit nothing now. Rows
@@ -19634,10 +19645,7 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # closed.
             return iter(()), self._handoff_seed_from_token(table, token)
 
-        configured_mode = options.get("snapshot.mode", self.options.get("snapshot.mode"))
-        snapshot_mode = (
-            "initial" if configured_mode is None else str(configured_mode).strip().lower()
-        )
+        snapshot_mode = self._table_snapshot_mode(table, options)
         if snapshot_mode == "incremental" and table.primary_keys:
             return self._read_incremental(table, start, options)
         if snapshot_mode not in {"initial", "cdc_only"}:

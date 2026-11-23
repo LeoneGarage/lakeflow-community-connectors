@@ -703,7 +703,7 @@ class Probe:
         log(f"deployed connector and ingest file to {self.workspace_dir}")
 
     def ingest_source(self) -> str:
-        star = {"primary.keys": "*", "snapshot.mode": "initial", "snapshot.scan": "cursor"}
+        star = {"primary.keys": "*", "snapshot.scan": "cursor"}
         configs = {
             self.variants["s1"]: {**star, "scd_type": "SCD_TYPE_1"},
             self.variants["s2"]: {**star, "scd_type": "SCD_TYPE_2"},
