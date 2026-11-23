@@ -135,6 +135,10 @@ def _pickled_source(cls):
     return _restored_source, (_driver_registration(_active_spark_session()),)
 
 
+# Through copyreg, not a __reduce_ex__ on _InformixSourceType: pickle saves a class by its
+# name without asking the class's type, and consults only a reducer in the dispatch table
+# first -- the C and pure-Python picklers and PySpark's cloudpickle alike. The table gains
+# this one private type, so no other type pickles differently.
 copyreg.pickle(_InformixSourceType, _pickled_source)
 
 
