@@ -3307,7 +3307,7 @@ class StagingCredentialProviderTests(unittest.TestCase):
         self.assertNotIn("bootstrap-later", used)
 
     def test_the_chain_outlives_the_bootstrap_credential(self):
-        # The captured credential lasts about an hour; a reader running for days keeps
+        # The captured credential lasts about two days; a reader running longer keeps
         # minting its bearers through the minting tokens, and stays on REST.
         api = _StagingTokenApi()
         now = {"t": 0.0}
@@ -3366,7 +3366,7 @@ class StagingCredentialProviderTests(unittest.TestCase):
         self.assertFalse(provider.rejected)
 
     def test_a_token_nothing_can_replace_is_dropped_and_reported(self):
-        # The starting credential lasts about an hour; after that a rejected token can't
+        # The starting credential lasts about two days; after that a rejected token can't
         # be replaced, and resending it would only repeat the 401.
         api = _StagingTokenApi()
         provider, _ = self._provider(api, clock=lambda: 0.0)
@@ -3517,7 +3517,7 @@ class _FakeHttpResponse:
 
 class WorkspaceApiClientTests(unittest.TestCase):
     def test_a_state_takes_the_current_workspace_token_each_time(self):
-        # The client was kept with the token it was made with, which lasts about an hour:
+        # The client was kept with the token it was made with, which lasts about two days:
         # credential rotation, re-provisioning and project GC then failed with it.
         state = lakebase_state.LakebaseState({}, "conn")
         with mock.patch.dict(lakebase_state._CAPTURED_WORKSPACE, {"host": "ws", "token": "a"}):

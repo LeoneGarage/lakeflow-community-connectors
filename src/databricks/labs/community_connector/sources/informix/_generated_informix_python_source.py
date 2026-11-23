@@ -3229,8 +3229,8 @@ def register_lakeflow_source(spark):
         # (see revoke_stale_staging_tokens). The minting token never leaves this process: no
         # descriptor carries it, and neither token is written anywhere, a workspace secret
         # included. The first pair is minted with ``bootstrap_token`` -- whatever credential
-        # the reader could carry from the driver (the captured runtime credential), the
-        # latest one a reader gave (take_bootstrap) -- which lasts about an hour; the chain
+        # the reader could carry from the driver (the captured ambient PAT), the latest
+        # one a reader gave (take_bootstrap) -- which lasts about two days; the chain
         # needs no ambient identity after that, however long the reader runs. Refresh is
         # lazy -- checked on each ``bearer()`` call -- so there is no background thread to
         # manage; page writes call ``bearer()`` often enough to refresh well within the
@@ -3871,7 +3871,7 @@ def register_lakeflow_source(spark):
     _MAX_SCHEMA_DESCENT = 256
     _INFORMIX_REGISTRATION_CONTEXT: dict[str, Any] = {"scope": None, "request": None, "reset_at": None}
     # How old the driver's captured workspace credential may get before the driver, packing a
-    # registration, captures it again: the ambient token lasts about an hour.
+    # registration, captures it again: the ambient PAT lasts about two days, an OAuth token an hour.
     _CREDENTIAL_RECAPTURE_SECONDS = 900.0
     _CREDENTIAL_CAPTURED: dict[str, float] = {}
     # An index-ordered snapshot records its progress beside its staged pages, so that a restart
@@ -4728,7 +4728,7 @@ def register_lakeflow_source(spark):
         ):
             # The same update, or a session outside a pipeline, packing a registration again
             # (a flow restarted, say, or a connector pickled for a worker, which asks with no
-            # session): the token captured when it began lasts about an hour, and a process
+            # session): the token captured when it began lasts about two days, and a process
             # first reaching the control plane after that failed with it. Captured again here,
             # in the process that captured it (the merged file's globals carry the capture
             # time to every process with its code, but not the process); a process that was
@@ -5036,7 +5036,7 @@ def register_lakeflow_source(spark):
         # package import is not a driver and has nothing to capture.
         capture_workspace_credentials()
         # When and where, so that the driver captures again as a package's does (see
-        # _driver_registration): it was never, and the token lasts about an hour.
+        # _driver_registration): it was never, and the token lasts about two days.
         _CREDENTIAL_CAPTURED.update(at=time.monotonic(), pid=os.getpid())
         # The merged source's own parameter: the framework's data source, merged after this
         # file, registers through it and is shortened then (_ShortenedRegistrations).
@@ -10522,9 +10522,10 @@ def register_lakeflow_source(spark):
             return (self._project_id, self._database, digest)
 
         def _api_client(self) -> _WorkspaceApi:
-            # Made for each use: the workspace token lasts about an hour, and the one taken up
-            # here is captured again (_driver_registration) or renewed by the SDK. Kept, an
-            # instance's credential rotation, re-provisioning and project GC failed with it.
+            # Made for each use: the ambient PAT lasts about two days, an OAuth token an hour,
+            # and the one taken up here is captured again (_driver_registration) or renewed by
+            # the SDK. Kept, an instance's credential rotation, re-provisioning and project GC
+            # failed with it.
             return _WorkspaceApi(*_workspace_credentials(self._options))
 
         def provision(self) -> dict[str, Any]:
@@ -25828,8 +25829,8 @@ def register_lakeflow_source(spark):
                 logging.getLogger(__name__).info(_m(215))
                 return None
             except WorkspaceHttpError as error:
-                # A 401 here is the reader's starting credential refused: it lasts about an
-                # hour, and the process mints its first tokens from it, at the first stream
+                # A 401 here is the reader's starting credential refused: it lasts about two
+                # days, and the process mints its first tokens from it, at the first stream
                 # read (_keep_staging_credential). Stage over FUSE, as when token creation is
                 # forbidden.
                 if mode == "rest" or error.status_code != 401:
@@ -25845,7 +25846,7 @@ def register_lakeflow_source(spark):
             # Docstring: Start this process's staging-token chain while the reader's starting
             # credential is valid, and keep it fresh: each stream read of an upsert flow calls
             # here. A process that first staged after that credential had expired (it lasts
-            # about an hour), or whose chain had gone unused past a token's lifetime, could
+            # about two days), or whose chain had gone unused past a token's lifetime, could
             # mint nothing, and staged over FUSE. A failure is left to the stage that needs
             # the transport, which resolves it again.
 

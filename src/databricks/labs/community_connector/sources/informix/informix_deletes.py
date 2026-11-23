@@ -1395,8 +1395,8 @@ class _DeleteChannelMixin:
             logging.getLogger(__name__).info(_m(215))
             return None
         except WorkspaceHttpError as error:
-            # A 401 here is the reader's starting credential refused: it lasts about an
-            # hour, and the process mints its first tokens from it, at the first stream
+            # A 401 here is the reader's starting credential refused: it lasts about two
+            # days, and the process mints its first tokens from it, at the first stream
             # read (_keep_staging_credential). Stage over FUSE, as when token creation is
             # forbidden.
             if mode == "rest" or error.status_code != 401:
@@ -1412,7 +1412,7 @@ class _DeleteChannelMixin:
         # Docstring: Start this process's staging-token chain while the reader's starting
         # credential is valid, and keep it fresh: each stream read of an upsert flow calls
         # here. A process that first staged after that credential had expired (it lasts
-        # about an hour), or whose chain had gone unused past a token's lifetime, could
+        # about two days), or whose chain had gone unused past a token's lifetime, could
         # mint nothing, and staged over FUSE. A failure is left to the stage that needs
         # the transport, which resolves it again.
 

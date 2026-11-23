@@ -409,10 +409,10 @@ connection:
         which Files API calls send and split descriptors carry to executors, and a
         minting token scoped to token management (`authentication`), kept in the
         process's memory, which mints the next pair. The first pair is minted at the
-        reader's first stream read, from its starting credential (that lasts about an
-        hour), and later reads refresh the pair at half this value, so a reader stays on
-        REST however long it runs. Default `14400` (4h); minimum `600`. Clamped to the
-        workspace's maximum-token-lifetime policy.
+        reader's first stream read, from its starting credential (the runtime's ambient
+        PAT, about two days), and later reads refresh the pair at half this value, so a
+        reader stays on REST however long it runs. Default `14400` (4h); minimum `600`.
+        Clamped to the workspace's maximum-token-lifetime policy.
 
     - name: snapshot.staging.pipeline
       type: string

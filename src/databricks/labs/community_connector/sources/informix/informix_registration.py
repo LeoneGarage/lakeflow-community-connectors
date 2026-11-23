@@ -74,7 +74,7 @@ _MAX_REGISTRATION_TABLE_CACHES = 512
 _MAX_SCHEMA_DESCENT = 256
 _INFORMIX_REGISTRATION_CONTEXT: dict[str, Any] = {"scope": None, "request": None, "reset_at": None}
 # How old the driver's captured workspace credential may get before the driver, packing a
-# registration, captures it again: the ambient token lasts about an hour.
+# registration, captures it again: the ambient PAT lasts about two days, an OAuth token an hour.
 _CREDENTIAL_RECAPTURE_SECONDS = 900.0
 _CREDENTIAL_CAPTURED: dict[str, float] = {}
 # An index-ordered snapshot records its progress beside its staged pages, so that a restart
@@ -931,7 +931,7 @@ def _driver_registration(spark_session: Any | None = None) -> dict[str, Any]:
     ):
         # The same update, or a session outside a pipeline, packing a registration again
         # (a flow restarted, say, or a connector pickled for a worker, which asks with no
-        # session): the token captured when it began lasts about an hour, and a process
+        # session): the token captured when it began lasts about two days, and a process
         # first reaching the control plane after that failed with it. Captured again here,
         # in the process that captured it (the merged file's globals carry the capture
         # time to every process with its code, but not the process); a process that was
@@ -1239,7 +1239,7 @@ else:
     # package import is not a driver and has nothing to capture.
     capture_workspace_credentials()
     # When and where, so that the driver captures again as a package's does (see
-    # _driver_registration): it was never, and the token lasts about an hour.
+    # _driver_registration): it was never, and the token lasts about two days.
     _CREDENTIAL_CAPTURED.update(at=time.monotonic(), pid=os.getpid())
     # The merged source's own parameter: the framework's data source, merged after this
     # file, registers through it and is shortened then (_ShortenedRegistrations).

@@ -183,9 +183,10 @@ class LakebaseState:
         return (self._project_id, self._database, digest)
 
     def _api_client(self) -> _WorkspaceApi:
-        # Made for each use: the workspace token lasts about an hour, and the one taken up
-        # here is captured again (_driver_registration) or renewed by the SDK. Kept, an
-        # instance's credential rotation, re-provisioning and project GC failed with it.
+        # Made for each use: the ambient PAT lasts about two days, an OAuth token an hour,
+        # and the one taken up here is captured again (_driver_registration) or renewed by
+        # the SDK. Kept, an instance's credential rotation, re-provisioning and project GC
+        # failed with it.
         return _WorkspaceApi(*_workspace_credentials(self._options))
 
     def provision(self) -> dict[str, Any]:

@@ -3869,8 +3869,8 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertEqual(ambient._bootstrap_token, "captured-since")
 
     def test_a_stream_read_starts_the_staging_token_chain_and_keeps_it_fresh(self):
-        # Started while the reader's starting credential is valid (it lasts about an hour)
-        # and refreshed on each stream read: a process first staging after that hour, or a
+        # Started while the reader's starting credential is valid (it lasts about two days)
+        # and refreshed on each stream read: a process first staging after that, or a
         # chain gone unused past a token's lifetime, could mint nothing and staged over FUSE.
         calls = []
 
@@ -4421,7 +4421,7 @@ class LakeflowContractTests(unittest.TestCase):
 
     def test_the_driver_captures_its_workspace_credential_again_once_it_is_old(self):
         # Captured once per update, or once per session outside a pipeline: the ambient
-        # token lasts about an hour, and a process first reaching the control plane after
+        # token lasts about two days, and a process first reaching the control plane after
         # that (a restarted flow, say) was handed the expired one. Also when a connector is
         # pickled for a worker, which asks with no session. A process that was handed the
         # credentials has no capture time, and hands the same on.
@@ -19065,7 +19065,7 @@ class LakeflowContractTests(unittest.TestCase):
 
     def _expired_bootstrap_read(self, transport):
         # A keyless initial read whose very first token mint answers 401: the reader's
-        # starting credential expired, as it does about an hour into an update.
+        # starting credential expired, as it does about two days into an update.
         def _expired_provider(*_a, **_k):
             provider = mock.Mock()
             provider.bearer.side_effect = informix_module.WorkspaceHttpError(

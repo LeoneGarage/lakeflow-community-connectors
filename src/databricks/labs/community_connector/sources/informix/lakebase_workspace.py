@@ -765,8 +765,8 @@ class StagingCredentialProvider:
     # (see revoke_stale_staging_tokens). The minting token never leaves this process: no
     # descriptor carries it, and neither token is written anywhere, a workspace secret
     # included. The first pair is minted with ``bootstrap_token`` -- whatever credential
-    # the reader could carry from the driver (the captured runtime credential), the
-    # latest one a reader gave (take_bootstrap) -- which lasts about an hour; the chain
+    # the reader could carry from the driver (the captured ambient PAT), the latest
+    # one a reader gave (take_bootstrap) -- which lasts about two days; the chain
     # needs no ambient identity after that, however long the reader runs. Refresh is
     # lazy -- checked on each ``bearer()`` call -- so there is no background thread to
     # manage; page writes call ``bearer()`` often enough to refresh well within the
