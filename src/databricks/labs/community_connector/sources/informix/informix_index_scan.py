@@ -721,7 +721,7 @@ class _IndexScanMixin:
                 changed = [event for event in events[key] if event[6] not in relocated]
                 if any(before < event[0] <= after for event in changed):
                     continue
-                _bound, read_before, read_after, staged_at = pages[
+                _bound, _read_before, read_after, staged_at = pages[
                     bisect.bisect_left(bounds, _index_scan_order(key, descending))
                 ]
                 unsure = [event for event in changed if event[0] <= read_after]

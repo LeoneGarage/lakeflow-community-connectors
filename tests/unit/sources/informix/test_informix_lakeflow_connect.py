@@ -3896,6 +3896,36 @@ class LakeflowContractTests(unittest.TestCase):
             fuse._keep_staging_credential()
         transport.assert_not_called()
 
+    def test_metadata_lookups_on_one_connector_take_turns(self):
+        # The capacity bypass is set on options the bridge shares: two lookups at once let
+        # the first one's exit close the second one's session, and the second one's put the
+        # bypass back for good, every later read bypassing connection capacity.
+        connector = self.connector(FakeBridge())
+        inside, release, order = threading.Event(), threading.Event(), []
+
+        def first():
+            with connector._metadata_access():
+                order.append("first in")
+                inside.set()
+                release.wait(5)
+                order.append("first out")
+
+        def second():
+            with connector._metadata_access():
+                order.append("second in")
+
+        threads = [threading.Thread(target=first), threading.Thread(target=second)]
+        threads[0].start()
+        self.assertTrue(inside.wait(5))
+        threads[1].start()
+        threads[1].join(0.2)
+        self.assertTrue(threads[1].is_alive())  # waits for the first lookup
+        release.set()
+        for thread in threads:
+            thread.join(5)
+        self.assertEqual(order, ["first in", "first out", "second in"])
+        self.assertNotIn("_informix.bypass.connection.capacity", connector.options)
+
     def test_a_staging_token_chain_that_could_not_start_is_tried_a_minute_on(self):
         # Left to the stage that needs the transport, which resolves it again; read after
         # read, a failing mint retried its request each time.

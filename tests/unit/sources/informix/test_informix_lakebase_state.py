@@ -2846,6 +2846,23 @@ class LakebaseCredentialCaptureTests(unittest.TestCase):
         self.assertEqual(host, "https://explicit.example")
         self.assertEqual(token, "explicit-token")
 
+    def test_a_host_option_alone_names_the_pipelines_own_workspace(self):
+        # The captured credential is the pipeline identity's: a connection naming another
+        # host without a token of its own was sent it.
+        lakebase_state._CAPTURED_WORKSPACE.update(
+            {"host": "https://ws.example", "token": "captured-token"}
+        )
+        with self.assertRaisesRegex(lakebase_state.LakebaseStateError, "lakebase.workspace.token"):
+            lakebase_state._workspace_credentials(
+                {"lakebase.workspace.host": "https://other.example"}
+            )
+        for same in ("ws.example", "https://WS.example/", "https://ws.example:443"):
+            with self.subTest(host=same):
+                self.assertEqual(
+                    lakebase_state._workspace_credentials({"lakebase.workspace.host": same}),
+                    ("https://ws.example", "captured-token"),
+                )
+
 
 class LakebaseWaiterQueueTests(unittest.TestCase):
     """The fair slot queue with one requester class: per slot, waiters are served by age."""
@@ -3536,6 +3553,48 @@ class WorkspaceApiClientTests(unittest.TestCase):
                 make("http://ws.example.com")
             self.assertEqual(make("https://ws.example.com/")._host, "https://ws.example.com")
 
+    def test_a_client_refuses_a_host_with_more_than_a_host_name(self):
+        # A path, query or fragment became part of every URL built on the host, and
+        # credentials in it went along too.
+        for host in (
+            "https://ws.example/evil",
+            "https://ws.example/evil?",
+            "https://ws.example?x=1",
+            "https://ws.example#f",
+            "https://user:pw@ws.example",
+            "https://",
+            "https://ws.example:notaport",
+        ):
+            with self.subTest(host=host):
+                with self.assertRaisesRegex(lakebase_state.LakebaseStateError, "host name alone"):
+                    lakebase_state._WorkspaceApi(host, "t")
+        api = lakebase_state._WorkspaceApi("https://ws.example:8443", "t")
+        self.assertEqual(api._host, "https://ws.example:8443")
+
+    def test_a_redirect_does_not_carry_the_bearer(self):
+        # urllib follows a redirect and copies the request's headers onto it: the bearer
+        # went wherever the answer pointed.
+        seen = []
+
+        def fake_urlopen(request, timeout=None):
+            seen.append(request)
+            return _FakeHttpResponse(b"{}", status=200)
+
+        provider = mock.Mock()
+        provider.bearer.return_value = "files-bearer"
+        with mock.patch.object(lakebase_state.urllib.request, "urlopen", fake_urlopen):
+            lakebase_state._WorkspaceApi("https://ws.example", "api-token").request(
+                "GET", "/api/2.0/x"
+            )
+            lakebase_state.WorkspaceFilesApi("https://ws.example", provider).get("/Volumes/a/b")
+        handler = lakebase_state.urllib.request.HTTPRedirectHandler()
+        for request, bearer in zip(seen, ("api-token", "files-bearer")):
+            self.assertEqual(request.get_header("Authorization"), f"Bearer {bearer}")
+            moved = handler.redirect_request(
+                request, None, 302, "Found", {}, "https://elsewhere.example/x"
+            )
+            self.assertIsNone(moved.get_header("Authorization"))
+
     def test_an_operation_done_with_a_null_error_succeeded(self):
         api = lakebase_state._WorkspaceApi("https://ws", "t")
         envelope = {"name": "projects/p/operations/1", "done": True, "error": None}
@@ -3558,7 +3617,7 @@ class WorkspaceFilesApiTests(unittest.TestCase):
             captured["url"] = request.full_url
             captured["method"] = request.get_method()
             captured["data"] = request.data
-            captured["auth"] = request.headers.get("Authorization")
+            captured["auth"] = request.get_header("Authorization")
             captured["ctype"] = request.headers.get("Content-type")
             return _FakeHttpResponse(b"")
 
@@ -3620,7 +3679,7 @@ class WorkspaceFilesApiTests(unittest.TestCase):
         calls = []
 
         def fake_urlopen(request, timeout=None):
-            calls.append(request.headers.get("Authorization"))
+            calls.append(request.get_header("Authorization"))
             if outcomes[len(calls) - 1] == "401":
                 raise lakebase_state.urllib.error.HTTPError(
                     request.full_url, 401, "unauthorized", {}, io.BytesIO(b"expired")

@@ -18,8 +18,8 @@
 #     ASF type-13 redirect responder; a genuine IDS/HDR-issued redirect remains
 #     unvalidated.
 #   - GSS, locale discovery, and private-server authentication remain rejected.
-#   - TLS is mandatory because normal authentication sends the password in the
-#     ASC payload. `encrypt=false` explicitly opts into plaintext transport.
+#   - TLS is on by default because normal authentication sends the password in
+#     the ASC payload. `encrypt=false` explicitly opts into plaintext transport.
 #   - TLS uses Python hostname verification and either system CA trust or a PEM
 #     CA file supplied with `ssl.ca.file`. There is no insecure-skip-verify mode.
 #
@@ -432,7 +432,8 @@ connection:
       required: false
       description: >
         SQLI socket read timeout while fetching transactional snapshot pages.
-        Default `300` seconds; minimum `1`.
+        Default `300` seconds; minimum `1`. It only lengthens the connection's
+        socket timeout (30 seconds): a smaller value leaves that in force.
 
     - name: cdc.read.timeout.seconds
       type: string
@@ -441,7 +442,9 @@ connection:
         SQLI socket read timeout for CDC session setup and teardown
         (cdc_opensess/startcapture/activatesess/endcapture/closesess), used when
         validating the initial CDC boundary. Raise it if syscdcv1 teardown stalls
-        under many concurrent CDC sessions. Default `60` seconds.
+        under many concurrent CDC sessions. Default `60` seconds. It only lengthens
+        the connection's socket timeout (30 seconds): a smaller value leaves that in
+        force.
 
     - name: snapshot.mode
       type: string
@@ -1041,7 +1044,7 @@ connection:
         snapshot.incremental.blocking). Setting `0` extends that full-block
         behavior to the stream phase too for
         a continuous flow (maximum chance to claim a slot, no inter-read delay,
-        so higher shared-Volume metadata load under heavy contention). Must be
+        so more load on the Lakebase slot table under heavy contention). Must be
         >= 0. A continuous flow always yields on exhaustion regardless of this
         value, bounded by capacity.retry.max.retries; the value is irrelevant to
         a triggered flow, which always blocks the full wait and raises on
@@ -1063,7 +1066,7 @@ connection:
       type: string
       required: false
       description: >
-        Consecutive reads that find the shared-state Volume's FUSE mount
+        Consecutive reads that find the snapshot staging Volume's FUSE mount
         disconnected (ENOTCONN) before the flow stops yielding empty batches and
         fails. A dropped mount is normally transient and yielding lets the next
         read proceed once it returns, but a mount that never comes back leaves the

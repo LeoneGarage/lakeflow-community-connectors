@@ -1008,7 +1008,7 @@ def _widened(previous: Column, current: Column) -> bool:
     ):
         return False
     old_type, new_type = previous.type_name, current.type_name
-    if old_type == new_type in _WIDENABLE_STRING_TYPES:
+    if old_type == new_type and new_type in _WIDENABLE_STRING_TYPES:
         return _string_capacity(current) >= _string_capacity(previous)
     if old_type in _INTEGER_RANKS and new_type in _INTEGER_RANKS:
         return _INTEGER_RANKS[new_type] > _INTEGER_RANKS[old_type]
@@ -1024,7 +1024,7 @@ def _widened(previous: Column, current: Column) -> bool:
         return _INTEGER_RANKS[old_type] < 3
     if old_type in {"SMALLFLOAT", "REAL"}:
         return new_type in {"FLOAT", "DOUBLE", "DOUBLE PRECISION"}
-    if old_type == new_type in {"DECIMAL", "NUMERIC", "MONEY"}:
+    if old_type == new_type and new_type in {"DECIMAL", "NUMERIC", "MONEY"}:
         scales = (previous.scale, current.scale)
         if None in (previous.precision, current.precision, *scales) or 0xFF in scales:
             return False

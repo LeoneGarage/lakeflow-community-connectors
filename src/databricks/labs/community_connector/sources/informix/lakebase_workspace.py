@@ -147,13 +147,38 @@ def _https_host(host: str) -> str:
     # Docstring: ``host`` for a REST call that carries a bearer token: refused unless HTTPS.
     #
     # lakebase.workspace.host given as http://... sent the workspace token, and the staging
-    # tokens minted with it, in clear text.
+    # tokens minted with it, in clear text. A path, query or fragment (https://h/x?) became
+    # part of every URL built on it, and credentials in it went along too.
 
-    if not host.lower().startswith("https://"):
-        raise LakebaseStateError(
-            f"Workspace host {host!r} must be an https:// URL: it is sent bearer tokens"
+    try:
+        parts = urllib.parse.urlsplit(host.strip())
+        valid = (
+            parts.scheme.lower() == "https"
+            and bool(parts.hostname)
+            and parts.username is None
+            and parts.password is None
+            and parts.path in ("", "/")
+            and not parts.query
+            and not parts.fragment
+            and (parts.port or 443) > 0
         )
-    return host.rstrip("/")
+    except ValueError:
+        valid = False
+    if not valid:
+        raise LakebaseStateError(
+            f"Workspace host {host!r} must be an https:// URL with a host name alone: "
+            "it is sent bearer tokens"
+        )
+    return host.strip().rstrip("/")
+
+
+def _host_key(host: str) -> tuple[str, int]:
+    # Docstring: A workspace host as its lower-case name and port, to tell two apart.
+    try:
+        parts = urllib.parse.urlsplit(host if "://" in host else f"https://{host}")
+        return (parts.hostname or "").lower(), parts.port or 443
+    except ValueError:  # a port that is no number: no host the pipeline's could be
+        return host.lower(), -1
 
 
 class _WorkspaceApi:
@@ -184,14 +209,10 @@ class _WorkspaceApi:
             if remaining is not None and remaining <= 0:
                 raise LakebaseStateError(f"Lakebase provisioning timed out during {method} {path}")
             request = urllib.request.Request(
-                url,
-                data=payload,
-                method=method,
-                headers={
-                    "Authorization": f"Bearer {self._token}",
-                    "Content-Type": "application/json",
-                },
+                url, data=payload, method=method, headers={"Content-Type": "application/json"}
             )
+            # Unredirected: urllib follows a redirect, and copies the other headers onto it.
+            request.add_unredirected_header("Authorization", f"Bearer {self._token}")
             try:
                 timeout = (
                     _API_TIMEOUT_SECONDS
@@ -411,20 +432,18 @@ def _workspace_credentials(options: dict[str, str]) -> tuple[str, str]:
     # the ambient identity. The captured value is what makes this work inside a
     # pipeline at all, because the calling process has no identity of its own.
 
-    host = (
-        options.get("lakebase.workspace.host")
-        or _CAPTURED_WORKSPACE.get("host")
-        or os.environ.get("DATABRICKS_HOST")
-        or ""
-    ).strip()
+    explicit_host = (options.get("lakebase.workspace.host") or "").strip()
+    explicit_token = (options.get("lakebase.workspace.token") or "").strip()
+    if explicit_host and explicit_token:
+        return _normalized_host(explicit_host), explicit_token
+    host = (_CAPTURED_WORKSPACE.get("host") or os.environ.get("DATABRICKS_HOST") or "").strip()
     token = (
-        options.get("lakebase.workspace.token")
+        explicit_token
         or _CAPTURED_WORKSPACE.get("token")
         or os.environ.get("DATABRICKS_TOKEN")
         or ""
     ).strip()
-    if host and not host.lower().startswith("http"):
-        host = f"https://{host}"
+    host = _normalized_host(host) if host else host
     if not host or not token:
         # The SDK resolves notebook/job/serverless credentials that are not
         # exposed as environment variables. Imported lazily so the module keeps
@@ -448,7 +467,20 @@ def _workspace_credentials(options: dict[str, str]) -> tuple[str, str]:
                 "Lakebase state needs a workspace host and a bearer token; set "
                 "lakebase.workspace.host/lakebase.workspace.token"
             )
+        host = _normalized_host(host)
+    if explicit_host and not explicit_token and _host_key(explicit_host) != _host_key(host):
+        # The ambient credential is the pipeline identity's: a host from the connection
+        # alone was sent it, whatever host that named.
+        raise LakebaseStateError(
+            "lakebase.workspace.host names another workspace than the pipeline's; set "
+            "lakebase.workspace.token with it"
+        )
     return host, token
+
+
+def _normalized_host(host: str) -> str:
+    # Docstring: A host option as a URL, ``https://`` added when it names no scheme.
+    return host if host.lower().startswith("http") else f"https://{host}"
 
 
 def _purged_project(
@@ -1014,13 +1046,15 @@ class WorkspaceFilesApi:
                 raise WorkspaceHttpError(
                     f"{method} files {volume_path}: the staging token was rejected", 401
                 ) from error
-            headers = {"Authorization": f"Bearer {bearer}"}
+            headers = {}
             if byte_range is not None:
                 # Inclusive, zero-based per RFC 9110; the Files API answers 206.
                 headers["Range"] = f"bytes={byte_range[0]}-{byte_range[1]}"
             if data is not None:
                 headers["Content-Type"] = "application/octet-stream"
             request = urllib.request.Request(url, data=data, method=method, headers=headers)
+            # Unredirected, so a redirect can't carry the bearer elsewhere (_WorkspaceApi).
+            request.add_unredirected_header("Authorization", f"Bearer {bearer}")
             try:
                 with urllib.request.urlopen(
                     request, timeout=_FILES_API_TIMEOUT_SECONDS

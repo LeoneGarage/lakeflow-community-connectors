@@ -310,18 +310,22 @@ class _ReaderMixin:
         # Registration and reader setup read only metadata. Queued for a slot behind running
         # reads they would stall startup, and a wait that gave up would fail it.
 
-        previous = self.options.get("_informix.bypass.connection.capacity")
-        self.options["_informix.bypass.connection.capacity"] = "true"
-        try:
-            yield
-        finally:
+        # Under the metadata lock, re-entrant: the flag is set on options the bridge shares,
+        # and two lookups at once let the first one's exit close the second one's session
+        # and the second one's put the flag back for good, every later read bypassing.
+        with self._metadata_session_lock:
+            previous = self.options.get("_informix.bypass.connection.capacity")
+            self.options["_informix.bypass.connection.capacity"] = "true"
             try:
-                self._release_worker_connection()
+                yield
             finally:
-                if previous is None:
-                    self.options.pop("_informix.bypass.connection.capacity", None)
-                else:
-                    self.options["_informix.bypass.connection.capacity"] = previous
+                try:
+                    self._release_worker_connection()
+                finally:
+                    if previous is None:
+                        self.options.pop("_informix.bypass.connection.capacity", None)
+                    else:
+                        self.options["_informix.bypass.connection.capacity"] = previous
 
     def list_tables(self) -> list[str]:
         with self._metadata_access():
