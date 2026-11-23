@@ -196,12 +196,17 @@ class _StagingMixin:
         table: Table,
         pipeline_scope: str,
         schema_id: str,
-        snapshot_lsn: int,
+        snapshot_lsn: int | str,
         page_index: int,
         rows: list[dict[str, Any]],
-        lower_pk: list[Any] | None,
+        lower_pk: list[Any] | str | None,
     ) -> Any:
         # Docstring: Stage one page; returns the encoded upper_pk its header records.
+        #
+        # ``snapshot_lsn`` names the run the page is in: a snapshot's LSN, or a CDC spill's
+        # run id (a string). ``lower_pk`` is the key the page starts after, or for a chunk
+        # of an incremental copy the chunk's metadata as JSON, which _copy_chunk reads
+        # back when it replays the chunk.
 
         namespace = os.path.join(
             self._snapshot_stage_namespace(table, pipeline_scope, schema_id),

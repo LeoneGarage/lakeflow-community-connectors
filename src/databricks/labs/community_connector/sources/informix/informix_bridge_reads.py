@@ -1030,8 +1030,6 @@ class _BridgeReadMixin:
         # captured here and replayed by CDC -- harmless for a keyed table (the sink
         # de-duplicates), a duplicate-row risk for a key-less one.
 
-        self._ensure_connected()
-
         # Informix SQLI does not expose parameter binding, so keyset pagination
         # must render continuation values as SQL literals. Some valid partial
         # DATETIME values are rejected when parsed back by Informix (-1263), a float

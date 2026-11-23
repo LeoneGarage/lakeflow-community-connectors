@@ -406,7 +406,7 @@ class _ReaderMixin:
         # A table's whole-number options failed only when the stream first read them.
         for name, default, minimum, maximum in _TABLE_INT_OPTIONS:
             self._table_int_option(table_options, name, default, minimum=minimum, maximum=maximum)
-        with self._metadata_session_lock, self._metadata_access():
+        with self._metadata_access():
             table = self._registration_table(table_name, table_options)
             _ensure_materializable(table, self._with_connection_scan(table_options))
             # The pipeline reads every table's metadata through this one connector. Two of

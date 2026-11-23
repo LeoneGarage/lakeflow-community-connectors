@@ -370,9 +370,10 @@ class _IndexScanMixin:
                     # A change the key's last read may have held, handed over only now:
                     # the key was settled without it. One the source's clock puts after
                     # that read is the stream's.
-                    position, clock = settled[key]
+                    position, settled_at = settled[key]
                     if any(
-                        event[0] <= position and not (clock and event[5] and event[5] > clock)
+                        event[0] <= position
+                        and not (settled_at and event[5] and event[5] > settled_at)
                         for event in changed
                     ):
                         # 436: The index-ordered snapshot cannot tell

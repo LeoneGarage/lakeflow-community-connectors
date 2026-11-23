@@ -17061,8 +17061,6 @@ def register_lakeflow_source(spark):
             # captured here and replayed by CDC -- harmless for a keyed table (the sink
             # de-duplicates), a duplicate-row risk for a key-less one.
 
-            self._ensure_connected()
-
             # Informix SQLI does not expose parameter binding, so keyset pagination
             # must render continuation values as SQL literals. Some valid partial
             # DATETIME values are rejected when parsed back by Informix (-1263), a float
@@ -19434,9 +19432,10 @@ def register_lakeflow_source(spark):
                         # A change the key's last read may have held, handed over only now:
                         # the key was settled without it. One the source's clock puts after
                         # that read is the stream's.
-                        position, clock = settled[key]
+                        position, settled_at = settled[key]
                         if any(
-                            event[0] <= position and not (clock and event[5] and event[5] > clock)
+                            event[0] <= position
+                            and not (settled_at and event[5] and event[5] > settled_at)
                             for event in changed
                         ):
                             # 436: The index-ordered snapshot cannot tell
@@ -27566,7 +27565,7 @@ def register_lakeflow_source(spark):
             # A table's whole-number options failed only when the stream first read them.
             for name, default, minimum, maximum in _TABLE_INT_OPTIONS:
                 self._table_int_option(table_options, name, default, minimum=minimum, maximum=maximum)
-            with self._metadata_session_lock, self._metadata_access():
+            with self._metadata_access():
                 table = self._registration_table(table_name, table_options)
                 _ensure_materializable(table, self._with_connection_scan(table_options))
                 # The pipeline reads every table's metadata through this one connector. Two of
@@ -30036,12 +30035,17 @@ def register_lakeflow_source(spark):
             table: Table,
             pipeline_scope: str,
             schema_id: str,
-            snapshot_lsn: int,
+            snapshot_lsn: int | str,
             page_index: int,
             rows: list[dict[str, Any]],
-            lower_pk: list[Any] | None,
+            lower_pk: list[Any] | str | None,
         ) -> Any:
             # Docstring: Stage one page; returns the encoded upper_pk its header records.
+            #
+            # ``snapshot_lsn`` names the run the page is in: a snapshot's LSN, or a CDC spill's
+            # run id (a string). ``lower_pk`` is the key the page starts after, or for a chunk
+            # of an incremental copy the chunk's metadata as JSON, which _copy_chunk reads
+            # back when it replays the chunk.
 
             namespace = os.path.join(
                 self._snapshot_stage_namespace(table, pipeline_scope, schema_id),
