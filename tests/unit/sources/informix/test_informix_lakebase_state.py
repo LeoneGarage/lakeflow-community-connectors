@@ -10,7 +10,7 @@ those are exactly what these tests exercise.
 Every behaviour asserted here was first confirmed against a live Lakebase
 endpoint; this module is the offline guard that keeps it from regressing.
 
-Importing ``lakeflow_test`` first installs that module's PySpark stubs, which the
+Importing ``test_informix_lakeflow_connect`` first installs that module's PySpark stubs, which the
 connector's imports require and which there is no reason to duplicate.
 """
 
@@ -28,10 +28,9 @@ import types
 import unittest
 from unittest import mock
 
+import informix_modules
 from databricks.labs.community_connector.sources.informix import lakebase_state
-from databricks.labs.community_connector.sources.informix import (  # noqa: F401
-    lakeflow_test as _pyspark_stubs,
-)
+import test_informix_lakeflow_connect as _pyspark_stubs  # noqa: F401
 
 
 class _FakeCursor:
@@ -1697,39 +1696,45 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         state = lakebase_state.LakebaseState({"lakebase.project.id": "shared-project"}, "identity")
         state._api_client = mock.Mock(side_effect=AssertionError("must not list projects"))
 
-        self.assertEqual(state.collect_unused_projects(90, 24), 0)
+        self.assertEqual(len(lakebase_state.unused_projects(state, 90, delete=True)), 0)
 
-    def test_a_project_listing_that_fails_skips_the_sweep(self):
-        # The sweep runs on the read path a day apart; by then the reader's workspace token
-        # may have expired, and a failed listing must skip the sweep, not fail the read.
-        lakebase_state.LakebaseState._project_gc_checked.clear()
+    def test_a_project_listing_that_fails_fails_the_sweep(self):
+        # Run by the cleanup tool, which says so, rather than skipped as on a reader's path.
         state = lakebase_state.LakebaseState({}, "current")
         api = mock.MagicMock()
         api.request.side_effect = RuntimeError("401 Unauthorized")
         state._api_client = mock.Mock(return_value=api)
 
-        with self.assertLogs(lakebase_state.__name__, "WARNING"):
-            self.assertEqual(state.collect_unused_projects(90, 24), 0)
+        with self.assertRaisesRegex(RuntimeError, "401"):
+            lakebase_state.unused_projects(state, 90, delete=True)
 
-    def test_a_claim_won_just_short_of_the_interval_still_looks_for_projects(self):
-        # The caller's Lakebase claim spaces runs an interval apart. At a whole interval by
-        # this process's clock too, a claim won a few milliseconds short of it was spent
-        # with no run; half an interval still keeps another connection from repeating one.
-        lakebase_state.LakebaseState._project_gc_checked.clear()
+    def test_a_dry_run_names_an_inactive_project_and_deletes_none(self):
+        # The cleanup tool lists first: the same checks, no DELETE.
         state = lakebase_state.LakebaseState({}, "current")
         api = mock.MagicMock()
-        api.request.return_value = {"projects": []}
+        api.request.side_effect = [{"projects": [{"name": "projects/informix-state-old"}]}]
         state._api_client = mock.Mock(return_value=api)
-        looked = []
-        for now in (1000.0, 1000.0 + 60, 1000.0 + 24 * 3600 - 0.005):
-            with mock.patch.object(lakebase_state.time, "monotonic", return_value=now):
-                before = api.request.call_count
-                state.collect_unused_projects(90, 24)
-                looked.append(api.request.call_count > before)
-        self.assertEqual(looked, [True, False, True])
+        connection = mock.MagicMock()
+        _answer_sweep_queries(connection.cursor.return_value.__enter__.return_value)
+        state._open = mock.Mock(return_value=connection)
+        state._admin_user = mock.Mock(return_value="admin")
+
+        with (
+            mock.patch.object(
+                lakebase_state,
+                "_endpoint_facts",
+                return_value={"endpoint": "endpoint", "host": "host"},
+            ),
+            mock.patch.object(lakebase_state, "generate_credential", return_value="token"),
+            mock.patch.object(lakebase_state.time, "time", return_value=100_000_000),
+        ):
+            found = lakebase_state.unused_projects(state, 90)
+
+        self.assertEqual(found, ["informix-state-old"])
+        self.assertEqual(api.request.call_count, 1)
+        api.await_operation.assert_not_called()
 
     def test_owned_inactive_project_is_deleted_after_retention(self):
-        lakebase_state.LakebaseState._project_gc_checked.clear()
         state = lakebase_state.LakebaseState({}, "current")
         api = mock.MagicMock()
         api.request.side_effect = [
@@ -1752,7 +1757,7 @@ class LakebaseProjectNamingTests(unittest.TestCase):
             mock.patch.object(lakebase_state, "generate_credential", return_value="token"),
             mock.patch.object(lakebase_state.time, "time", return_value=100_000_000),
         ):
-            deleted = state.collect_unused_projects(90, 24)
+            deleted = len(lakebase_state.unused_projects(state, 90, delete=True))
 
         self.assertEqual(deleted, 1)
         api.request.assert_any_call("DELETE", "/api/2.0/postgres/projects/informix-state-old")
@@ -1761,7 +1766,6 @@ class LakebaseProjectNamingTests(unittest.TestCase):
     def test_a_project_still_being_deleted_past_the_wait_is_forgotten_by_the_process(self):
         # The delete goes on at the server after the minute it is given: the process kept
         # the endpoint it had provisioned in that project, and its later connects failed.
-        lakebase_state.LakebaseState._project_gc_checked.clear()
         state = lakebase_state.LakebaseState({}, "current")
         api = mock.MagicMock()
         api.request.side_effect = [
@@ -1787,7 +1791,7 @@ class LakebaseProjectNamingTests(unittest.TestCase):
             mock.patch.object(lakebase_state, "generate_credential", return_value="token"),
             mock.patch.object(lakebase_state.time, "time", return_value=100_000_000),
         ):
-            self.assertEqual(state.collect_unused_projects(90, 24), 1)
+            self.assertEqual(len(lakebase_state.unused_projects(state, 90, delete=True)), 1)
 
         self.assertNotIn(key, lakebase_state.LakebaseState._provisioned)
 
@@ -1811,7 +1815,6 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         # Provisioning connects with lakebase.admin_password where one is set; the sweep
         # minted an OAuth token instead and gave it as that role's password, so where
         # no token can be minted, or the role takes a password, it never deleted one.
-        lakebase_state.LakebaseState._project_gc_checked.clear()
         state = lakebase_state.LakebaseState({"lakebase.admin_password": "secret"}, "current")
         api = mock.MagicMock()
         api.request.side_effect = [
@@ -1835,7 +1838,7 @@ class LakebaseProjectNamingTests(unittest.TestCase):
             ),
             mock.patch.object(lakebase_state.time, "time", return_value=100_000_000),
         ):
-            deleted = state.collect_unused_projects(90, 24)
+            deleted = len(lakebase_state.unused_projects(state, 90, delete=True))
 
         self.assertEqual(deleted, 1)
         self.assertEqual({call.args[2] for call in state._open.call_args_list}, {"secret"})
@@ -1845,7 +1848,6 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         # kept on the default database was never swept; one in neither is left alone.
         for databases, deleted in (({"custom": False, "databricks_postgres": True}, 1), ({}, 0)):
             with self.subTest(databases=databases):
-                lakebase_state.LakebaseState._project_gc_checked.clear()
                 state = lakebase_state.LakebaseState({"lakebase.database": "custom"}, "current")
                 api = mock.MagicMock()
                 api.request.side_effect = [
@@ -1878,7 +1880,9 @@ class LakebaseProjectNamingTests(unittest.TestCase):
                     mock.patch.object(lakebase_state, "generate_credential", return_value="token"),
                     mock.patch.object(lakebase_state.time, "time", return_value=100_000_000),
                 ):
-                    self.assertEqual(state.collect_unused_projects(90, 24), deleted)
+                    self.assertEqual(
+                        len(lakebase_state.unused_projects(state, 90, delete=True)), deleted
+                    )
                 self.assertEqual(opened, ["custom", "databricks_postgres"])
 
     def test_a_project_without_connector_state_is_left_quietly(self):
@@ -1897,7 +1901,9 @@ class LakebaseProjectNamingTests(unittest.TestCase):
             return clean
 
         state._open = open_database
-        self.assertEqual(state._open_state_database({"host": "h"}, "token"), (None, None))
+        self.assertEqual(
+            lakebase_state._open_state_database(state, {"host": "h"}, "token"), (None, None)
+        )
         clean.close.assert_called_once()
 
         dropped = mock.MagicMock()
@@ -1905,7 +1911,7 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         dropped.rollback.side_effect = OSError("gone")
         state._open = mock.Mock(return_value=dropped)
         with self.assertRaises(OSError):
-            state._state_database({"host": "h"}, "token", "databricks_postgres")
+            lakebase_state._state_database(state, {"host": "h"}, "token", "databricks_postgres")
         dropped.close.assert_called_once()
 
     def test_a_project_another_of_whose_databases_holds_state_is_kept(self):
@@ -1919,7 +1925,6 @@ class LakebaseProjectNamingTests(unittest.TestCase):
             ({"custom": None}, 0),
         ):
             with self.subTest(others=others):
-                lakebase_state.LakebaseState._project_gc_checked.clear()
                 state = lakebase_state.LakebaseState({}, "current")
                 api = mock.MagicMock()
                 api.request.side_effect = [
@@ -1956,7 +1961,9 @@ class LakebaseProjectNamingTests(unittest.TestCase):
                     mock.patch.object(lakebase_state, "generate_credential", return_value="token"),
                     mock.patch.object(lakebase_state.time, "time", return_value=100_000_000),
                 ):
-                    self.assertEqual(state.collect_unused_projects(90, 24), deleted)
+                    self.assertEqual(
+                        len(lakebase_state.unused_projects(state, 90, delete=True)), deleted
+                    )
                 self.assertEqual(opened[0], "databricks_postgres")
                 self.assertEqual(
                     mock.call("DELETE", "/api/2.0/postgres/projects/informix-state-old")
@@ -1977,7 +1984,6 @@ class LakebaseProjectNamingTests(unittest.TestCase):
             (False, False, False, False, True),
         ):
             with self.subTest(recent=recent):
-                lakebase_state.LakebaseState._project_gc_checked.clear()
                 state = lakebase_state.LakebaseState({}, "current")
                 api = mock.MagicMock()
                 api.request.side_effect = [{"projects": [{"name": "projects/informix-state-old"}]}]
@@ -1995,7 +2001,7 @@ class LakebaseProjectNamingTests(unittest.TestCase):
                     mock.patch.object(lakebase_state, "generate_credential", return_value="token"),
                     mock.patch.object(lakebase_state.time, "time", return_value=100_000_000),
                 ):
-                    self.assertEqual(state.collect_unused_projects(90, 24), 0)
+                    self.assertEqual(len(lakebase_state.unused_projects(state, 90, delete=True)), 0)
                 self.assertNotIn(
                     mock.call("DELETE", "/api/2.0/postgres/projects/informix-state-old"),
                     api.request.call_args_list,
@@ -2005,7 +2011,6 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         # The listing comes in pages, and the records belong to the state role: the
         # provisioning identity takes that role to read them, granting it to itself first
         # where it must.
-        lakebase_state.LakebaseState._project_gc_checked.clear()
         state = lakebase_state.LakebaseState({}, "current")
         api = mock.MagicMock()
         api.request.side_effect = [
@@ -2036,7 +2041,7 @@ class LakebaseProjectNamingTests(unittest.TestCase):
             mock.patch.object(lakebase_state, "generate_credential", return_value="token"),
             mock.patch.object(lakebase_state.time, "time", return_value=100_000_000),
         ):
-            self.assertEqual(state.collect_unused_projects(90, 24), 1)
+            self.assertEqual(len(lakebase_state.unused_projects(state, 90, delete=True)), 1)
         self.assertEqual(
             [call.args[:2] for call in api.request.call_args_list[:2]],
             [
@@ -2061,7 +2066,6 @@ class LakebaseProjectNamingTests(unittest.TestCase):
         # Another identity's project: neither taking the state role nor granting it works.
         # Its state is then not read as some other role, which would fail with a warning
         # on every sweep, and nothing is deleted.
-        lakebase_state.LakebaseState._project_gc_checked.clear()
         state = lakebase_state.LakebaseState({}, "current")
         api = mock.MagicMock()
         api.request.side_effect = [{"projects": [{"name": "projects/informix-state-other"}]}]
@@ -2078,9 +2082,9 @@ class LakebaseProjectNamingTests(unittest.TestCase):
                 return_value={"endpoint": "endpoint", "host": "host"},
             ),
             mock.patch.object(lakebase_state, "generate_credential", return_value="token"),
-            self.assertNoLogs(lakebase_state.__name__, level="WARNING"),
+            self.assertNoLogs(informix_modules.LOGGER, level="WARNING"),
         ):
-            self.assertEqual(state.collect_unused_projects(90, 24), 0)
+            self.assertEqual(len(lakebase_state.unused_projects(state, 90, delete=True)), 0)
         statements = [call.args[0] for call in cursor.execute.call_args_list]
         # The catalog probe for the state's table aside, which reads no record.
         self.assertFalse(
@@ -2093,7 +2097,6 @@ class LakebaseProjectNamingTests(unittest.TestCase):
     def test_a_deleted_project_is_skipped_and_a_failed_delete_does_not_fail_the_read(self):
         # A deleted project lingers in the list with no endpoint; waiting for one would block
         # the read that runs the GC. A delete that fails is skipped like any other candidate.
-        lakebase_state.LakebaseState._project_gc_checked.clear()
         state = lakebase_state.LakebaseState({}, "current")
         api = mock.MagicMock()
         api.request.side_effect = [
@@ -2120,9 +2123,9 @@ class LakebaseProjectNamingTests(unittest.TestCase):
             ) as facts,
             mock.patch.object(lakebase_state, "generate_credential", return_value="token"),
             mock.patch.object(lakebase_state.time, "time", return_value=100_000_000),
-            self.assertLogs(lakebase_state.__name__, level="WARNING"),
+            self.assertLogs(informix_modules.LOGGER, level="WARNING"),
         ):
-            deleted = state.collect_unused_projects(90, 24)
+            deleted = len(lakebase_state.unused_projects(state, 90, delete=True))
 
         self.assertEqual(deleted, 0)
         self.assertEqual([call.args[1] for call in facts.call_args_list], ["informix-state-old"])
@@ -3133,11 +3136,16 @@ class _StagingTokenApi:
         self.scopes: list[str] = []
         self._next_id = 0
         self.create_error: int | None = None
+        # Credentials that have expired or been revoked: a mint through one gets a 401.
+        self.dead_credentials: set[str] = set()
         self.list_error = False
         # Set by the test's _WorkspaceApi factory to the bearer token this client
         # was built with, so create-token calls can be attributed to a credential.
         self.auth_token: str | None = None
         self.create_tokens: list[str | None] = []
+        # The credential each minting token was minted with, and their count.
+        self.minter_tokens: list[str | None] = []
+        self._next_minter = 0
         # The lifetime the workspace grants, as token_info creation/expiry times; None
         # leaves them out, as a response may.
         self.granted_seconds: int | None = None
@@ -3145,14 +3153,23 @@ class _StagingTokenApi:
     def request(self, method, path, body=None, tolerate_missing=False):
         self.calls.append((method, path, body))
         if path == "/api/2.0/token/create":
-            self.create_tokens.append(self.auth_token)
             if self.create_error is not None:
                 raise lakebase_state.WorkspaceHttpError("nope", self.create_error)
-            self._next_id += 1
-            info = {"token_id": f"tid-{self._next_id}"}
+            if self.auth_token in self.dead_credentials:
+                raise lakebase_state.WorkspaceHttpError("expired", 401)
+            info = {}
             if self.granted_seconds is not None:
                 info["creation_time"] = 1_700_000_000_000
                 info["expiry_time"] = 1_700_000_000_000 + self.granted_seconds * 1000
+            if (body or {}).get("scopes") == ["authentication"]:
+                # A provider's minting token, numbered apart from the bearers.
+                self.minter_tokens.append(self.auth_token)
+                self._next_minter += 1
+                info["token_id"] = f"mid-{self._next_minter}"
+                return {"token_value": f"mint-{self._next_minter}", "token_info": info}
+            self.create_tokens.append(self.auth_token)
+            self._next_id += 1
+            info["token_id"] = f"tid-{self._next_id}"
             return {"token_value": f"dapi-{self._next_id}", "token_info": info}
         if path == "/api/2.0/token/list":
             if self.list_error:
@@ -3181,6 +3198,8 @@ class StagingTokenTests(unittest.TestCase):
         self.assertEqual((method, path), ("POST", "/api/2.0/token/create"))
         self.assertEqual(body["comment"], "informix-snapshot-staging:pipe-1")
         self.assertEqual(body["lifetime_seconds"], 86400)
+        # The File Management APIs alone: leaked, it calls no other workspace API.
+        self.assertEqual(body["scopes"], ["files"])
 
     def test_mint_maps_forbidden_to_unavailable(self):
         for code in (400, 403):
@@ -3270,7 +3289,10 @@ class StagingCredentialProviderTests(unittest.TestCase):
         # The very first mint authenticates with the carried bootstrap credential.
         self.assertEqual(used[0], "bootstrap-token")
 
-    def test_refresh_at_half_life_uses_the_current_token(self):
+    def test_refresh_at_half_life_mints_through_the_minting_token(self):
+        # The bearer has only the files scope, which can't mint its successor or revoke a
+        # token. The bootstrap credential mints the first minting token; each minting
+        # token mints its bearer and its own successor, and the bootstrap isn't used again.
         api = _StagingTokenApi()
         now = {"t": 0.0}
         provider, used = self._provider(api, clock=lambda: now["t"], lifetime_seconds=1000)
@@ -3278,10 +3300,32 @@ class StagingCredentialProviderTests(unittest.TestCase):
         now["t"] = 400.0  # below half-life: no refresh
         self.assertEqual(provider.bearer(), "dapi-1")
         now["t"] = 500.0  # at half-life: refresh
+        provider.take_bootstrap("bootstrap-later")
         self.assertEqual(provider.bearer(), "dapi-2")
-        # The first mint used the bootstrap credential; the refresh mint used the
-        # previous minted token, so no ambient identity is needed after startup.
-        self.assertEqual(api.create_tokens, ["bootstrap-token", "dapi-1"])
+        self.assertEqual(api.minter_tokens, ["bootstrap-token", "mint-1"])
+        self.assertEqual(api.create_tokens, ["mint-1", "mint-2"])
+        self.assertNotIn("bootstrap-later", used)
+
+    def test_the_chain_outlives_the_bootstrap_credential(self):
+        # The captured credential lasts about an hour; a reader running for days keeps
+        # minting its bearers through the minting tokens, and stays on REST.
+        api = _StagingTokenApi()
+        now = {"t": 0.0}
+        provider, _ = self._provider(api, clock=lambda: now["t"], lifetime_seconds=1000)
+        self.assertEqual(provider.bearer(), "dapi-1")
+        api.dead_credentials.add("bootstrap-token")
+        for rotation in range(1, 201):
+            now["t"] = 500.0 * rotation
+            self.assertEqual(provider.bearer(), f"dapi-{rotation + 1}")
+        self.assertFalse(provider.rejected)
+        self.assertEqual(api.minter_tokens.count("bootstrap-token"), 1)
+        # Each minting token went as soon as its successor was minted; none is left
+        # but the one in use.
+        revoked = {token for token in api.deleted if token.startswith("mid-")}
+        self.assertEqual(revoked, {f"mid-{n}" for n in range(1, 201)})
+        # A rejected bearer is replaced through the chain too.
+        self.assertEqual(provider.refresh("dapi-201"), "dapi-202")
+        self.assertFalse(provider.rejected)
 
     def test_refresh_follows_a_shorter_granted_lifetime(self):
         # Scheduled from the requested 86400 s, the refresh would come 11 hours after a
@@ -3296,17 +3340,30 @@ class StagingCredentialProviderTests(unittest.TestCase):
         now["t"] = 1800.0
         self.assertEqual(provider.bearer(), "dapi-2")
 
-    def test_a_rejected_token_is_replaced_from_the_bootstrap_credential(self):
+    def test_a_rejected_token_is_replaced_through_the_minting_token(self):
         api = _StagingTokenApi()
         provider, _ = self._provider(api, clock=lambda: 0.0)
         self.assertEqual(provider.bearer(), "dapi-1")
 
         self.assertEqual(provider.refresh("dapi-1"), "dapi-2")
-        # A rejected token can't mint its successor.
-        self.assertEqual(api.create_tokens, ["bootstrap-token", "bootstrap-token"])
+        # A rejected bearer couldn't mint its successor even if it were valid.
+        self.assertEqual(api.minter_tokens, ["bootstrap-token", "mint-1"])
+        self.assertEqual(api.create_tokens, ["mint-1", "mint-2"])
         # Another thread's rejection of the token already replaced mints nothing more.
         self.assertEqual(provider.refresh("dapi-1"), "dapi-2")
         self.assertEqual(len(api.create_tokens), 2)
+
+    def test_a_revoked_minting_token_falls_back_to_the_bootstrap_credential(self):
+        api = _StagingTokenApi()
+        provider, _ = self._provider(api, clock=lambda: 0.0)
+        self.assertEqual(provider.bearer(), "dapi-1")
+        api.dead_credentials.add("mint-1")  # revoked under the reader
+        provider.take_bootstrap("bootstrap-later")
+
+        self.assertEqual(provider.refresh("dapi-1"), "dapi-2")
+        self.assertEqual(api.minter_tokens, ["bootstrap-token", "bootstrap-later"])
+        self.assertEqual(api.create_tokens, ["mint-1", "mint-2"])
+        self.assertFalse(provider.rejected)
 
     def test_a_token_nothing_can_replace_is_dropped_and_reported(self):
         # The starting credential lasts about an hour; after that a rejected token can't
@@ -3348,7 +3405,7 @@ class StagingCredentialProviderTests(unittest.TestCase):
             return sum(1 for _, path, _ in api.calls if path == "/api/2.0/token/create")
 
         now["t"] = 600.0
-        with self.assertLogs(lakebase_state.__name__, "WARNING"):
+        with self.assertLogs(informix_modules.LOGGER, "WARNING"):
             provider.bearer()
         tried = creates()
         for step in range(5):
@@ -3426,11 +3483,12 @@ class StagingCredentialProviderTests(unittest.TestCase):
         ]
         now["t"] = 500.0
         self.assertEqual(provider.bearer(), "dapi-2")
-        # Kept for one more rotation: split descriptors carried it to executors.
-        self.assertEqual(api.deleted, [])
+        # The bearer is kept for one more rotation: split descriptors carried it to
+        # executors. The minting token it replaced goes at once: none carried that.
+        self.assertEqual(api.deleted, ["mid-1"])
         now["t"] = 1000.0
         self.assertEqual(provider.bearer(), "dapi-3")
-        self.assertEqual(api.deleted, ["tid-1"])
+        self.assertEqual(api.deleted, ["mid-1", "tid-1", "mid-2"])
 
     def test_a_rejected_token_is_revoked_at_once(self):
         api = _StagingTokenApi()
@@ -3439,7 +3497,7 @@ class StagingCredentialProviderTests(unittest.TestCase):
 
         self.assertEqual(provider.refresh(first), "dapi-2")
 
-        self.assertEqual(api.deleted, ["tid-1"])
+        self.assertEqual(api.deleted, ["tid-1", "mid-1"])
 
 
 class _FakeHttpResponse:

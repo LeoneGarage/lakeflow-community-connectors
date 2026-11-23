@@ -12,7 +12,6 @@ from decimal import Decimal
 from unittest.mock import Mock, patch
 
 import databricks.labs.community_connector.sources.informix.sqli as _sqli
-
 from databricks.labs.community_connector.sources.informix.cdc_protocol import (
     CdcFrameParser,
     CdcProtocolError,
@@ -29,7 +28,6 @@ from databricks.labs.community_connector.sources.informix.cdc_protocol import (
 )
 from databricks.labs.community_connector.sources.informix.sqli import (
     SQ_EOT,
-    datetime_order_preserving_cast,
     SQ_EXIT,
     ConnectionState,
     InformixDatetimeLiteral,
@@ -49,6 +47,7 @@ from databricks.labs.community_connector.sources.informix.sqli import (
     _decode_result_value,
     _fixed_result_size,
     _statement_keyword,
+    datetime_order_preserving_cast,
     decode_asc_accept,
     encode_asc_char,
     encode_asc_environment,

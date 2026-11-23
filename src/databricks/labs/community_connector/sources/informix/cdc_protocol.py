@@ -322,6 +322,7 @@ def decode_value(
     return apply_null_byte(value, null_byte), consumed
 
 
+# pylint: disable-next=too-many-branches,too-many-statements
 def _decode_value_bytes(data: memoryview, column: ColumnDescriptor) -> tuple[Any, int]:
     kind = column.type_name.upper().split("(", 1)[0].strip()
     if kind in {"SMALLINT", "INT2"}:

@@ -4,11 +4,15 @@ import copyreg
 import logging
 
 from databricks.labs.community_connector.sources.informix.informix import (
-    _INFORMIX_REGISTRATION_CONTEXT,
     InformixLakeflowConnect,
+)
+from databricks.labs.community_connector.sources.informix.informix_options import (
+    _m,
+)
+from databricks.labs.community_connector.sources.informix.informix_registration import (
+    _INFORMIX_REGISTRATION_CONTEXT,
     _driver_registration,
     _install_registration,
-    _m,
     _replay_reader_range,
 )
 from databricks.labs.community_connector.sparkpds import LakeflowSource

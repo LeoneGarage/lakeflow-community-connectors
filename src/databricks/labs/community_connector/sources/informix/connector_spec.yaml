@@ -395,8 +395,8 @@ connection:
         disconnects that recur under sustained write frequency; it requires the workspace
         to allow personal-access-token creation for the pipeline's identity. `auto` (the
         default) uses `rest` when a token can be minted and falls back to `fuse` when the
-        workspace forbids token creation or the reader's starting credential has expired
-        (it lasts about an hour, and each reader mints its first token from it). Page
+        workspace forbids token creation, or when nothing can mint one (the token API
+        failing until the reader's tokens and starting credential have expired). Page
         *writes* and `snapshot.source` (`.unl`) reads use this transport; page reads and
         cleanup use the mount. One of `auto`, `rest`, `fuse`.
 
@@ -404,11 +404,15 @@ connection:
       type: string
       required: false
       description: >
-        Lifetime of the personal access token minted for the `rest`/`auto` staging
-        transport. The token is refreshed at half this value by the current token
-        minting its successor, so a long-running pipeline never lets it expire, and each
-        token is short-lived at rest. Default `86400` (24h); minimum `600`. Clamped to
-        the workspace's maximum-token-lifetime policy.
+        Lifetime of the personal access tokens the `rest`/`auto` staging transport
+        mints. Each reader process holds a bearer scoped to the File Management APIs,
+        which Files API calls send and split descriptors carry to executors, and a
+        minting token scoped to token management (`authentication`), kept in the
+        process's memory, which mints the next pair. The first pair is minted at the
+        reader's first stream read, from its starting credential (that lasts about an
+        hour), and later reads refresh the pair at half this value, so a reader stays on
+        REST however long it runs. Default `14400` (4h); minimum `600`. Clamped to the
+        workspace's maximum-token-lifetime policy.
 
     - name: snapshot.staging.pipeline
       type: string
@@ -946,17 +950,9 @@ connection:
       type: string
       required: false
       description: >
-        Whether to also drop Lakebase projects that no pipeline has used within
-        `state.gc.project.retention.days`. Accepts `true` or `false`; default
-        `false`.
-
-    - name: state.gc.project.retention.days
-      type: string
-      required: false
-      description: >
-        Age in days after which an unused Lakebase project becomes eligible for
-        removal when `state.gc.drop.unused.projects` is `true`. Default `90`;
-        must be greater than or equal to `state.gc.retention.days`.
+        No longer supported: set to `true`, the connection fails. Unused Lakebase
+        projects are found and deleted by the Lakebase project cleanup tool (see the
+        README) instead. Accepts `true` or `false`; default `false`.
 
     - name: connection.wait.timeout.seconds
       type: string

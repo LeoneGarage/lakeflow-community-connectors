@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import os
 import re
 import subprocess
 import sys
@@ -19,15 +20,10 @@ import time
 from typing import Any
 
 sys.path.insert(0, "src")
-try:
-    # Repo checkout / local dev: the connector package is importable.
-    from databricks.labs.community_connector.sources.informix import (  # noqa: E402
-        compare_live_data_test_tool as C,
-    )
-except ModuleNotFoundError:
-    # Serverless job / standalone: compare_live_data_test_tool.py is staged next
-    # to this file (it has no databricks.labs dependency of its own).
-    import compare_live_data_test_tool as C  # noqa: E402
+# compare_live_data_test_tool.py sits next to this file, here and where the serverless job
+# stages both (it has no databricks.labs dependency of its own).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import compare_live_data_test_tool as C  # noqa: E402
 
 TABLES = [
     "archivefulfillment",

@@ -67,8 +67,8 @@ table, and the probe recreates its tables as the phase found them.
 
 Usage (from the repo root, with the repo virtualenv):
 
-    .venv/bin/python src/databricks/labs/community_connector/sources/informix/tests/\
-keyless_star_probe_test_tool.py [--warehouse-id <id>] [--start-phase N] [--end-phase N] \
+    .venv/bin/python tests/unit/sources/informix/tools/keyless_star_probe_test_tool.py \
+[--warehouse-id <id>] [--start-phase N] [--end-phase N] \
 [--keep] [--report out.json]
 
 Without ``--warehouse-id`` it uses the workspace's only SQL warehouse, or its Serverless
@@ -100,7 +100,8 @@ import tempfile
 import time
 from typing import Any, Callable
 
-REPO_SRC = pathlib.Path(__file__).resolve().parents[6]
+# tests/unit/sources/informix/tools/ -> the repo's src/
+REPO_SRC = pathlib.Path(__file__).resolve().parents[5] / "src"
 sys.path.insert(0, str(REPO_SRC))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
