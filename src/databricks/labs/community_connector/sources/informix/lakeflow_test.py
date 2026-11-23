@@ -894,6 +894,61 @@ class _LaggingIndexScanSource(_IndexScanSource):
         return records
 
 
+class _OwnKeyIndexScanSource(_IndexScanSource):
+    """A table (id, value) whose primary key is id, one row to a key, for a change log's
+    snapshot paged by that key: between the calls a scan makes it updates a row's value,
+    moves a row to another id, deletes a row or inserts one, under ids anywhere in the
+    order, and leaves an insert open some gaps."""
+
+    def __init__(self, random, **kwargs):
+        super().__init__(random, **kwargs)
+        self.rows = [{"id": key, "value": random.choice("ab")} for key in range(1, 21)]
+        self.indexes = [(["id"], [False], 20, 20)]
+
+    def _fresh(self):
+        used = {row["id"] for row in self.rows} | {
+            row["id"] for _tx, rows in self.pending for row in rows
+        }
+        return self.random.choice([key for key in range(1, 81) if key not in used])
+
+    def _tick(self):
+        if self.pending and self.random.random() < 0.3:
+            tx, rows = self.pending.pop()
+            self.rows.extend(rows)
+            self._write("COMMIT", tx=tx)
+        elif not self.pending and self.left > 0 and self.random.random() < 0.1:
+            self.left -= 1
+            self.tx_id += 1
+            rows = [{"id": self._fresh(), "value": "open"}]
+            self._write("BEGIN")
+            for row in rows:
+                self._write("INSERT", row=dict(row))
+            self.pending.append((self.tx_id, rows))
+        while self.left > 0 and self.random.random() < 0.6:
+            self.left -= 1
+            self.tx_id += 1
+            self._write("BEGIN")
+            kind = self.random.random()
+            row = self.random.choice(self.rows) if self.rows else None
+            if row is not None and kind < 0.35:
+                self._write("BEFORE_UPDATE", row=dict(row))
+                row["value"] = self.random.choice("abc")
+                self._write("AFTER_UPDATE", row=dict(row))
+            elif row is not None and kind < 0.5:
+                # UPDATE ... SET id = other: the key changes.
+                self._write("BEFORE_UPDATE", row=dict(row))
+                row["id"] = self._fresh()
+                self._write("AFTER_UPDATE", row=dict(row))
+            elif row is not None and kind < 0.75:
+                self.rows.remove(row)
+                self._write("DELETE", row=dict(row))
+            else:
+                new = {"id": self._fresh(), "value": self.random.choice("ab")}
+                self.rows.insert(self.random.randint(0, len(self.rows)), new)
+                self._write("INSERT", row=dict(new))
+            self._write("COMMIT")
+
+
 class _ScriptedEndSource(_IndexScanSource):
     """A keyless table on a log nothing else writes to, with a change committed while its
     first page is read that Informix CDC hands over late: the scan's end gets an idle poll,
@@ -2707,6 +2762,78 @@ class LakeflowContractTests(unittest.TestCase):
         )
         staged = [row for index in sorted(pages) for row in pages[index]]
         return boundary, staged, scan, connector, table
+
+    def test_a_keyed_change_log_snapshot_and_the_stream_after_it_add_up_to_the_table(self):
+        # A table with a key of its own on the append path took the plain key-paged
+        # snapshot, and its stream started at the snapshot's page-start LSN unfiltered: a
+        # change on that page, or one to a key whose page had been read before it
+        # committed, was in its change log twice. It now takes the index-ordered snapshot by
+        # its key, which follows the table's changes, and the stream drops those the pages
+        # hold. The source commits at random between the scan's calls; the staged rows and
+        # the changes the stream keeps must give the final table.
+        def net(staged, transactions):
+            result = collections.Counter(_IndexScanSource.text(row) for row in staged)
+            for tx in transactions:
+                for record in tx.records:
+                    before = record.get(
+                        "before", record.get("row") if record["op"] == "DELETE" else None
+                    )
+                    after = record.get(
+                        "after", record.get("row") if record["op"] == "INSERT" else None
+                    )
+                    if before is not None:
+                        result[_IndexScanSource.text(before)] -= 1
+                    if after is not None:
+                        result[_IndexScanSource.text(after)] += 1
+            return result
+
+        overlapped = settled = 0
+        options = {"append.only.ingestion": "true"}
+        for seed in range(80):
+            random = random_module.Random(7000 + seed)
+            source = _OwnKeyIndexScanSource(random, quiet=seed % 3 == 1)
+            table = Table.parse(_table(primary_keys=("id",)), "demo")
+            with mock.patch.object(informix_module, "_INDEX_SCAN_PROOF_SECONDS", 0):
+                boundary, staged, scan, connector, table = self._index_scan(
+                    source, random.choice([3, 5]), table=table, options=options
+                )
+            self.assertEqual(scan["index_scan"]["keys"], ["id"], f"seed {seed}")
+            settled += bool(scan["index_scan"]["suppress"])
+            transactions = informix_module._transaction_batch(source.history(boundary))[0]
+            connector._read_snapshot_stage_manifest = lambda *_, _scan=scan: _scan
+            connector._offset_scopes = lambda checkpoint: ("scope", "scope")
+            kept = connector._drop_scanned_changes(
+                table, {"commit_lsn": str(boundary), "schema_id": "s"}, options, transactions
+            )
+            expected = collections.Counter(source.rows_as_text())
+            result = net(staged, kept)
+            self.assertEqual(+result, expected, f"seed {seed}")
+            self.assertFalse(-result, f"seed {seed}")
+            # The stream's every change from the snapshot LSN on, unfiltered, as before.
+            overlapped += net(staged, transactions) != expected
+        self.assertGreater(overlapped, 10)
+        self.assertGreater(settled, 5)
+
+    def test_a_keyed_change_log_pages_its_snapshot_by_its_key(self):
+        # Paged by its key on the append path; merged by its key, as before (the merge
+        # takes the overlap out). A key the scan cannot compare leaves the table's other
+        # indexes, and with none the key-paged snapshot that does not follow, with a warning.
+        source = _OwnKeyIndexScanSource(random_module.Random(1))
+        connector = self.connector(source)
+        table = Table.parse(_table(primary_keys=("id",)), "demo")
+        append = {"append.only.ingestion": "true"}
+        self.assertEqual(connector._scan_index(table, append), (["id"], [False]))
+        self.assertIsNone(connector._scan_index(table, {}))
+        self.assertIsNone(connector._scan_index(table, {**append, "snapshot.scan": "cursor"}))
+        descending = dataclasses.replace(table, key_descending=(True,))
+        self.assertEqual(connector._scan_index(descending, append), (["id"], [True]))
+        with mock.patch.object(informix_module, "_INDEX_SCAN_KEY_TYPES", frozenset({"VARCHAR"})):
+            source.indexes = [(["value"], [False], 3, 20)]
+            self.assertEqual(connector._scan_index(table, append), (["value"], [False]))
+            source.indexes = [(["id"], [False], 20, 20)]
+            with self.assertLogs(informix_module.__name__, "WARNING") as logged:
+                self.assertIsNone(connector._scan_index(table, append))
+        self.assertIn("pages by its key without following its changes", logged.output[0])
 
     def test_an_index_scan_and_the_stream_after_it_add_up_to_the_table(self):
         # snapshot.scan=index: a keyless change log's snapshot and the stream that replays
@@ -4823,6 +4950,31 @@ class LakeflowContractTests(unittest.TestCase):
                 rows, offset = connector.read_table("app.orders", offset, options)
                 ids += [row["id"] for row in rows]
         return ids, offset
+
+    def test_a_keyed_change_log_reads_its_snapshot_by_the_index_scan(self):
+        # Through read_table: a table with a key of its own on the append path took the
+        # consistent snapshot, which follows no changes; merged by its key it still does.
+        bridge = _KeylessIndexBridge()
+        bridge.tables[0]["primary_keys"] = ["id"]
+        bridge.rows = [{"id": number, "value": "v"} for number in range(1, 6)]
+        calls = []
+        plain = bridge.consistent_snapshot
+
+        def counted(*args, **kwargs):
+            calls.append(1)
+            return plain(*args, **kwargs)
+
+        bridge.consistent_snapshot = counted
+        options = {"snapshot.mode": "initial", "snapshot.page.size": "2"}
+        connector = self.connector(bridge, registration_scope="keyed-change-log")
+        ids, offset = self._snapshot_ids(connector, {**options, "append.only.ingestion": "true"})
+        self.assertEqual(ids, [1, 2, 3, 4, 5])
+        self.assertEqual(offset["phase"], "stream")
+        self.assertEqual(calls, [])
+        merged = self.connector(bridge, registration_scope="keyed-merged")
+        ids, _offset = self._snapshot_ids(merged, options)
+        self.assertEqual(ids, [1, 2, 3, 4, 5])
+        self.assertEqual(calls, [1])
 
     def test_a_later_update_takes_a_failed_index_scan_up_unless_it_is_a_full_refresh(self):
         pipeline = uuid.UUID(int=1)

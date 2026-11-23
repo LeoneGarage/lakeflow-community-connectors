@@ -16607,7 +16607,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
 
     def _scan_index(self, table, options) -> tuple[list[str], list[bool]] | None:
         # Docstring: The index a keyless table's snapshot pages by, as its columns and their
-        # directions, or None when it reads through the one cursor instead.
+        # directions, or None when it reads through the one cursor instead. A table with a
+        # key of its own pages by that key on the append path, and follows its changes as a
+        # keyless one does; merged by its key, it returns None and pages by the key as before.
         #
         # ``snapshot.scan=cursor`` asks for the cursor. ``snapshot.scan=keyset(a, b desc)``
         # names the columns to page by, and may give their directions. Otherwise the table is
@@ -16625,7 +16627,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         )
         requested = _snapshot_scan_value(raw)
         named = _snapshot_scan_columns(raw)
-        if table.primary_keys and not table.key_only_from_option:
+        own_key = bool(table.primary_keys) and not table.key_only_from_option
+        if own_key and not self._append_only_table(table, options):
+            # Merged by its key, which takes out what the snapshot and the stream both hold.
             return None
         bridge = self._bridge
         indexes = getattr(bridge, "table_indexes", None)
@@ -16652,9 +16656,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # takes the direction of an index that starts with these columns, else ascending.
             for name, _direction in named:
                 if name.lower() not in usable:
-                    # 433: The index-ordered snapshot of a keyless table does
-                    # not support {} on '{}'; set snapshot.scan=cursor to read
-                    # the table without index order
+                    # 433: The index-ordered snapshot does not support {} on '{}'; set
+                    # snapshot.scan=cursor to read the table without index order
                     raise InformixError(
                         _m(
                             433,
@@ -16677,7 +16680,18 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 names,
                 [found[at] if down is None else down for at, (_name, down) in enumerate(named)],
             )
-        for columns, directions, nunique, *rows in () if named else listed:
+        if own_key and not named and all(name.lower() in usable for name in table.primary_keys):
+            # A key of its own on the append path: one row to a value, so each change is
+            # judged by its own key's page. A key of a type the scan does not compare (a
+            # DATETIME, say) leaves the table's other indexes, as for primary.keys.
+            chosen = (
+                None,
+                list(table.primary_keys),
+                list(table.key_descending)
+                if len(table.key_descending) == len(table.primary_keys)
+                else [False] * len(table.primary_keys),
+            )
+        for columns, directions, nunique, *rows in () if named or chosen else listed:
             # The catalog's count of distinct keys, which is 0 until statistics are run:
             # among equals, more columns make smaller groups.
             rank = (nunique, len(columns))
@@ -16701,11 +16715,19 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         else:
             return list(chosen[1]), list(chosen[2])
         if named:
-            # 433: The index-ordered snapshot of a keyless table does not support {}
-            # on '{}'; set snapshot.scan=cursor to read the table without index order
+            # 433: The index-ordered snapshot does not support {} on '{}'; set snapshot.scan=cursor
+            # to read the table without index order
             raise InformixError(_m(433, reason, table.exposed_name))
         if not follows:
             # A merged target takes the overlap out by its key: it pages by the key as before.
+            return None
+        if own_key:
+            # 492: Informix snapshot of '{}', which lands as a change log, pages by its key
+            # without following its changes because it has {}; a row that changes during
+            # the snapshot can then be in its change log twice
+            logging.getLogger(__name__).warning(
+                _m(492, table.exposed_name, reason or "no key or index of a type it can page by")
+            )
             return None
         # 437: Informix snapshot of '{}', which has no key of its own, reads without index
         # order because it has {}; a row that changes during the snapshot can then be in
@@ -17183,10 +17205,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     for record in tx.records:
                         op = _operation(record)
                         if op == "TRUNCATE":
-                            # 433: The index-ordered snapshot of a
-                            # keyless table does not support {} on
-                            # '{}'; set snapshot.scan=cursor to read
-                            # the table without index order
+                            # 433: The index-ordered snapshot does not support {} on '{}'; set
+                            # snapshot.scan=cursor to read the table without index order
                             raise InformixError(_m(433, "TRUNCATE", table.exposed_name))
                         before = record.get("before", record.get("row") if op == "DELETE" else None)
                         after = record.get("after", record.get("row") if op == "INSERT" else None)
@@ -17198,7 +17218,9 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                             before, keys
                         ) != _index_scan_key(after, keys)
                         named = [None, None]
-                        if table.primary_keys:
+                        # Paged by its own key, a row's index value is its key: an UPDATE of
+                        # it already goes as the two halves above, and no row moves.
+                        if table.primary_keys and set(keys) != set(table.primary_keys):
                             named = [
                                 None if row is None else _index_scan_row_key(row, table, options)
                                 for row in (before, after)
@@ -17207,16 +17229,14 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                                 if name is None:
                                     continue
                                 if name not in had and len(had) >= _INDEX_SCAN_TRACKED_ROWS:
-                                    # 433: The index-ordered snapshot of a
-                                    # keyless table does not support {} on
-                                    # '{}'; set snapshot.scan=cursor to read
-                                    # the table without index order
+                                    # 433: The index-ordered snapshot does not support {} on '{}';
+                                    # set snapshot.scan=cursor to read the table without index order
                                     raise InformixError(
                                         _m(
                                             433,
                                             f"more than {_INDEX_SCAN_TRACKED_ROWS} rows "
-                                            "changing during it, for a table keyed by "
-                                            "primary.keys,",
+                                            "changing during it, for a table paged by an "
+                                            "index other than its key,",
                                             table.exposed_name,
                                         )
                                     )
@@ -17379,9 +17399,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 if _snapshot_scan_columns(
                     options.get(_SNAPSHOT_SCAN_OPTION, self.options.get(_SNAPSHOT_SCAN_OPTION, ""))
                 ):
-                    # 433: The index-ordered snapshot of a keyless table does
-                    # not support {} on '{}'; set snapshot.scan=cursor to read
-                    # the table without index order
+                    # 433: The index-ordered snapshot does not support {} on '{}'; set
+                    # snapshot.scan=cursor to read the table without index order
                     raise InformixError(_m(433, reason, table.exposed_name))
                 if follows:
                     # 437: Informix snapshot of '{}', which has no key of its
@@ -17416,9 +17435,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             if () in orders:
                 # No NULL is among these rows, so the connector made one of a value: paging
                 # on from it would lose the rows after it.
-                # 433: The index-ordered snapshot of a keyless table does not
-                # support {} on '{}'; set snapshot.scan=cursor to read the table
-                # without index order
+                # 433: The index-ordered snapshot does not support {} on '{}'; set
+                # snapshot.scan=cursor to read the table without index order
                 raise InformixError(
                     _m(
                         433,
@@ -17432,9 +17450,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                 or (orders and bounds and not bounds[-1] < orders[0])
             ):
                 # The page lookup of a change's key relies on it.
-                # 433: The index-ordered snapshot of a keyless table does not
-                # support {} on '{}'; set snapshot.scan=cursor to read the table
-                # without index order
+                # 433: The index-ordered snapshot does not support {} on '{}'; set
+                # snapshot.scan=cursor to read the table without index order
                 raise InformixError(
                     _m(
                         433,
@@ -17454,10 +17471,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                         table.identity, names, keys, cursor, isolation, _INDEX_SCAN_KEY_ROWS + 1
                     )
                     if len(rows) > _INDEX_SCAN_KEY_ROWS:
-                        # 433: The index-ordered snapshot of a keyless
-                        # table does not support {} on '{}'; set
-                        # snapshot.scan=cursor to read the table without
-                        # index order
+                        # 433: The index-ordered snapshot does not support {} on '{}'; set
+                        # snapshot.scan=cursor to read the table without index order
                         raise InformixError(
                             _m(
                                 433,
@@ -17588,9 +17603,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                     if len(rows_read) > _INDEX_SCAN_KEY_ROWS:
                         # Cut at the limit, a copy of a row past it went unseen, and a row
                         # found once passed for found where it was.
-                        # 433: The index-ordered snapshot of a keyless table does not
-                        # support {} on '{}'; set snapshot.scan=cursor to read the table
-                        # without index order
+                        # 433: The index-ordered snapshot does not support {} on '{}'; set
+                        # snapshot.scan=cursor to read the table without index order
                         raise InformixError(
                             _m(
                                 433,
@@ -17812,7 +17826,11 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         # stream's offsets name that update (scan_scope, see _read_stream) until the stream
         # is past the scan's end, since a later update's offsets carry its own scope.
 
-        if (table.primary_keys and not table.key_only_from_option) or (
+        if (
+            table.primary_keys
+            and not table.key_only_from_option
+            and not self._append_only_table(table, options)
+        ) or (
             # snapshot.scan as it is now says nothing of a scan the snapshot took: set to
             # cursor before the stream was past its end, the offset lost the scan's name
             # (_read_stream) and the changes the pages hold were replayed.
@@ -17943,9 +17961,8 @@ class InformixLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             # row without its index columns failed, and one with them named a change the
             # manifest did not, for a full refresh.
             if any(_record_matches(part, table) for part in tx.spilled):
-                # 433: The index-ordered snapshot of a keyless table does not
-                # support {} on '{}'; set snapshot.scan=cursor to read the table
-                # without index order
+                # 433: The index-ordered snapshot does not support {} on '{}'; set
+                # snapshot.scan=cursor to read the table without index order
                 raise InformixError(
                     _m(433, "a transaction over cdc.spill.records during it", table.exposed_name)
                 )

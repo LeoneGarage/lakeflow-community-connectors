@@ -673,6 +673,15 @@ The differences from a keyless table:
 
 A table that has its own primary key, or a unique index used as its key, is read by that
 key whatever `primary.keys` says, and naming columns with `keyset(...)` is rejected for it.
+Merged by that key, its snapshot pages by the key and follows no changes: the merge takes
+out what the snapshot and the stream both hold. On the append path
+(`append.only.ingestion: "true"`) nothing does, so its snapshot is the index scan below,
+paged by its key, one row to a key value, and its change log is exact as a keyless one's
+is. When a key column is of a type the scan cannot page by (a `DATETIME`, say), it pages
+by another index of the table instead; with none, or with a row filter, `snapshot.filter`
+or buffered logging, it takes the key-paged snapshot that follows no changes and logs a
+warning that its change log can hold the overlap. `snapshot.scan: cursor` reads it that way
+without the warning.
 
 With the index scan:
 
