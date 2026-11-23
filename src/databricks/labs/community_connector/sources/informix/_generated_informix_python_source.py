@@ -12321,8 +12321,8 @@ def register_lakeflow_source(spark):
     # wildcard every update changes the key and deletes the old row. What a NULL can still
     # break is keyset snapshot paging, which compares key values in SQL and in Python;
     # snapshot.scan=cursor avoids it, and the per-page sort an all-column key usually costs.
-    # On the append path with snapshot.mode=cdc_only, its default, nothing pages by key, so a
-    # NULL there is harmless.
+    # On the append path with snapshot.mode=cdc_only nothing pages by key, so a NULL there is
+    # harmless; its default, initial, pages its snapshot by key like any other.
     _PRIMARY_KEYS_WILDCARD = "*"
     # ``"* except(c1, c2)"`` keys the table on every column but the ones named, which suits a
     # table whose rows are unique as a whole bar a few columns that change or are too wide to
@@ -17832,17 +17832,17 @@ def register_lakeflow_source(spark):
             # would never use.
             #
             # Only snapshot.mode initial and initial_only take a snapshot from the extract (an
-            # append-only table, initial). Set with another, the option did nothing: a keyless
-            # table's default cdc_only skipped the extract, a keyed table's default incremental
-            # copied the live table from today's log position instead of loading the extract
-            # from its boundary. Checked on the table's own configuration; one set on the
-            # connection applies only to the tables whose mode reads it.
+            # append-only table, initial, its default). Set with another, the option did
+            # nothing: an append-only table's cdc_only skipped the extract, a keyed table's
+            # default incremental copied the live table from today's log position instead of
+            # loading the extract from its boundary. Checked on the table's own configuration;
+            # one set on the connection applies only to the tables whose mode reads it.
 
             source = bool(str(table_options.get(_SNAPSHOT_SOURCE_OPTION) or "").strip())
             if not source and _SNAPSHOT_BOUNDARY_LSN_OPTION not in table_options:
                 return
             option = _SNAPSHOT_SOURCE_OPTION if source else _SNAPSHOT_BOUNDARY_LSN_OPTION
-            mode = self._snapshot_mode(table_options)
+            mode = self._table_snapshot_mode(table, table_options)
             if not source and self._table_snapshot_source(table_options) is None:
                 # 472: Option '{}' of table '{}' is never read: the table has no snapshot.source;
                 # set one, or remove the option
@@ -17851,10 +17851,9 @@ def register_lakeflow_source(spark):
                 # 473: Option '{}' of table '{}' is never read: the table is snapshot-only, read
                 # whole from Informix; remove the option
                 raise ValueError(_m(473, option, table.exposed_name))
-            unset = "snapshot.mode" not in table_options and "snapshot.mode" not in self.options
-            if append and (mode == "cdc_only" or unset):
-                # 474: Option '{}' of table '{}' is never read: snapshot.mode=cdc_only, an
-                # append-only table's default, reads no snapshot; set snapshot.mode=initial
+            if append and mode == "cdc_only":
+                # 474: Option '{}' of table '{}' is never read: snapshot.mode=cdc_only reads no
+                # snapshot; set snapshot.mode=initial, or leave it unset on an append-only table
                 raise ValueError(_m(474, option, table.exposed_name))
             if not append and mode not in _UNL_SNAPSHOT_MODES:
                 # 475: Option '{}' of table '{}' is never read: snapshot.mode={} takes no snapshot
@@ -18761,7 +18760,7 @@ def register_lakeflow_source(spark):
             # Volume and Lakebase, so a dropped mount is retried in place. The embedded replay in
             # get_partitions stays outside, as a real read that handles the mount itself.
 
-            if self._unl_snapshot_serve(table_options, effective_start, table.identity):
+            if self._unl_snapshot_serve(table_options, effective_start, table.identity, table):
                 # File source: fan this microbatch's split window across executors -- one
                 # unl_split descriptor per byte split in [start_split, start_split+window). The
                 # boundary was pinned by latest_offset; take snapshot_lsn from end_offset and
@@ -20115,6 +20114,21 @@ def register_lakeflow_source(spark):
                 # 196: Unsupported snapshot.mode={!r}; supported values are {}
                 raise ValueError(_m(196, mode, allowed))
             return mode
+
+        def _snapshot_mode_set(self, table_options: dict[str, str]) -> bool:
+            # Docstring: Whether the table's configuration or the connection sets snapshot.mode.
+            return "snapshot.mode" in table_options or "snapshot.mode" in self.options
+
+        def _table_snapshot_mode(self, table: Table, table_options: dict[str, str]) -> str:
+            # Docstring: snapshot.mode as this table's reads take it. An append-only table with
+            # none set, on the table or on the connection, takes initial: it copies the rows the
+            # table holds before it streams, where cdc_only, its default before, copied none.
+
+            if not self._snapshot_mode_set(table_options) and self._append_only_table(
+                table, table_options
+            ):
+                return "initial"
+            return self._snapshot_mode(table_options)
 
         def _table_migration(self, table_options: dict[str, str]) -> bool:
             # Docstring: Whether this table is being migrated (``table.migration=true``).
@@ -22988,7 +23002,7 @@ def register_lakeflow_source(spark):
                 # another (a connection-scope snapshot.source), a blocking snapshot that
                 # incremental or auto_snapshot falls back to served the extract on the driver,
                 # an auto_snapshot resnapshot an old one, while a chunked copy read the table.
-                self._snapshot_mode(options) in _UNL_SNAPSHOT_MODES
+                self._table_snapshot_mode(table, options) in _UNL_SNAPSHOT_MODES
                 or self._replayed_unl_boundary(table, options) is not None
             ):
                 # File source: serve the initial snapshot from Informix UNLOAD (`.unl`) files
@@ -24826,7 +24840,11 @@ def register_lakeflow_source(spark):
             return delimiter, escape
 
         def _unl_snapshot_serve(
-            self, table_options: dict[str, str], effective_start: dict, table_name: str | None = None
+            self,
+            table_options: dict[str, str],
+            effective_start: dict,
+            table_name: str | None = None,
+            table: Table | None = None,
         ) -> bool:
             # Docstring: Whether this read belongs to a file-source initial snapshot's split serve.
             #
@@ -24848,6 +24866,16 @@ def register_lakeflow_source(spark):
             if self._table_snapshot_source(table_options) is None:
                 return False
             if not effective_start:
+                if (
+                    table is None
+                    and table_name is not None
+                    and not self._snapshot_mode_set(table_options)
+                ):
+                    # With no mode set, an append-only table takes initial: the table says which.
+                    with self._metadata_access():
+                        table = self._table(table_name, table_options)
+                if table is not None:
+                    return self._table_snapshot_mode(table, table_options) in _UNL_SNAPSHOT_MODES
                 return self._snapshot_mode(table_options) in _UNL_SNAPSHOT_MODES
             # A serve part-way through finishes as a staged one does, whatever snapshot.mode
             # says now: the mode chooses how a snapshot starts. A staged snapshot's offset is
@@ -25958,21 +25986,21 @@ def register_lakeflow_source(spark):
             #
             # Two startup behaviours, selected by ``snapshot.mode``:
             #
-            # ``cdc_only`` (also the append-only default when snapshot.mode is unset)
-            #     Start at the server's current log position and emit nothing now. Rows
-            #     that predate the flow are not captured. No size ceiling, no memory
-            #     spike, and no failure mode -- which is why it is the default. An
-            #     append-only table is usually one that is actively being appended to, so
-            #     the interesting rows are the arriving ones.
+            # ``initial`` (also the append-only default when snapshot.mode is unset)
+            #     Copy the rows the table holds, then continue from the snapshot's LSN, so
+            #     history is captured and the handoff is gapless. The snapshot pages by an
+            #     index, or by its key, and follows the table's changes while it runs (see
+            #     the README's exact snapshots of keyless tables); without either it reads
+            #     through one forward-only cursor. Fetched rows are written to immutable
+            #     staged pages and become visible only after the completed snapshot
+            #     manifest is published. Defaulting to it, a change log starts with the rows
+            #     the table holds, as a keyed table's default incremental copy does: one
+            #     that started from today's log alone could not be rebuilt from it.
             #
-            # ``initial``
-            #     Read the table once under REPEATABLE READ and continue from that
-            #     snapshot's LSN, so history is captured and the handoff is gapless: the
-            #     snapshot is consistent as-of one LSN and the stream resumes from exactly
-            #     that LSN. Because a key-less table has no stable monotonic cursor, this
-            #     uses one forward-only cursor and one REPEATABLE READ transaction. Fetched
-            #     rows are written to immutable staged pages and become visible only after
-            #     the completed snapshot manifest is published.
+            # ``cdc_only``
+            #     Start at the server's current log position and emit nothing now. Rows
+            #     that predate the flow are not captured. No size ceiling and no snapshot,
+            #     for a table whose arriving rows are all that matter.
             #
             # When ``table.migration=true`` (checked before either mode), the flow instead
             # records the checkpoint a prior flow parked in Lakebase (see :meth:`_read_handoff`),
@@ -26047,7 +26075,7 @@ def register_lakeflow_source(spark):
 
             configured_mode = options.get("snapshot.mode", self.options.get("snapshot.mode"))
             snapshot_mode = (
-                "cdc_only" if configured_mode is None else str(configured_mode).strip().lower()
+                "initial" if configured_mode is None else str(configured_mode).strip().lower()
             )
             if snapshot_mode not in {"initial", "cdc_only"}:
                 # 274: Append-only table '{}' supports only snapshot.mode=initial or

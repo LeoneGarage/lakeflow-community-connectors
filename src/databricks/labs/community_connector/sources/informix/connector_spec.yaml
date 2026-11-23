@@ -453,9 +453,10 @@ connection:
         It does not empty the destination: deletes still in the log are applied,
         but a row deleted at the source while the log was not retained stays
         there until a full refresh.
-        Keyless append-only tables default to `cdc_only` when this option is unset
-        and accept `cdc_only` or `initial`; `initial` streams one
-        unordered forward-only cursor into durable bounded pages before CDC.
+        Append-only tables (keyless ones, or with `append.only.ingestion=true`) default
+        to `initial` when this option is unset, copying the rows the table holds into
+        durable bounded pages before CDC, and accept `initial` or `cdc_only`, which
+        copies no existing rows.
         To move a table to a new flow without re-snapshotting, keep its snapshot.mode
         and set `table.migration=true` instead (see that option). The extension modes
         `configuration_based` and `custom` are not supported.
@@ -470,8 +471,8 @@ connection:
         initial snapshot is served from those files instead of a live repeatable-read scan
         of the source, then transitions to the CDC stream at the boundary the connector pins
         itself -- no operator-supplied LSN and no schema fingerprint. Set in a table's
-        configuration with another mode (an append-only table's default `cdc_only`
-        included), or a table's `snapshot.boundary.lsn` without an extract, fails when the
+        configuration with another mode (`cdc_only` on an append-only table included),
+        or a table's `snapshot.boundary.lsn` without an extract, fails when the
         pipeline starts; set on the connection, it applies to the tables whose mode reads
         it. The files must be newline-terminated, escaped, delimited text
         -- Informix UNLOAD (`|` delimiter, backslash escaping, empty field = NULL) or

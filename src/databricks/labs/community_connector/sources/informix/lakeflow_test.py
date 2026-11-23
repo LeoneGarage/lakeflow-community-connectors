@@ -18428,7 +18428,34 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(metadata["ingestion_type"], "snapshot")
 
-    def test_append_defaults_to_streaming_from_now_without_history(self):
+    def test_an_append_only_table_with_no_snapshot_mode_copies_its_rows_first(self):
+        # With snapshot.mode unset on the table and the connection, an append-only table
+        # took cdc_only: it started at today's log and copied none of the rows the table
+        # held, so its change log could not rebuild the table. It takes initial now,
+        # keyless or keyed by append.only.ingestion.
+        cases = (
+            ("keyless", True, {}),
+            ("opted-in", True, self.APPEND),
+            ("keyed", False, self.APPEND),
+        )
+        for label, keyless, options in cases:
+            with self.subTest(table=label):
+                scope = f"append-default-{label}"
+                if keyless:
+                    connector, _ = self._keyless_connector(registration_scope=scope)
+                else:
+                    connector = self.connector(FakeBridge(), registration_scope=scope)
+                connector.options.pop("snapshot.mode")
+                self.assertEqual(
+                    connector.read_table_metadata("app.orders", dict(options))["ingestion_type"],
+                    "append",
+                )
+                rows, offset = connector.read_table("app.orders", {}, dict(options))
+                self.assertEqual(sorted(r["value"] for r in rows), ["a", "b"])
+                self.assertEqual(offset["phase"], "stream")
+
+    def test_append_with_cdc_only_streams_from_now_without_history(self):
+        # snapshot.mode=cdc_only, here the connection's: no rows the table held.
         connector, _ = self._keyless_connector()
 
         rows, offset = connector.read_table("app.orders", {}, {})
@@ -31514,7 +31541,8 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
     def test_a_table_snapshot_source_its_mode_never_reads_is_refused(self):
         # Set with a mode that takes no snapshot from it, the extract was ignored: a keyed
         # table's incremental copied the live table from today's position, a keyless
-        # table's default cdc_only skipped it, and a boundary with no extract did nothing.
+        # table's cdc_only skipped it, and a boundary with no extract did nothing. A keyless
+        # table with no mode set takes initial, which reads it.
         source = self._source("1|a|\n")
         keyless = FakeBridge()
         keyless.tables = [_table(primary_keys=())]
@@ -31522,13 +31550,8 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
             ("incremental", FakeBridge(), {"snapshot.source": source}, "snapshot.mode=incremental"),
             ("auto_snapshot", FakeBridge(), {"snapshot.source": source}, "auto_snapshot takes"),
             ("cdc_only", FakeBridge(), {"snapshot.source": source}, "cdc_only takes no"),
-            (
-                None,
-                keyless,
-                {"snapshot.source": source},
-                "cdc_only, an append-only table.s default",
-            ),
-            ("cdc_only", keyless, {"snapshot.source": source}, "cdc_only, an append-only"),
+            ("cdc_only", keyless, {"snapshot.source": source}, "cdc_only reads no snapshot"),
+            (None, FakeBridge(), {"snapshot.source": source}, "snapshot.mode=incremental"),
             ("initial", FakeBridge(), {"snapshot.boundary.lsn": "50"}, "has no snapshot.source"),
         )
         for mode, bridge, table_options, reason in cases:
@@ -31543,14 +31566,40 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
             ("initial", FakeBridge(), {"snapshot.source": source}),
             ("initial_only", FakeBridge(), {"snapshot.source": source}),
             ("initial", keyless, {"snapshot.source": source}),
+            (None, keyless, {"snapshot.source": source}),
         )
         for mode, bridge, table_options in accepted:
             with self.subTest(mode=mode, accepted=True):
-                connector = self.connector(bridge, **{"snapshot.mode": mode})
+                connector = self.connector(bridge)
+                connector.options.pop("snapshot.mode")
+                if mode is not None:
+                    connector.options["snapshot.mode"] = mode
                 connector.read_table_metadata("app.orders", dict(table_options))
         # A boundary for the connection's extract.
         connector = self.connector(FakeBridge(), **{"snapshot.source": source})
         connector.read_table_metadata("app.orders", {"snapshot.boundary.lsn": "50"})
+
+    def test_an_append_only_table_with_no_snapshot_mode_loads_its_extract(self):
+        # With no snapshot.mode set, an append-only table took cdc_only: its snapshot.source
+        # was refused at registration, and its first read started at today's log. It
+        # takes initial now: the extract is served, as the partitioned reader plans it. A
+        # keyed table's unset mode is still incremental, which takes no extract.
+        source = self._source("1|alpha|\n2|beta|\n")
+        options = {"snapshot.source": source}
+        bridge = FakeBridge()
+        bridge.tables = [_table(primary_keys=())]
+        connector = self.connector(bridge, registration_scope="append-default-extract")
+        connector.options.pop("snapshot.mode")
+        connector.read_table_metadata("app.orders", dict(options))
+        self.assertTrue(connector._unl_snapshot_serve(dict(options), {}, "app.orders"))
+        rows, offset = connector.read_table("app.orders", {}, dict(options))
+        self.assertEqual(sorted(r["value"] for r in rows), ["alpha", "beta"])
+        self.assertEqual(offset["phase"], "stream")
+        keyed = self.connector(FakeBridge(), registration_scope="keyed-default-extract")
+        keyed.options.pop("snapshot.mode")
+        self.assertFalse(keyed._unl_snapshot_serve(dict(options), {}, "app.orders"))
+        cdc_only = self.connector(bridge, **{"snapshot.mode": "cdc_only"})
+        self.assertFalse(cdc_only._unl_snapshot_serve(dict(options), {}, "app.orders"))
 
     def test_a_staged_snapshot_beside_a_connection_extract_serves_its_own_pages(self):
         # incremental's blocking fallback (a cursor scan here) stages several pages of the
