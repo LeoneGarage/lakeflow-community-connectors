@@ -278,46 +278,6 @@ class PasswordAuthenticationProvider:
         raise SqliUnsupportedAuthentication(f"no noninteractive PAM response for style {style}")
 
 
-@dataclass(frozen=True, eq=False, repr=False)
-class TypedBind:
-    native_type: int
-    value: int | str | None
-
-
-def encode_bind(values: tuple[TypedBind, ...], encoding: str = "utf-8") -> bytes:
-    if len(values) > 1024:
-        raise ValueError("too many SQLI bind values")
-    out = io.BytesIO()
-    out.write(struct.pack(">hh", SQ_BIND, len(values)))
-    for bind in values:
-        out.write(struct.pack(">h", bind.native_type))
-        if bind.native_type > 18 and bind.native_type not in {52, 53}:
-            raise ValueError("extended bind types require owner/type metadata")
-        if bind.value is None:
-            out.write(struct.pack(">hh", -1, 0))
-            continue
-        if bind.native_type == 2:
-            raw = struct.pack(">i", int(bind.value))
-        elif bind.native_type in {52, 53}:
-            raw = struct.pack(">q", int(bind.value))
-        elif bind.native_type == 0:
-            raw = str(bind.value).encode(encoding)
-        elif bind.native_type == 13:
-            text = str(bind.value).encode(encoding)
-            if len(text) > 255:
-                raise ValueError("VARCHAR bind exceeds one-byte encoded length")
-            raw = bytes([len(text)]) + text
-        else:
-            raise ValueError(f"unsupported internal bind type {bind.native_type}")
-        if len(raw) > 32767:
-            raise ValueError("bind value exceeds signed-smallint length")
-        out.write(struct.pack(">hh", 0, len(raw)))
-        out.write(raw)
-        if len(raw) & 1:
-            out.write(b"\0")
-    return out.getvalue()
-
-
 def encode_pam_response(response: str, encoding: str = "utf-8") -> bytes:
     raw = response.encode(encoding)
     if len(raw) > 512:

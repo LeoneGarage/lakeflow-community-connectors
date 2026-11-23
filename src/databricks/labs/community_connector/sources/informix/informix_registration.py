@@ -20,6 +20,8 @@ import types
 from dataclasses import dataclass
 from typing import Any
 
+from pyspark.sql.datasource import InputPartition
+
 from databricks.labs.community_connector.sources.informix.cdc_protocol import frame_log_file
 from databricks.labs.community_connector.sources.informix.informix_options import (
     _DEFAULT_CONNECTION_WAIT_TIMEOUT_SECONDS,
@@ -423,6 +425,35 @@ def _sleep_with_backoff(deadline: float, delay: float) -> float:
 _WRAPPED_STREAM_READER_NAMES = frozenset(
     {"LakeflowStreamReader", "LakeflowPartitionedStreamReader"}
 )
+
+
+class _RedactedPartition(InputPartition):
+    # Docstring: A partition whose descriptor carries a staging bearer token (a .unl
+    # split's, for its executor's ranged reads). Printed, as Spark prints a partition in a
+    # failed task's diagnostics and its debug logs, it shows the token as <redacted>; its
+    # value, which the executor reads, keeps it.
+
+    def __repr__(self) -> str:
+        try:
+            shown = json.loads(self.value)
+        except (TypeError, ValueError):
+            shown = None
+        if isinstance(shown, dict) and "token" in shown:
+            shown["token"] = "<redacted>"
+            return f"InputPartition(value={json.dumps(shown)!r})"
+        return "InputPartition(value=<redacted>)"
+
+    __str__ = __repr__
+
+
+def _redacted_partitions(partitions: list) -> list:
+    # Docstring: ``partitions``, each one whose descriptor carries a token printed redacted.
+    return [
+        _RedactedPartition(partition.value)
+        if isinstance(getattr(partition, "value", None), str) and '"token"' in partition.value
+        else partition
+        for partition in partitions
+    ]
 
 
 def _snapshot_position(offset: Any) -> tuple | None:
@@ -1036,6 +1067,13 @@ def _informix_available_now_base(base: type, spark_session: Any | None = None) -
                 return _replay_reader_range(reader, start, end)
 
             cls.prepareForTriggerAvailableNow = prepare_for_trigger
+            original_partitions = getattr(cls, "partitions", None)
+            if cls.__name__ == "LakeflowPartitionedStreamReader" and original_partitions:
+
+                def partitions(reader, start, end):
+                    return _redacted_partitions(original_partitions(reader, start, end))
+
+                cls.partitions = partitions
             if cls.__name__ == "LakeflowStreamReader":
                 # Only the simple reader replays through readBetweenOffsets; the
                 # partitioned proxy replays through get_partitions(start, end), which

@@ -49,7 +49,6 @@ from databricks.labs.community_connector.sources.informix.sqli_codec import (
     SqliSessionRejected,
     SqliTransportError,
     SqliUnsupportedAuthentication,
-    TypedBind,
     _ca_file_misnamed,
     _connector_sql,
     _DeadlineReader,
@@ -69,7 +68,6 @@ from databricks.labs.community_connector.sources.informix.sqli_codec import (
     encode_asc_char,
     encode_asc_environment,
     encode_asc_tail,
-    encode_bind,
     encode_char,
     encode_close_release,
     encode_cursor_open,
@@ -576,11 +574,10 @@ class InformixSqliClient:
             self.execute_command(sql)
             return []
         _, output_stream = self._require_open()
-        typed: tuple[TypedBind, ...] = ()
         with self._lock:
             try:
                 output_stream.write(
-                    encode_prepare(sql, self._text_encoding, len(typed), self.remove_64k_limit)
+                    encode_prepare(sql, self._text_encoding, 0, self.remove_64k_limit)
                 )
                 output_stream.flush()
                 description, rows, _ = self._read_query_group(None)
@@ -603,7 +600,7 @@ class InformixSqliClient:
                 if description is None:
                     return rows
                 cursor_name = f"lc_{description.statement_id}"
-                binds = encode_bind(typed, self._text_encoding) if typed else b""
+                binds = b""
                 variable = self._variable_tuples(description)
                 if variable:
                     output_stream.write(
@@ -670,7 +667,6 @@ class InformixSqliClient:
         if _statement_keyword(sql) in _NON_ROW_STATEMENTS:
             raise ValueError("execute_pages requires a row-producing statement")
         _, output_stream = self._require_open()
-        typed: tuple[TypedBind, ...] = ()
         pending: list[dict[str, object]] = []
 
         def consume(batch: list[dict[str, object]]) -> None:
@@ -683,7 +679,7 @@ class InformixSqliClient:
         with self._lock:
             try:
                 output_stream.write(
-                    encode_prepare(sql, self._text_encoding, len(typed), self.remove_64k_limit)
+                    encode_prepare(sql, self._text_encoding, 0, self.remove_64k_limit)
                 )
                 output_stream.flush()
                 description, initial, _ = self._read_query_group(None)
@@ -1083,14 +1079,12 @@ __all__ = [
     "SqliTransportError",
     "SqliRedirect",
     "SqliUnsupportedAuthentication",
-    "TypedBind",
     "add_informix_exception_note",
     "decode_char",
     "decode_asc_accept",
     "encode_asc_environment",
     "encode_asc_char",
     "encode_asc_tail",
-    "encode_bind",
     "encode_char",
     "encode_close_release",
     "encode_cursor_open",

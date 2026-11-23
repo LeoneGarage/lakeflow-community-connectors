@@ -13,6 +13,7 @@ from databricks.labs.community_connector.sources.informix.informix_registration 
     _INFORMIX_REGISTRATION_CONTEXT,
     _driver_registration,
     _install_registration,
+    _redacted_partitions,
     _replay_reader_range,
 )
 from databricks.labs.community_connector.sparkpds import LakeflowSource
@@ -71,6 +72,11 @@ class InformixPartitionedStreamReader(LakeflowPartitionedStreamReader):
 
     def prepareForTriggerAvailableNow(self) -> None:
         self.lakeflow_connect.prepare_for_trigger_available_now()
+
+    def partitions(self, start, end):
+        # A .unl split's descriptor carries the staging bearer token: printed, it shows it
+        # redacted (_RedactedPartition).
+        return _redacted_partitions(super().partitions(start, end))
 
 
 class _InformixSourceType(type(LakeflowSource)):

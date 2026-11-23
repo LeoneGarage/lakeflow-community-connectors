@@ -115,16 +115,18 @@ from databricks.labs.community_connector.sources.informix.sqli_codec import (
     statement_sql_error,
 )
 
-# A variable that holds the bridge's class, so that tests can put another in its place.
-# pylint: disable-next=invalid-name
-_bridge_factory: Callable[[dict[str, str]], InformixBridge] = PurePythonInformixBridge
+# The bridge's class, so that tests can put another in its place. Held in a dict: the
+# merged single file turns module globals into function locals, which ``global`` can't
+# rebind.
+_BRIDGE_FACTORY: dict[str, Callable[[dict[str, str]], InformixBridge]] = {
+    "factory": PurePythonInformixBridge
+}
 
 
 def set_bridge_factory(factory: Callable[[dict[str, str]], InformixBridge]) -> None:
     # Docstring: Set the process-wide bridge factory (primarily for deterministic tests).
 
-    global _bridge_factory
-    _bridge_factory = factory
+    _BRIDGE_FACTORY["factory"] = factory
 
 
 class _ReaderMixin:
@@ -300,7 +302,7 @@ class _ReaderMixin:
     def _bridge(self) -> InformixBridge:
         if self._bridge_instance is None:
             _refuse_code_loading_options(self.options)
-            self._bridge_instance = _bridge_factory(self.options)
+            self._bridge_instance = _BRIDGE_FACTORY["factory"](self.options)
         return self._bridge_instance
 
     @contextlib.contextmanager

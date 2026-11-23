@@ -122,6 +122,9 @@ if "pyspark.sql.types" not in sys.modules:
     )
 
 import informix_modules  # noqa: E402
+
+informix_modules.install()  # after the stub above, when it is in use (see conftest)
+
 from databricks.labs.community_connector.sources.informix import (  # noqa: E402
     informix as informix_module,
 )
@@ -19725,6 +19728,74 @@ class LakeflowContractTests(unittest.TestCase):
                 self.lakeflow_connect = mock.Mock()
 
         SomethingElse().lakeflow_connect.set_registration_scope.assert_not_called()
+
+    def test_a_partition_carrying_a_token_prints_it_redacted(self):
+        # A .unl split's descriptor carries the staging bearer token for its executor's
+        # ranged reads, and Spark prints a partition in a failed task's diagnostics.
+        from pyspark.sql.datasource import InputPartition
+
+        split = {"kind": "unl_split", "path": "/Volumes/a/b.unl", "token": "dapi-secret"}
+        page = {"kind": "staged_page", "page": 3}
+
+        class TriggerBase:
+            pass
+
+        class LakeflowPartitionedStreamReader(_informix_available_now_base(TriggerBase)):
+            def __init__(self):
+                self.lakeflow_connect = mock.Mock()
+                self.options = {"tableName": "members"}
+
+            def partitions(self, start, end):
+                return [InputPartition(json.dumps(split)), InputPartition(json.dumps(page))]
+
+        packaged = importlib.import_module("databricks.labs.community_connector.sources.informix")
+        for reader_partitions in (
+            LakeflowPartitionedStreamReader().partitions({}, {}),
+            informix_module._redacted_partitions(
+                [InputPartition(json.dumps(split)), InputPartition(json.dumps(page))]
+            ),
+        ):
+            redacted, untouched = reader_partitions
+            for shown in (repr(redacted), str(redacted)):
+                self.assertNotIn("dapi-secret", shown)
+                self.assertIn("<redacted>", shown)
+            self.assertEqual(json.loads(redacted.value), split)  # the executor still reads it
+            self.assertEqual(json.loads(pickle.loads(pickle.dumps(redacted)).value), split)
+            self.assertEqual(json.loads(untouched.value), page)
+        self.assertTrue(
+            hasattr(packaged.InformixPartitionedStreamReader, "partitions")
+        )
+
+    def test_a_bridge_factory_set_for_the_process_makes_the_bridge(self):
+        made = []
+
+        def factory(options):
+            made.append(options)
+            return FakeBridge()
+
+        informix_module.set_bridge_factory(factory)
+        self.addCleanup(informix_module.set_bridge_factory, PurePythonInformixBridge)
+        connector = InformixLakeflowConnect(
+            {
+                "database": "demo",
+                "snapshot.staging.location": self._shared_state.name,
+                "lakebase.password": "p",
+            }
+        )
+        self.assertIsInstance(connector._bridge, FakeBridge)
+        self.assertEqual(len(made), 1)
+
+    def test_a_daemon_made_during_a_metadata_lookup_claims_slots(self):
+        # The lookup's capacity bypass is set on the connector's options, which a daemon
+        # reader's are copied from: kept, the daemon claimed no slot for as long as it lived.
+        connector = self.connector(FakeBridge())
+        with connector._metadata_access():
+            readers = [
+                connector._snapshot_drain_reader_factory()(),
+                connector._shared_cdc_reader_factory()(),
+            ]
+        for reader in readers:
+            self.assertNotIn("_informix.bypass.connection.capacity", reader.options)
 
     def _replay_reader(self, connector, **options):
         """A real LakeflowStreamReader over ``connector``, with the installed patch."""

@@ -111,6 +111,7 @@ from databricks.labs.community_connector.sources.informix.informix_registration 
     SharedStateAccessUnavailable,
     Table,
     UnsupportedChangeError,
+    _shorten_merged_definitions,
 )
 from databricks.labs.community_connector.sources.informix.informix_scan import _ScanMixin
 from databricks.labs.community_connector.sources.informix.informix_schema import _SchemaMixin
@@ -839,3 +840,9 @@ __all__ = [
     "UnsupportedChangeError",
     "set_bridge_factory",
 ]
+
+
+# Last, as when this was one module: in the merged file every definition above is local to
+# register_lakeflow_source by now. It keeps a few as module globals (the AvailableNow
+# reader base), so both namespaces are visited.
+_shorten_merged_definitions({**globals(), **locals()})

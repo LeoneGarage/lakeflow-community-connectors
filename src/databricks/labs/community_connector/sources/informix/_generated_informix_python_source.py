@@ -4256,6 +4256,35 @@ def register_lakeflow_source(spark):
     )
 
 
+    class _RedactedPartition(InputPartition):
+        # Docstring: A partition whose descriptor carries a staging bearer token (a .unl
+        # split's, for its executor's ranged reads). Printed, as Spark prints a partition in a
+        # failed task's diagnostics and its debug logs, it shows the token as <redacted>; its
+        # value, which the executor reads, keeps it.
+
+        def __repr__(self) -> str:
+            try:
+                shown = json.loads(self.value)
+            except (TypeError, ValueError):
+                shown = None
+            if isinstance(shown, dict) and "token" in shown:
+                shown["token"] = "<redacted>"
+                return f"InputPartition(value={json.dumps(shown)!r})"
+            return "InputPartition(value=<redacted>)"
+
+        __str__ = __repr__
+
+
+    def _redacted_partitions(partitions: list) -> list:
+        # Docstring: ``partitions``, each one whose descriptor carries a token printed redacted.
+        return [
+            _RedactedPartition(partition.value)
+            if isinstance(getattr(partition, "value", None), str) and '"token"' in partition.value
+            else partition
+            for partition in partitions
+        ]
+
+
     def _snapshot_position(offset: Any) -> tuple | None:
         # Docstring: Where a snapshot-phase offset points: (snapshot LSN, page, record); else None.
 
@@ -4867,6 +4896,13 @@ def register_lakeflow_source(spark):
                     return _replay_reader_range(reader, start, end)
 
                 cls.prepareForTriggerAvailableNow = prepare_for_trigger
+                original_partitions = getattr(cls, "partitions", None)
+                if cls.__name__ == "LakeflowPartitionedStreamReader" and original_partitions:
+
+                    def partitions(reader, start, end):
+                        return _redacted_partitions(original_partitions(reader, start, end))
+
+                    cls.partitions = partitions
                 if cls.__name__ == "LakeflowStreamReader":
                     # Only the simple reader replays through readBetweenOffsets; the
                     # partitioned proxy replays through get_partitions(start, end), which
@@ -11787,7 +11823,7 @@ def register_lakeflow_source(spark):
         types: list[type[BaseException]] = []
         for module_name in ("psycopg2", "psycopg"):
             try:
-                module = __import__(module_name)
+                module = importlib.import_module(module_name)
             except ImportError:
                 continue
             for attribute in ("OperationalError", "InterfaceError"):
@@ -12470,46 +12506,6 @@ def register_lakeflow_source(spark):
             if style == 2 and self.echo_response is not None:
                 return self.echo_response
             raise SqliUnsupportedAuthentication(f"no noninteractive PAM response for style {style}")
-
-
-    @dataclass(frozen=True, eq=False, repr=False)
-    class TypedBind:
-        native_type: int
-        value: int | str | None
-
-
-    def encode_bind(values: tuple[TypedBind, ...], encoding: str = "utf-8") -> bytes:
-        if len(values) > 1024:
-            raise ValueError("too many SQLI bind values")
-        out = io.BytesIO()
-        out.write(struct.pack(">hh", SQ_BIND, len(values)))
-        for bind in values:
-            out.write(struct.pack(">h", bind.native_type))
-            if bind.native_type > 18 and bind.native_type not in {52, 53}:
-                raise ValueError("extended bind types require owner/type metadata")
-            if bind.value is None:
-                out.write(struct.pack(">hh", -1, 0))
-                continue
-            if bind.native_type == 2:
-                raw = struct.pack(">i", int(bind.value))
-            elif bind.native_type in {52, 53}:
-                raw = struct.pack(">q", int(bind.value))
-            elif bind.native_type == 0:
-                raw = str(bind.value).encode(encoding)
-            elif bind.native_type == 13:
-                text = str(bind.value).encode(encoding)
-                if len(text) > 255:
-                    raise ValueError("VARCHAR bind exceeds one-byte encoded length")
-                raw = bytes([len(text)]) + text
-            else:
-                raise ValueError(f"unsupported internal bind type {bind.native_type}")
-            if len(raw) > 32767:
-                raise ValueError("bind value exceeds signed-smallint length")
-            out.write(struct.pack(">hh", 0, len(raw)))
-            out.write(raw)
-            if len(raw) & 1:
-                out.write(b"\0")
-        return out.getvalue()
 
 
     def encode_pam_response(response: str, encoding: str = "utf-8") -> bytes:
@@ -19106,11 +19102,6 @@ def register_lakeflow_source(spark):
         return proven_floor + min(span, streak * span // max(1, _CONNECTION_BACKLOG_TRUNCATION_LEVELS))
 
 
-    # The merged file keeps a few of its definitions as module globals (the AvailableNow
-    # reader base), so both namespaces are visited.
-    _shorten_merged_definitions({**globals(), **locals()})
-
-
     ########################################################
     # src/databricks/labs/community_connector/sources/informix/informix_index_scan.py
     ########################################################
@@ -23562,11 +23553,10 @@ def register_lakeflow_source(spark):
                 self.execute_command(sql)
                 return []
             _, output_stream = self._require_open()
-            typed: tuple[TypedBind, ...] = ()
             with self._lock:
                 try:
                     output_stream.write(
-                        encode_prepare(sql, self._text_encoding, len(typed), self.remove_64k_limit)
+                        encode_prepare(sql, self._text_encoding, 0, self.remove_64k_limit)
                     )
                     output_stream.flush()
                     description, rows, _ = self._read_query_group(None)
@@ -23589,7 +23579,7 @@ def register_lakeflow_source(spark):
                     if description is None:
                         return rows
                     cursor_name = f"lc_{description.statement_id}"
-                    binds = encode_bind(typed, self._text_encoding) if typed else b""
+                    binds = b""
                     variable = self._variable_tuples(description)
                     if variable:
                         output_stream.write(
@@ -23656,7 +23646,6 @@ def register_lakeflow_source(spark):
             if _statement_keyword(sql) in _NON_ROW_STATEMENTS:
                 raise ValueError("execute_pages requires a row-producing statement")
             _, output_stream = self._require_open()
-            typed: tuple[TypedBind, ...] = ()
             pending: list[dict[str, object]] = []
 
             def consume(batch: list[dict[str, object]]) -> None:
@@ -23669,7 +23658,7 @@ def register_lakeflow_source(spark):
             with self._lock:
                 try:
                     output_stream.write(
-                        encode_prepare(sql, self._text_encoding, len(typed), self.remove_64k_limit)
+                        encode_prepare(sql, self._text_encoding, 0, self.remove_64k_limit)
                     )
                     output_stream.flush()
                     description, initial, _ = self._read_query_group(None)
@@ -24069,14 +24058,12 @@ def register_lakeflow_source(spark):
         "SqliTransportError",
         "SqliRedirect",
         "SqliUnsupportedAuthentication",
-        "TypedBind",
         "add_informix_exception_note",
         "decode_char",
         "decode_asc_accept",
         "encode_asc_environment",
         "encode_asc_char",
         "encode_asc_tail",
-        "encode_bind",
         "encode_char",
         "encode_close_release",
         "encode_cursor_open",
@@ -27245,14 +27232,15 @@ def register_lakeflow_source(spark):
     # src/databricks/labs/community_connector/sources/informix/informix_reader.py
     ########################################################
 
-    _bridge_factory: Callable[[dict[str, str]], InformixBridge] = PurePythonInformixBridge
+    _BRIDGE_FACTORY: dict[str, Callable[[dict[str, str]], InformixBridge]] = {
+        "factory": PurePythonInformixBridge
+    }
 
 
     def set_bridge_factory(factory: Callable[[dict[str, str]], InformixBridge]) -> None:
         # Docstring: Set the process-wide bridge factory (primarily for deterministic tests).
 
-        global _bridge_factory
-        _bridge_factory = factory
+        _BRIDGE_FACTORY["factory"] = factory
 
 
     class _ReaderMixin:
@@ -27428,7 +27416,7 @@ def register_lakeflow_source(spark):
         def _bridge(self) -> InformixBridge:
             if self._bridge_instance is None:
                 _refuse_code_loading_options(self.options)
-                self._bridge_instance = _bridge_factory(self.options)
+                self._bridge_instance = _BRIDGE_FACTORY["factory"](self.options)
             return self._bridge_instance
 
         @contextlib.contextmanager
@@ -31658,6 +31646,9 @@ def register_lakeflow_source(spark):
             # And the backlog rank of the read that happened to start it: kept, the daemon
             # swept for a slot at that read's pace for as long as it lived.
             reader_options.pop(_CONNECTION_ATTEMPT_RANK_OPTION, None)
+            # And a metadata lookup's capacity bypass, if one is under way: a daemon made then
+            # claimed no slot for as long as it lived.
+            reader_options.pop("_informix.bypass.connection.capacity", None)
             cls = type(self)
             return lambda: cls(reader_options)
 
@@ -31762,6 +31753,9 @@ def register_lakeflow_source(spark):
             # And the backlog rank of the read that happened to start it: kept, the daemon
             # swept for a slot at that read's pace for as long as it lived.
             reader_options.pop(_CONNECTION_ATTEMPT_RANK_OPTION, None)
+            # And a metadata lookup's capacity bypass, if one is under way: a daemon made then
+            # claimed no slot for as long as it lived.
+            reader_options.pop("_informix.bypass.connection.capacity", None)
             cls = type(self)
             # The shard is keyed by this reader's scope, and its reads spill under it.
             scope = self._registration_scope
@@ -33078,6 +33072,12 @@ def register_lakeflow_source(spark):
         "UnsupportedChangeError",
         "set_bridge_factory",
     ]
+
+
+    # Last, as when this was one module: in the merged file every definition above is local to
+    # register_lakeflow_source by now. It keeps a few as module globals (the AvailableNow
+    # reader base), so both namespaces are visited.
+    _shorten_merged_definitions({**globals(), **locals()})
 
 
     ########################################################

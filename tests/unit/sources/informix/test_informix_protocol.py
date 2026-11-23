@@ -41,7 +41,6 @@ from databricks.labs.community_connector.sources.informix.sqli import (
     SqliSessionRejected,
     SqliTransportError,
     SqliUnsupportedAuthentication,
-    TypedBind,
     _connector_sql,
     _DeadlineReader,
     _decode_result_value,
@@ -51,7 +50,6 @@ from databricks.labs.community_connector.sources.informix.sqli import (
     decode_asc_accept,
     encode_asc_char,
     encode_asc_environment,
-    encode_bind,
     encode_char,
     encode_close_release,
     encode_cursor_open,
@@ -1100,15 +1098,6 @@ class SqliPacketTests(unittest.TestCase):
         client.client_locale = "en_US.unknown"
         with self.assertRaises(SqliProtocolError):
             _ = client._encoding
-
-    def test_bounded_internal_bind_envelope(self):
-        encoded = encode_bind(
-            (TypedBind(2, 7), TypedBind(52, -9), TypedBind(13, "abc"), TypedBind(0, None))
-        )
-        self.assertTrue(encoded.startswith(struct.pack(">hh", 5, 4)))
-        self.assertIn(struct.pack(">i", 7), encoded)
-        self.assertIn(struct.pack(">q", -9), encoded)
-        self.assertTrue(encoded.endswith(struct.pack(">hhh", 0, -1, 0)))
 
     def test_pam_static_frames_and_bounds(self):
         self.assertEqual(encode_pam_response("1234"), struct.pack(">hh", 130, 4) + b"1234\0\x0c")

@@ -30,10 +30,7 @@ from databricks.labs.community_connector.sources.informix.informix_options impor
     InformixError,
     _m,
 )
-from databricks.labs.community_connector.sources.informix.informix_registration import (
-    Table,
-    _shorten_merged_definitions,
-)
+from databricks.labs.community_connector.sources.informix.informix_registration import Table
 from databricks.labs.community_connector.sources.informix.informix_shards import (
     _recorded_transforms,
     _wildcard_key,
@@ -710,8 +707,3 @@ def _backlog_rank(backlog: int, streak: int = 0) -> int:
     # rank, matching what "provably behind on every read" deserves.
     span = _CONNECTION_BACKLOG_RANK_LEVELS - 1 - proven_floor
     return proven_floor + min(span, streak * span // max(1, _CONNECTION_BACKLOG_TRUNCATION_LEVELS))
-
-
-# The merged file keeps a few of its definitions as module globals (the AvailableNow
-# reader base), so both namespaces are visited.
-_shorten_merged_definitions({**globals(), **locals()})

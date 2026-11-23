@@ -76,6 +76,7 @@ what the public shape suggests:
 
 from __future__ import annotations
 
+import importlib
 import json
 from typing import Any
 
@@ -117,7 +118,7 @@ def connection_lost_error_types() -> tuple[type[BaseException], ...]:
     types: list[type[BaseException]] = []
     for module_name in ("psycopg2", "psycopg"):
         try:
-            module = __import__(module_name)
+            module = importlib.import_module(module_name)
         except ImportError:
             continue
         for attribute in ("OperationalError", "InterfaceError"):

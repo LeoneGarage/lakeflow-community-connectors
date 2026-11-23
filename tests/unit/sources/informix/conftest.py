@@ -13,14 +13,17 @@ as the tools import each other. And the connector's split modules each get one
 namespace for the suites (see informix_modules).
 """
 
-import contextlib
 import pathlib
 import sys
 
-with contextlib.suppress(ImportError):
+try:
     import pyspark.sql.datasource  # noqa: F401
     import pyspark.sql.streaming.datasource  # noqa: F401
     import pyspark.sql.types  # noqa: F401
+except ImportError:
+    _REAL_PYSPARK = False
+else:
+    _REAL_PYSPARK = True
 
 _HERE = pathlib.Path(__file__).resolve().parent
 for _path in (_HERE, _HERE / "tools"):
@@ -29,4 +32,9 @@ for _path in (_HERE, _HERE / "tools"):
 
 import informix_modules  # noqa: E402
 
-informix_modules.install()
+if _REAL_PYSPARK:
+    informix_modules.install()
+else:
+    # The contract suite's stub stands in for PySpark: imported first, it installs the
+    # stub and then the namespaces, before anything else imports the connector.
+    import test_informix_lakeflow_connect  # noqa: E402,F401

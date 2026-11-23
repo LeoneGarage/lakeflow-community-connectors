@@ -40,9 +40,9 @@
 # column of one fails the table. Unknown catalog types fail discovery rather than being decoded
 # speculatively. Ordinary TEXT/BYTE fetch framing has a bounded internal helper,
 # but content materialization and limits are not exposed by this connector.
-# Generated metadata, snapshot, and CDC lifecycle statements use a deliberately
-# narrow typed-bind implementation (INTEGER/BIGINT/VARCHAR and explicit internal
-# typed nulls). It is not a user-query or arbitrary prepared-statement API.
+# Generated metadata, snapshot, and CDC lifecycle statements carry their parameters
+# as SQL literals the connector renders and escapes itself (sqli._connector_sql), not
+# as typed binds. It is not a user-query or arbitrary prepared-statement API.
 #
 # CDC-capable tables receive a deterministic primary-key snapshot followed by
 # CDC from the pre-snapshot high-water LSN. Delivery is at-least-once and a

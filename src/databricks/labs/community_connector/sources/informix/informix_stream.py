@@ -632,6 +632,9 @@ class _StreamMixin:
         # And the backlog rank of the read that happened to start it: kept, the daemon
         # swept for a slot at that read's pace for as long as it lived.
         reader_options.pop(_CONNECTION_ATTEMPT_RANK_OPTION, None)
+        # And a metadata lookup's capacity bypass, if one is under way: a daemon made then
+        # claimed no slot for as long as it lived.
+        reader_options.pop("_informix.bypass.connection.capacity", None)
         cls = type(self)
         return lambda: cls(reader_options)
 
@@ -736,6 +739,9 @@ class _StreamMixin:
         # And the backlog rank of the read that happened to start it: kept, the daemon
         # swept for a slot at that read's pace for as long as it lived.
         reader_options.pop(_CONNECTION_ATTEMPT_RANK_OPTION, None)
+        # And a metadata lookup's capacity bypass, if one is under way: a daemon made then
+        # claimed no slot for as long as it lived.
+        reader_options.pop("_informix.bypass.connection.capacity", None)
         cls = type(self)
         # The shard is keyed by this reader's scope, and its reads spill under it.
         scope = self._registration_scope
