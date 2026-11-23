@@ -1401,14 +1401,14 @@ class LakeflowContractTests(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertEqual(bridge.released_connections, 2)
-        self.assertNotIn("_informix.bypass.connection.capacity", connector.options)
+        self.assertFalse(getattr(connector._call_state(), "bypass_capacity", False))
 
     def test_schema_discovery_restores_private_capacity_bypass(self):
         connector = self.connector()
 
         connector.get_table_schema("app.orders", {})
 
-        self.assertNotIn("_informix.bypass.connection.capacity", connector.options)
+        self.assertFalse(getattr(connector._call_state(), "bypass_capacity", False))
 
     def test_registration_reads_only_the_requested_table(self):
         # Registration must resolve the one configured table with a targeted
@@ -3927,7 +3927,49 @@ class LakeflowContractTests(unittest.TestCase):
         for thread in threads:
             thread.join(5)
         self.assertEqual(order, ["first in", "first out", "second in"])
-        self.assertNotIn("_informix.bypass.connection.capacity", connector.options)
+        self.assertFalse(getattr(connector._call_state(), "bypass_capacity", False))
+
+    def test_a_redirect_allowlist_names_ipv6_in_brackets_and_hosts_in_any_case(self):
+        allowlist = informix_module._redirect_allowlist(
+            "IFX-HDR.Corp.Internal.:9088, [FD00:0::1]:9089, 10.0.0.5:9090"
+        )
+        self.assertEqual(
+            allowlist,
+            {("ifx-hdr.corp.internal", 9088), ("fd00::1", 9089), ("10.0.0.5", 9090)},
+        )
+        # Unbracketed, fd00::1:9088 could be an address with no port; brackets hold an
+        # IPv6 address and nothing else.
+        for entry in ("fd00::1:9088", "[ifx-hdr]:9088", "[10.0.0.5]:9088", "host:", "host:x"):
+            with self.subTest(entry=entry), self.assertRaisesRegex(ValueError, "brackets"):
+                informix_module._redirect_allowlist(entry)
+
+    def test_a_lookups_capacity_bypass_stays_on_its_own_thread(self):
+        # Set on the options the connector shares with its bridge, a metadata lookup's
+        # bypass reached a read on another thread, which then claimed no connection slot.
+        connector = self.connector(FakeBridge())
+        inside, release, seen = threading.Event(), threading.Event(), {}
+
+        def lookup():
+            with connector._metadata_access():
+                seen["lookup"] = getattr(connector._bridge._call_context, "bypass_capacity", False)
+                inside.set()
+                release.wait(5)
+
+        def read():
+            with connector._capacity_attempt({"backlog_rank": 2}):
+                seen["read"] = getattr(connector._bridge._call_context, "bypass_capacity", False)
+                seen["rank"] = getattr(connector._bridge._call_context, "attempt_rank", 0)
+
+        thread = threading.Thread(target=lookup)
+        thread.start()
+        self.assertTrue(inside.wait(5))
+        other = threading.Thread(target=read)
+        other.start()
+        other.join(5)
+        release.set()
+        thread.join(5)
+        self.assertEqual(seen, {"lookup": True, "read": False, "rank": 2})
+        self.assertFalse(connector._call_state().__dict__)  # nothing left on this thread
 
     def test_a_staging_token_chain_that_could_not_start_is_tried_a_minute_on(self):
         # Left to the stage that needs the transport, which resolves it again; read after
@@ -8169,7 +8211,8 @@ class LakeflowContractTests(unittest.TestCase):
     def _setup_bridge(self, transport, database="testdb"):
         bridge = object.__new__(PurePythonInformixBridge)
         bridge.transport = transport
-        bridge.options = {"_informix.bypass.connection.capacity": "true"}
+        bridge.options = {}
+        bridge._call_context = types.SimpleNamespace(bypass_capacity=True)
         bridge.config = {"database": database}
         return bridge
 
@@ -8316,14 +8359,13 @@ class LakeflowContractTests(unittest.TestCase):
 
     def test_daemon_readers_do_not_keep_the_backlog_rank_of_the_read_that_started_them(self):
         connector = self.connector(FakeBridge(), shared_cdc=True)
-        rank = informix_module._CONNECTION_ATTEMPT_RANK_OPTION
         with connector._capacity_attempt({"backlog_rank": 3}):
-            self.assertIn(rank, connector.options)
+            self.assertEqual(connector._call_state().attempt_rank, 3)
             for factory in (
                 connector._shared_cdc_reader_factory(),
                 connector._snapshot_drain_reader_factory(),
             ):
-                self.assertNotIn(rank, factory().options)
+                self.assertEqual(getattr(factory()._call_state(), "attempt_rank", 0), 0)
 
     def test_a_snapshot_time_that_finds_no_slot_is_not_taken_for_none(self):
         # Taken for a time the source could not tell, a lost lease was cleared unseen, or
@@ -10549,7 +10591,7 @@ class LakeflowContractTests(unittest.TestCase):
         )
 
         with connector._capacity_attempt(start):
-            published = connector.options.get(informix_module._CONNECTION_ATTEMPT_RANK_OPTION)
+            published = getattr(connector._call_state(), "attempt_rank", 0) or None
             self.assertIsNotNone(
                 published, "a blocking reader published no rank, so it cannot be prioritised"
             )
@@ -10559,7 +10601,7 @@ class LakeflowContractTests(unittest.TestCase):
                 "a saturated streak must publish the top rank",
             )
         # Restored afterwards so it cannot leak into an unrelated later read.
-        self.assertNotIn(informix_module._CONNECTION_ATTEMPT_RANK_OPTION, connector.options)
+        self.assertEqual(getattr(connector._call_state(), "attempt_rank", 0), 0)
 
     def test_a_ranked_waiter_sweeps_for_slots_more_often(self):
         # The lever for a blocking waiter is cadence, not budget: it never gives up,
@@ -10571,7 +10613,7 @@ class LakeflowContractTests(unittest.TestCase):
         top = informix_module._CONNECTION_BACKLOG_RANK_LEVELS - 1
         scales = []
         for rank in range(0, top + 1):
-            bridge.options = {informix_module._CONNECTION_ATTEMPT_RANK_OPTION: str(rank)}
+            bridge._call_context = types.SimpleNamespace(attempt_rank=str(rank))
             scales.append(bridge._connection_sweep_rank_scale())
 
         # Monotonically tighter with rank, and bounded so the metadata rate the wide
@@ -10587,8 +10629,8 @@ class LakeflowContractTests(unittest.TestCase):
         bridge = object.__new__(PurePythonInformixBridge)
         for bad in ("", "abc", "-3", "1.5", None):
             with self.subTest(bad=bad):
-                bridge.options = (
-                    {} if bad is None else {informix_module._CONNECTION_ATTEMPT_RANK_OPTION: bad}
+                bridge._call_context = types.SimpleNamespace(
+                    **({} if bad is None else {"attempt_rank": bad})
                 )
                 self.assertEqual(bridge._connection_sweep_rank_scale(), 1.0)
 
@@ -10889,7 +10931,7 @@ class LakeflowContractTests(unittest.TestCase):
         observed: list[str | None] = []
 
         def record(*args, **kwargs):
-            observed.append(connector.options.get("_informix.connection.attempt.budget.seconds"))
+            observed.append(getattr(connector._call_state(), "attempt_budget", None))
             raise InformixError("stop after observing the budget")
 
         with mock.patch.object(connector, "_table", side_effect=record):
@@ -10900,7 +10942,7 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertIsNotNone(observed[0])
         self.assertGreater(float(observed[0]), 0)
         # Must not leak past the read.
-        self.assertNotIn("_informix.connection.attempt.budget.seconds", connector.options)
+        self.assertIsNone(getattr(connector._call_state(), "attempt_budget", None))
 
     def test_a_batch_read_raises_on_a_capacity_or_volume_failure_instead_of_reading_nothing(self):
         # A batch read (no offset) has no checkpoint to try again from. Its empty batch,
@@ -11064,10 +11106,7 @@ class LakeflowContractTests(unittest.TestCase):
         self.assertIsNone(connector._capacity_attempt_budget(stream, replaying=True))
 
         with connector._capacity_attempt(stream, replaying=True):
-            self.assertNotIn(
-                informix_module._CONNECTION_ATTEMPT_BUDGET_OPTION,
-                connector.options,
-            )
+            self.assertIsNone(getattr(connector._call_state(), "attempt_budget", None))
 
     def test_zero_capacity_delay_blocks_fully_in_every_phase(self):
         # delay=0 already means "block fully in every phase", so the non-stream
@@ -12313,7 +12352,7 @@ class LakeflowContractTests(unittest.TestCase):
         lookup = connector._registration_table
 
         def registration_table(name, options):
-            seen.append(connector.options.get("_informix.bypass.connection.capacity"))
+            seen.append(getattr(connector._call_state(), "bypass_capacity", False))
             return lookup(name, options)
 
         with (
@@ -12322,8 +12361,8 @@ class LakeflowContractTests(unittest.TestCase):
         ):
             self.assertTrue(connector.is_partitioned("app.orders"))
 
-        self.assertEqual(seen, ["true"])
-        self.assertNotIn("_informix.bypass.connection.capacity", connector.options)
+        self.assertEqual(seen, [True])
+        self.assertFalse(getattr(connector._call_state(), "bypass_capacity", False))
         release.assert_called_once_with()
         with (
             mock.patch.object(connector, "_registration_table", side_effect=InformixError("down")),
@@ -12377,7 +12416,7 @@ class LakeflowContractTests(unittest.TestCase):
         bypass = []
 
         def lookup(*_args, **_kwargs):
-            bypass.append(connector.options.get("_informix.bypass.connection.capacity"))
+            bypass.append(getattr(connector._call_state(), "bypass_capacity", False))
             raise ValueError("lookup failed")
 
         with (
@@ -12387,7 +12426,7 @@ class LakeflowContractTests(unittest.TestCase):
         ):
             connector.get_partitions("app.orders", {}, _stream_offset(90), _stream_offset(95))
 
-        self.assertEqual(bypass, ["true"])
+        self.assertEqual(bypass, [True])
         release.assert_called_once()
 
     def test_an_embedded_replay_is_not_retried_by_the_plan(self):
@@ -12529,7 +12568,7 @@ class LakeflowContractTests(unittest.TestCase):
         real_table = connector._table
 
         def lookup(*args, **kwargs):
-            bypass.append(connector.options.get("_informix.bypass.connection.capacity"))
+            bypass.append(getattr(connector._call_state(), "bypass_capacity", False))
             return real_table(*args, **kwargs)
 
         with (
@@ -12542,8 +12581,8 @@ class LakeflowContractTests(unittest.TestCase):
         ):
             connector.latest_offset("app.orders", {}, first)
 
-        self.assertEqual(bypass, ["true"])
-        self.assertNotIn("_informix.bypass.connection.capacity", connector.options)
+        self.assertEqual(bypass, [True])
+        self.assertFalse(getattr(connector._call_state(), "bypass_capacity", False))
         release.assert_called_once()
 
     def test_partitioned_bootstrap_serves_page_zero_from_the_stage(self):
@@ -19795,7 +19834,7 @@ class LakeflowContractTests(unittest.TestCase):
                 connector._shared_cdc_reader_factory()(),
             ]
         for reader in readers:
-            self.assertNotIn("_informix.bypass.connection.capacity", reader.options)
+            self.assertFalse(getattr(reader._call_state(), "bypass_capacity", False))
 
     def _replay_reader(self, connector, **options):
         """A real LakeflowStreamReader over ``connector``, with the installed patch."""
@@ -26185,9 +26224,9 @@ class CurrentUtcTimeTests(unittest.TestCase):
                 "user": "informix",
                 "password": "secret",
                 "server": "demo_on",
-                "_informix.bypass.connection.capacity": "true",
             }
         )
+        bridge._call_context = types.SimpleNamespace(bypass_capacity=True)
         bridge.transport = mock.Mock()
         bridge.transport.execute.side_effect = error
         bridge._is_ansi_database = False  # the time probe's queries alone
@@ -26250,7 +26289,6 @@ class KeyIndexDirectionsTests(unittest.TestCase):
                 "user": "informix",
                 "password": "secret",
                 "server": "demo_on",
-                "_informix.bypass.connection.capacity": "true",
             }
         )
         bridge.transport = mock.Mock()
@@ -27418,12 +27456,12 @@ class DaemonReaderFactoryMarkerTests(unittest.TestCase):
 
     def test_cdc_reader_factory_drops_inherited_attempt_budget(self):
         # The daemon waits on the turnover watchdog, so a short per-read consumer budget
-        # inherited from the parent's options must not cap that wait and send it back to
+        # inherited from the read that made it must not cap that wait and send it back to
         # the end of the queue.
         connector = self._connector()
-        connector.options[informix_module._CONNECTION_ATTEMPT_BUDGET_OPTION] = "0.8"
+        connector._call_state().attempt_budget = 0.8
         reader = connector._shared_cdc_reader_factory()()
-        self.assertIsNone(reader.options.get(informix_module._CONNECTION_ATTEMPT_BUDGET_OPTION))
+        self.assertIsNone(getattr(reader._call_state(), "attempt_budget", None))
 
     def test_snapshot_drain_reader_factory_sets_snapshot_daemon_marker(self):
         # The drain floors one band below the CDC daemon, so it carries the snapshot-daemon
@@ -27453,9 +27491,9 @@ class DaemonReaderFactoryMarkerTests(unittest.TestCase):
         # A per-read attempt budget from the consumer would cap the slot wait below the
         # idle window, so the factory clears it on the worker's copy.
         connector = self._connector()
-        connector.options[informix_module._CONNECTION_ATTEMPT_BUDGET_OPTION] = "5"
+        connector._call_state().attempt_budget = 5.0
         reader = connector._snapshot_drain_reader_factory()()
-        self.assertIsNone(reader.options.get(informix_module._CONNECTION_ATTEMPT_BUDGET_OPTION))
+        self.assertIsNone(getattr(reader._call_state(), "attempt_budget", None))
 
 
 class SnapshotDrainPoolTests(unittest.TestCase):
@@ -31699,12 +31737,12 @@ class UnloadSnapshotSourceTests(LakeflowContractTests):
         real_pin = connector._pin_unl_boundary
 
         def pin(*args, **kwargs):
-            bypass.append(connector.options.get("_informix.bypass.connection.capacity"))
+            bypass.append(getattr(connector._call_state(), "bypass_capacity", False))
             return real_pin(*args, **kwargs)
 
         with mock.patch.object(connector, "_pin_unl_boundary", side_effect=pin):
             end = connector.latest_offset("app.orders", options, {})
-        self.assertEqual(bypass, [None])
+        self.assertEqual(bypass, [False])
         self.assertIn("commit_lsn", end)
         unavailable = informix_module.ConnectionCapacityUnavailable("no slot")
         with mock.patch.object(connector, "_pin_unl_boundary", side_effect=unavailable):

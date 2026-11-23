@@ -919,12 +919,22 @@ class StagingCredentialProvider:
             self._update_id,
             _STAGING_MINTER_SCOPES,
         )
-        token, token_id, granted = mint_staging_token(
-            _WorkspaceApi(self._host, minter),
-            self._pipeline_id,
-            self._lifetime_seconds,
-            self._update_id,
-        )
+        try:
+            token, token_id, granted = mint_staging_token(
+                _WorkspaceApi(self._host, minter),
+                self._pipeline_id,
+                self._lifetime_seconds,
+                self._update_id,
+            )
+        except Exception:
+            # The minting token just made goes too, through the credential that made it:
+            # held nowhere else, it would live out its lifetime, and a failed refresh,
+            # tried again a minute on, left one more each time.
+            if minter_id:
+                revoke_stale_staging_tokens(
+                    _WorkspaceApi(self._host, minting_token), self._pipeline_id, "", minter_id
+                )
+            raise
         predecessor_id, replaced_minter_id = self._token_id, self._minter_id
         self._token, self._token_id = token, token_id
         self._minter, self._minter_id = minter, minter_id

@@ -286,12 +286,13 @@ connection:
       required: false
       description: >
         Comma-separated exact `host:numeric-port` destinations permitted for
-        redirects; service names, wildcards, and omitted ports are rejected.
+        redirects, an IPv6 address in brackets (`[fd00::1]:9091`); service names,
+        wildcards, and omitted ports are rejected. Host names match in any case.
         Every address an allowed hostname resolves to is validated and pinned for
         the connection attempt, and the addresses are tried in turn only after a
         transport failure. If any address is private, loopback, link-local,
         multicast, or otherwise non-public, its exact `IP:numeric-port` must also
-        be listed. Each redirected socket starts a fresh login and revalidates TLS
+        be listed (`[IPv6]:numeric-port`). Each redirected socket starts a fresh login and revalidates TLS
         against the redirected hostname.
 
     - name: redirect.max

@@ -8,6 +8,7 @@ import contextlib
 import errno
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -73,6 +74,7 @@ from databricks.labs.community_connector.sources.informix.informix_registration 
     SharedStateAccessUnavailable,
     Table,
 )
+from databricks.labs.community_connector.sources.informix.sqli_codec import redirect_host_key
 
 
 # pylint: disable-next=too-many-branches
@@ -867,14 +869,36 @@ def _open_state_file(root: str, path: str) -> int:
 
 
 def _redirect_allowlist(value: str) -> frozenset[tuple[str, int]]:
+    # Docstring: The allow-listed redirect destinations as redirect_host_key compares them.
+    #
+    # A host name matches whatever case the Connection Manager names it in. An IPv6 address
+    # goes in brackets: unbracketed, fd00::1:9088 could be an address with no port.
     result: set[tuple[str, int]] = set()
     for item in filter(None, (part.strip() for part in value.split(","))):
         host, separator, port_text = item.rpartition(":")
-        if not separator or not host or not port_text.isdigit() or not 1 <= int(port_text) <= 65535:
-            # 125: redirect.allowlist entries must be exact host:numeric-port pairs
+        if (
+            not separator
+            or not host
+            or not port_text.isdigit()
+            or not 1 <= int(port_text) <= 65535
+            or not _redirect_host_form(host)
+        ):
+            # 125: redirect.allowlist entries must be exact host:numeric-port pairs, an IPv6
+            # address in brackets ([fd00::1]:9088)
             raise ValueError(_m(125))
-        result.add((host, int(port_text)))
+        result.add((redirect_host_key(host), int(port_text)))
     return frozenset(result)
+
+
+def _redirect_host_form(host: str) -> bool:
+    # Docstring: Whether an allow-list entry's host is written as one: a name or IPv4
+    # address bare, an IPv6 address in brackets and only that.
+    if not (host.startswith("[") and host.endswith("]")):
+        return ":" not in host
+    try:
+        return ipaddress.ip_address(host[1:-1]).version == 6
+    except ValueError:
+        return False
 
 
 def _operation(record: dict[str, Any]) -> str:

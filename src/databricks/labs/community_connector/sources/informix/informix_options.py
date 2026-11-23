@@ -734,17 +734,10 @@ _DAEMON_SLOT_MARKER_OPTION = "_informix.daemon.slot"
 # append-only consumer, so it is floored *below* the CDC daemon -- into a band the CDC
 # daemon cannot claim -- rather than sharing the CDC floor and being starved by it.
 _SNAPSHOT_DAEMON_SLOT_MARKER_OPTION = "_informix.snapshot.daemon.slot"
-# Private, published per read by a yielding continuous reader: how long this
-# attempt may spend acquiring a slot before the reader gives up and returns empty.
-_CONNECTION_ATTEMPT_BUDGET_OPTION = "_informix.connection.attempt.budget.seconds"
 # Remaining connection-acquisition budget shared by every internal read in one
 # readBetweenOffsets() call. Without this, each advisory bootstrap retry starts a
 # fresh connection.wait.timeout.seconds window and multiplies the configured cap.
 _REPLAY_CONNECTION_WAIT_BUDGET_OPTION = "_informix.replay.connection.wait.budget.seconds"
-# Carries the reader's backlog rank to the bridge for the duration of one read, so
-# acquisition can prioritise by sweep cadence. Separate from the budget option
-# because a *blocking* reader has no budget at all yet still needs a rank.
-_CONNECTION_ATTEMPT_RANK_OPTION = "_informix.connection.attempt.backlog.rank"
 _DEFAULT_CONNECTION_WAIT_TIMEOUT_SECONDS = 10 * 60
 # One-shot jittered delay a reader sleeps before its *first* connection, so a pipeline that
 # starts dozens of flows at once does not open all their Informix CDC sessions in the same

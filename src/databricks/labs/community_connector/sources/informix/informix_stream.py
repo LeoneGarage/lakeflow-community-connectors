@@ -41,8 +41,6 @@ from databricks.labs.community_connector.sources.informix.informix_options impor
     _CDC_SPILL_RECORD_TYPE,
     _CDC_SPILL_RECORDS_OPTION,
     _CDC_SPILL_SCHEMA,
-    _CONNECTION_ATTEMPT_BUDGET_OPTION,
-    _CONNECTION_ATTEMPT_RANK_OPTION,
     _DAEMON_SLOT_MARKER_OPTION,
     _DEFAULT_CDC_MAX_RECORDS,
     _DEFAULT_CDC_SPILL_RECORDS,
@@ -626,15 +624,10 @@ class _StreamMixin:
         # (see the slot-wait liveness in ``_acquire_connection_slot``), so it waits out a busy
         # backfill and only gives up when the pool is wedged. It is also the consumer's
         # per-progress idle window, so the single knob governs both. Drop any inherited
-        # per-read attempt budget so it cannot cap the slot wait below that window.
-        reader_options.pop(_CONNECTION_ATTEMPT_BUDGET_OPTION, None)
+        # replay wait budget so it cannot cap the slot wait below that window. The read's
+        # own attempt budget, backlog rank and a lookup's capacity bypass are its thread's
+        # (_call_context), which a new reader doesn't inherit.
         reader_options.pop(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION, None)
-        # And the backlog rank of the read that happened to start it: kept, the daemon
-        # swept for a slot at that read's pace for as long as it lived.
-        reader_options.pop(_CONNECTION_ATTEMPT_RANK_OPTION, None)
-        # And a metadata lookup's capacity bypass, if one is under way: a daemon made then
-        # claimed no slot for as long as it lived.
-        reader_options.pop("_informix.bypass.connection.capacity", None)
         cls = type(self)
         return lambda: cls(reader_options)
 
@@ -733,15 +726,10 @@ class _StreamMixin:
         # per-turnover window rather than a hard cap, so it holds its queue ticket long
         # enough for the round-robin rotation to reach it. Drop any per-read attempt budget
         # inherited from the parent's options so a short consumer budget cannot cap that
-        # wait below the window and send the daemon back to the end of the queue.
-        reader_options.pop(_CONNECTION_ATTEMPT_BUDGET_OPTION, None)
+        # wait below the window and send the daemon back to the end of the queue. The
+        # read's attempt budget, backlog rank and a lookup's capacity bypass are its
+        # thread's (_call_context), which a new reader doesn't inherit.
         reader_options.pop(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION, None)
-        # And the backlog rank of the read that happened to start it: kept, the daemon
-        # swept for a slot at that read's pace for as long as it lived.
-        reader_options.pop(_CONNECTION_ATTEMPT_RANK_OPTION, None)
-        # And a metadata lookup's capacity bypass, if one is under way: a daemon made then
-        # claimed no slot for as long as it lived.
-        reader_options.pop("_informix.bypass.connection.capacity", None)
         cls = type(self)
         # The shard is keyed by this reader's scope, and its reads spill under it.
         scope = self._registration_scope

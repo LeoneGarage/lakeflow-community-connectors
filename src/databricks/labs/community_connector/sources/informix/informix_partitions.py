@@ -61,8 +61,6 @@ from databricks.labs.community_connector.sources.informix.informix_options impor
     _CAPACITY_ATTEMPT_PER_RANK_SECONDS,
     _CAPACITY_RETRY_MAX_RETRIES,
     _CAPACITY_RETRY_MIN_DELAY_SECONDS,
-    _CONNECTION_ATTEMPT_BUDGET_OPTION,
-    _CONNECTION_ATTEMPT_RANK_OPTION,
     _DEFAULT_CAPACITY_RETRY_MAX_DELAY_SECONDS,
     _DROPPED_MOUNT_MAX_RETRIES,
     _HANDOFF_CHANNEL_DELETE,
@@ -1013,23 +1011,18 @@ class _PartitionMixin:
             _backlog_rank_value(start_offset),
             _backlog_rank(0, _backlog_streak(start_offset)),
         )
-        previous = self.options.get(_CONNECTION_ATTEMPT_BUDGET_OPTION)
-        previous_rank = self.options.get(_CONNECTION_ATTEMPT_RANK_OPTION)
+        # This thread's, for the bridge to read (_call_context).
+        context = self._call_state()
+        previous = getattr(context, "attempt_budget", None)
+        previous_rank = getattr(context, "attempt_rank", 0)
         if budget is not None:
-            self.options[_CONNECTION_ATTEMPT_BUDGET_OPTION] = repr(budget)
+            context.attempt_budget = budget
         if rank > 0:
-            self.options[_CONNECTION_ATTEMPT_RANK_OPTION] = str(rank)
+            context.attempt_rank = rank
         try:
             yield
         finally:
-            if previous is None:
-                self.options.pop(_CONNECTION_ATTEMPT_BUDGET_OPTION, None)
-            else:
-                self.options[_CONNECTION_ATTEMPT_BUDGET_OPTION] = previous
-            if previous_rank is None:
-                self.options.pop(_CONNECTION_ATTEMPT_RANK_OPTION, None)
-            else:
-                self.options[_CONNECTION_ATTEMPT_RANK_OPTION] = previous_rank
+            context.attempt_budget, context.attempt_rank = previous, previous_rank
 
     def _capacity_retry_offset(self, start_offset: dict) -> dict:
         # Docstring: Yield an empty continuous batch when no connection slot is free.

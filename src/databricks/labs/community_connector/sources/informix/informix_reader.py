@@ -262,6 +262,7 @@ class _ReaderMixin:
         state = self.__dict__.copy()
         state["_bridge_instance"] = None
         state["_metadata_session_lock"] = None
+        state["_call_context"] = None
         # Driver-only; never ship materialized embedded rows to a worker. The worker
         # gets its rows from the partition descriptor, not from this cache.
         state["_partition_embedded_rows"] = {}
@@ -297,13 +298,25 @@ class _ReaderMixin:
             _install_registration(carried)
         self.__dict__.update(state)
         self._metadata_session_lock = threading.RLock()
+        self._call_context = threading.local()
 
     @property
     def _bridge(self) -> InformixBridge:
         if self._bridge_instance is None:
             _refuse_code_loading_options(self.options)
             self._bridge_instance = _BRIDGE_FACTORY["factory"](self.options)
-        return self._bridge_instance
+        bridge, context = self._bridge_instance, self._call_state()
+        if getattr(bridge, "_call_context", None) is not context:
+            bridge._call_context = context
+        return bridge
+
+    def _call_state(self) -> threading.local:
+        # Docstring: This connector's per-thread call context (see __init__), made on first
+        # use where the connector was built without __init__.
+        context = self.__dict__.get("_call_context")
+        if context is None:
+            context = self._call_context = threading.local()
+        return context
 
     @contextlib.contextmanager
     def _metadata_access(self) -> Iterator[None]:
@@ -312,22 +325,20 @@ class _ReaderMixin:
         # Registration and reader setup read only metadata. Queued for a slot behind running
         # reads they would stall startup, and a wait that gave up would fail it.
 
-        # Under the metadata lock, re-entrant: the flag is set on options the bridge shares,
-        # and two lookups at once let the first one's exit close the second one's session
-        # and the second one's put the flag back for good, every later read bypassing.
+        # The bypass is this thread's (_call_context), so a read on another thread claims
+        # its slot as ever. Under the metadata lock, re-entrant: two lookups at once let
+        # the first one's exit close the second one's session.
         with self._metadata_session_lock:
-            previous = self.options.get("_informix.bypass.connection.capacity")
-            self.options["_informix.bypass.connection.capacity"] = "true"
+            context = self._call_state()
+            previous = getattr(context, "bypass_capacity", False)
+            context.bypass_capacity = True
             try:
                 yield
             finally:
                 try:
                     self._release_worker_connection()
                 finally:
-                    if previous is None:
-                        self.options.pop("_informix.bypass.connection.capacity", None)
-                    else:
-                        self.options["_informix.bypass.connection.capacity"] = previous
+                    context.bypass_capacity = previous
 
     def list_tables(self) -> list[str]:
         with self._metadata_access():

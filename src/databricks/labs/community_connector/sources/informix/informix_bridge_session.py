@@ -32,8 +32,6 @@ from databricks.labs.community_connector.sources.informix.informix_keys import (
 from databricks.labs.community_connector.sources.informix.informix_options import (
     _CATALOG_BATCH,
     _CATALOG_COLUMNS_SQL,
-    _CONNECTION_ATTEMPT_BUDGET_OPTION,
-    _CONNECTION_ATTEMPT_RANK_OPTION,
     _CONNECTION_BACKLOG_RANK_LEVELS,
     _CONNECTION_HINT_MAX_AGE_SECONDS,
     _CONNECTION_LIMIT_CONFIG_VERSION,
@@ -106,6 +104,11 @@ class _BridgeSessionMixin:
     # Docstring: The bridge's sessions: connecting, connection slots, transactions and the
     # catalog.
 
+    def _call_flag(self, name: str, default: Any = None) -> Any:
+        # Docstring: What the connector's call under way set for this thread: a capacity
+        # bypass, a slot-wait budget, a backlog rank (the connector's _call_context).
+        return getattr(getattr(self, "_call_context", None), name, default)
+
     def _apply_startup_jitter(self) -> None:
         # Docstring: Sleep a one-time jittered delay before this reader's first connection.
         #
@@ -134,13 +137,13 @@ class _BridgeSessionMixin:
                 return
             # Before acquiring a slot -- a jittering reader holds nothing while it waits.
             self._apply_startup_jitter()
-            bypass_capacity = self.options.get("_informix.bypass.connection.capacity") == "true"
+            bypass_capacity = bool(self._call_flag("bypass_capacity", False))
             # A reconnect after reset_transport still holds its slot and heartbeat; claiming
             # another would strand the first, renewed until the process exits. Its connect
             # failing keeps it too, for the retry: release_connection frees it in the end.
             held = getattr(self, "_lakebase_slot", None) is not None
             if not bypass_capacity and not held:
-                budget = self.options.get(_CONNECTION_ATTEMPT_BUDGET_OPTION)
+                budget = self._call_flag("attempt_budget")
                 budget = float(budget) if budget else None
                 # Lakebase can reap the state connection while this bridge sits idle
                 # between reads, or drop it during a long wait for a slot, which psycopg
@@ -521,7 +524,7 @@ class _BridgeSessionMixin:
         # the gap is enough to bias that race, while an unbounded shrink would
         # reintroduce exactly the metadata storm the wide interval exists to prevent.
 
-        raw = self.options.get(_CONNECTION_ATTEMPT_RANK_OPTION)
+        raw = self._call_flag("attempt_rank", 0)
         if not raw:
             return 1.0
         try:

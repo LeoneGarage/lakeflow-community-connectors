@@ -476,6 +476,10 @@ class InformixLakeflowConnect(  # pylint: disable=too-many-ancestors
         # When the pipeline's targets were last reset (see _last_reset).
         self._update_reset_at: float | None = _INFORMIX_REGISTRATION_CONTEXT.get("reset_at")
         self._metadata_session_lock = threading.RLock()
+        # What the call under way tells the bridge -- a metadata lookup's capacity bypass,
+        # a read's slot-wait budget and backlog rank -- per thread: set on the options it
+        # shares with the bridge, a lookup on one thread reached a read on another.
+        self._call_context = threading.local()
         # Set by a snapshot-drain worker to a callback that reports a staged page to the
         # pool, resetting the consumer's liveness watchdog. None on a normal reader.
         self._drain_progress: Callable[[], None] | None = None

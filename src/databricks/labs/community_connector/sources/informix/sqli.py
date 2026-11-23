@@ -90,6 +90,7 @@ from databricks.labs.community_connector.sources.informix.sqli_codec import (
     read_int32,
     read_session_packet,
     read_smallint,
+    redirect_host_key,
 )
 
 
@@ -393,12 +394,14 @@ class InformixSqliClient:
     ) -> None:
         if not redirected:
             return
-        if (host, port) not in self.redirect_allowlist:
+        # Both sides as redirect_host_key has them: a name case-insensitively, an address
+        # in its canonical form (the allow-list's IPv6 entries are bracketed).
+        if (redirect_host_key(host), port) not in self.redirect_allowlist:
             raise SqliUnsupportedAuthentication("redirect target is not explicitly allow-listed")
         resolved = addresses if addresses is not None else self._resolved_addresses(host, port)
         for value in resolved:
             address = ipaddress.ip_address(value)
-            if not address.is_global and (str(address), port) not in self.redirect_allowlist:
+            if not address.is_global and (address.compressed, port) not in self.redirect_allowlist:
                 raise SqliUnsupportedAuthentication("redirect resolved to a non-public address")
 
     def _reset_connection_state(self) -> None:
@@ -1103,5 +1106,6 @@ __all__ = [
     "encode_simple_command",
     "informix_locale_encoding",
     "parse_redirect_detail",
+    "redirect_host_key",
     "read_session_packet",
 ]

@@ -66,6 +66,7 @@ from databricks.labs.community_connector.sources.informix.sqli import (
     encode_simple_command,
     encode_variable_fetch,
     parse_redirect_detail,
+    redirect_host_key,
     read_session_packet,
 )
 
@@ -1179,6 +1180,39 @@ class SqliPacketTests(unittest.TestCase):
         for unsafe in ("label=srv|db.example|service", "label=srv|db.example|9089|extra"):
             with self.assertRaises(SqliUnsupportedAuthentication):
                 parse_redirect_detail(unsafe, {("db.example", 9089)})
+
+    def test_a_redirect_matches_its_allowlist_entry_in_any_case(self):
+        # DNS names are case-insensitive: a Connection Manager naming IFX-HDR.CORP.INTERNAL
+        # was refused against an entry written in lower case.
+        allowlist = {("ifx-hdr.corp.internal", 9088)}
+        self.assertEqual(
+            parse_redirect_detail("redirect:x:srv:IFX-HDR.CORP.INTERNAL:9088", allowlist),
+            ("srv", "IFX-HDR.CORP.INTERNAL", 9088),
+        )
+        self.assertEqual(redirect_host_key(" IFX-HDR.Corp.Internal. "), "ifx-hdr.corp.internal")
+        self.assertEqual(redirect_host_key("[FD00::0001]"), "fd00::1")
+        self.assertEqual(redirect_host_key("010.1.2.3"), "010.1.2.3")  # not an address
+        with self.assertRaises(SqliUnsupportedAuthentication):  # an IPv6 redirect itself
+            parse_redirect_detail("redirect:x:srv:fd00::1:9088", {("fd00::1", 9088)})
+
+    def test_a_redirect_to_a_private_ipv6_address_needs_its_bracketed_entry(self):
+        client = InformixSqliClient(
+            "origin",
+            9088,
+            "db",
+            "user",
+            "secret",
+            redirect_enabled=True,
+            redirect_allowlist=frozenset({("target.example", 9088)}),
+        )
+        resolved = [(10, 1, 6, "", ("fd00::1", 9088, 0, 0))]
+        with patch("socket.getaddrinfo", return_value=resolved):
+            with self.assertRaises(SqliUnsupportedAuthentication):
+                client._validate_redirect_destination("Target.Example", 9088, True)
+        # As _redirect_allowlist reads "target.example:9088,[FD00:0::1]:9088".
+        client.redirect_allowlist = frozenset({("target.example", 9088), ("fd00::1", 9088)})
+        with patch("socket.getaddrinfo", return_value=resolved):
+            client._validate_redirect_destination("Target.Example", 9088, True)
 
     def test_redirect_resolution_is_stable_and_private_requires_ip_allowlist(self):
         client = InformixSqliClient(

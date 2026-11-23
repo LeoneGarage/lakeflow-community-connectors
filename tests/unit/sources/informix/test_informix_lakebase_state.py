@@ -3153,6 +3153,8 @@ class _StagingTokenApi:
         self.scopes: list[str] = []
         self._next_id = 0
         self.create_error: int | None = None
+        # An HTTP status for bearer creates alone; the minting token's still succeeds.
+        self.bearer_create_error: int | None = None
         # Credentials that have expired or been revoked: a mint through one gets a 401.
         self.dead_credentials: set[str] = set()
         self.list_error = False
@@ -3184,6 +3186,8 @@ class _StagingTokenApi:
                 self._next_minter += 1
                 info["token_id"] = f"mid-{self._next_minter}"
                 return {"token_value": f"mint-{self._next_minter}", "token_info": info}
+            if self.bearer_create_error is not None:
+                raise lakebase_state.WorkspaceHttpError("nope", self.bearer_create_error)
             self.create_tokens.append(self.auth_token)
             self._next_id += 1
             info["token_id"] = f"tid-{self._next_id}"
@@ -3439,6 +3443,40 @@ class StagingCredentialProviderTests(unittest.TestCase):
         provider, _ = self._provider(api, clock=lambda: 0.0)
         with self.assertRaises(lakebase_state.StagingTokenUnavailable):
             provider.bearer()
+
+    def test_a_failed_first_bearer_mint_revokes_the_minting_token_made_for_it(self):
+        # Held only by the provider, which never took it up, it would live out its
+        # lifetime.
+        api = _StagingTokenApi()
+        api.bearer_create_error = 403
+        provider, used = self._provider(api, clock=lambda: 0.0)
+        with self.assertRaises(lakebase_state.StagingTokenUnavailable):
+            provider.bearer()
+        self.assertEqual(api.deleted, ["mid-1"])
+        # Through the credential that made it.
+        self.assertEqual(used[-1], "bootstrap-token")
+
+    def test_a_failed_bearer_refresh_revokes_its_minting_token_and_keeps_the_pair(self):
+        # Retried a minute on, a refresh whose bearer mint failed left a minting token
+        # behind each time.
+        api = _StagingTokenApi()
+        now = {"t": 0.0}
+        provider, used = self._provider(api, clock=lambda: now["t"], lifetime_seconds=1000)
+        self.assertEqual(provider.bearer(), "dapi-1")
+        api.bearer_create_error = 500
+        for attempt in range(3):
+            now["t"] = 600.0 + attempt * 61
+            with self.assertLogs(informix_modules.LOGGER, "WARNING"):
+                self.assertEqual(provider.bearer(), "dapi-1")
+        self.assertEqual(api.deleted, ["mid-2", "mid-3", "mid-4"])
+        self.assertEqual(used[-1], "mint-1")
+        # The pair in use is kept: the next refresh mints through the same minting token.
+        api.bearer_create_error = None
+        now["t"] = 800.0
+        self.assertEqual(provider.bearer(), "dapi-2")
+        self.assertEqual(api.minter_tokens[-1], "mint-1")
+        self.assertIn("mid-1", api.deleted)
+        self.assertNotIn("mid-5", api.deleted)
 
     def test_mint_revokes_earlier_updates_and_stores_the_token_nowhere(self):
         # The token lives in the process that minted it. Nothing reads a stored copy, so

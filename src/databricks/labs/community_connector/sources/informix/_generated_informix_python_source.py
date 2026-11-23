@@ -2167,17 +2167,10 @@ def register_lakeflow_source(spark):
     # append-only consumer, so it is floored *below* the CDC daemon -- into a band the CDC
     # daemon cannot claim -- rather than sharing the CDC floor and being starved by it.
     _SNAPSHOT_DAEMON_SLOT_MARKER_OPTION = "_informix.snapshot.daemon.slot"
-    # Private, published per read by a yielding continuous reader: how long this
-    # attempt may spend acquiring a slot before the reader gives up and returns empty.
-    _CONNECTION_ATTEMPT_BUDGET_OPTION = "_informix.connection.attempt.budget.seconds"
     # Remaining connection-acquisition budget shared by every internal read in one
     # readBetweenOffsets() call. Without this, each advisory bootstrap retry starts a
     # fresh connection.wait.timeout.seconds window and multiplies the configured cap.
     _REPLAY_CONNECTION_WAIT_BUDGET_OPTION = "_informix.replay.connection.wait.budget.seconds"
-    # Carries the reader's backlog rank to the bridge for the duration of one read, so
-    # acquisition can prioritise by sweep cadence. Separate from the budget option
-    # because a *blocking* reader has no budget at all yet still needs a rank.
-    _CONNECTION_ATTEMPT_RANK_OPTION = "_informix.connection.attempt.backlog.rank"
     _DEFAULT_CONNECTION_WAIT_TIMEOUT_SECONDS = 10 * 60
     # One-shot jittered delay a reader sleeps before its *first* connection, so a pipeline that
     # starts dozens of flows at once does not open all their Informix CDC sessions in the same
@@ -3383,12 +3376,22 @@ def register_lakeflow_source(spark):
                 self._update_id,
                 _STAGING_MINTER_SCOPES,
             )
-            token, token_id, granted = mint_staging_token(
-                _WorkspaceApi(self._host, minter),
-                self._pipeline_id,
-                self._lifetime_seconds,
-                self._update_id,
-            )
+            try:
+                token, token_id, granted = mint_staging_token(
+                    _WorkspaceApi(self._host, minter),
+                    self._pipeline_id,
+                    self._lifetime_seconds,
+                    self._update_id,
+                )
+            except Exception:
+                # The minting token just made goes too, through the credential that made it:
+                # held nowhere else, it would live out its lifetime, and a failed refresh,
+                # tried again a minute on, left one more each time.
+                if minter_id:
+                    revoke_stale_staging_tokens(
+                        _WorkspaceApi(self._host, minting_token), self._pipeline_id, "", minter_id
+                    )
+                raise
             predecessor_id, replaced_minter_id = self._token_id, self._minter_id
             self._token, self._token_id = token, token_id
             self._minter, self._minter_id = minter, minter_id
@@ -7771,2681 +7774,6 @@ def register_lakeflow_source(spark):
 
 
     ########################################################
-    # src/databricks/labs/community_connector/sources/informix/informix_transactions.py
-    ########################################################
-
-    def _apply_function(name: str, value: Any, literals: list, context: dict) -> Any:
-        # Docstring: Evaluate one function on an already-evaluated operand ``value``.
-        #
-        # NULL in gives NULL out, except NVL/COALESCE, which replace it, and NULLIFY, which
-        # always gives NULL. ``context`` holds the byte encoding LENGTH counts in and the
-        # HMAC key HASH uses.
-
-        if name == "NULLIFY":
-            return None
-        if name in ("NVL", "COALESCE"):
-            return literals[0] if value is None else value
-        if value is None:
-            return None
-        if name == "HASH":
-            key = context.get("hash_key")
-            if not key:
-                # 111: HASH needs the connection option '{}'
-                raise InformixError(_m(111, _TRANSFORM_HASH_KEY_OPTION))
-            return hmac.new(key, _hash_text(value).encode("utf-8"), hashlib.sha256).hexdigest()
-        if name in _STRING_FUNCTION_NAMES:
-            text = str(value)
-            if name in ("UPPER", "LOWER"):
-                return _case_map(text, name == "UPPER")
-            if name == "TRIM":
-                return text.strip(" ")
-            if name == "LTRIM":
-                return text.lstrip(" ")
-            if name == "RTRIM":
-                return text.rstrip(" ")
-            if name == "LENGTH":
-                # Bytes, without trailing blanks, as Informix counts.
-                return len(text.rstrip(" ").encode(context.get("encoding", "latin-1"), "replace"))
-            if name == "CHAR_LENGTH":
-                return len(text)
-            if name == "SUBSTR":
-                # A start past the end gives NULL, as on Informix; an in-range empty slice is ''.
-                start = int(literals[0]) - 1
-                if start >= len(text):
-                    return None
-                return text[start:] if len(literals) == 1 else text[start : start + int(literals[1])]
-            if name == "REPLACE":
-                return text.replace(literals[0], literals[1] if len(literals) > 1 else "")
-            if name in ("LPAD", "RPAD"):
-                width, pad = int(literals[0]), literals[1]
-                if len(text) >= width:
-                    return text[:width]
-                fill = (pad * width)[: width - len(text)]
-                return fill + text if name == "LPAD" else text + fill
-            # MASK keeps the last ``keep`` characters; a value no longer than that is
-            # masked whole, so a short value does not pass through unmasked.
-            keep = int(literals[0]) if literals else 0
-            character = literals[1] if len(literals) > 1 else "*"
-            if len(text) <= keep:
-                return character * len(text)
-            return character * (len(text) - keep) + (text[len(text) - keep :] if keep else "")
-        if name in ("YEAR", "MONTH", "DAY", "WEEKDAY"):
-            moment = _temporal(value)
-            if name == "WEEKDAY":
-                return moment.isoweekday() % 7  # Informix: 0 is Sunday
-            return getattr(moment, name.lower())
-        with localcontext() as decimal_context:
-            # Wide enough for a DECIMAL(p) with no scale, whose values run from 1E-130 to
-            # 1E+126: rounding one to a whole number takes over a hundred digits.
-            decimal_context.prec = 200
-            # A float by the digits it shows (1.15, not its binary 1.1499...), as
-            # _hash_number_text reads one, so a half rounds as the documentation says.
-            number = Decimal(repr(value)) if isinstance(value, float) else Decimal(value)
-            if name == "ABS":
-                result = abs(number)
-            elif name == "MOD":
-                # Informix truncates both operands to integers; the sign follows the dividend.
-                whole = number.to_integral_value(rounding=ROUND_DOWN)
-                result = whole % Decimal(literals[0]).to_integral_value(rounding=ROUND_DOWN)
-            else:
-                digits = int(literals[0]) if literals else 0
-                result = number.quantize(
-                    Decimal(1).scaleb(-digits),
-                    rounding=ROUND_HALF_UP if name == "ROUND" else ROUND_DOWN,
-                )
-                # Negative digits leave a positive exponent (1.2E+4): write it out in full.
-                result = result.quantize(Decimal(1)) if digits < 0 else result
-        # Back in the type the column's values arrive as, which the schema declares: a
-        # variable-scale DECIMAL can arrive as a float or a fixed-point string.
-        if isinstance(value, str):
-            # Zero unsigned, as Informix and the decimal decoders write it ("-0" hashed apart).
-            return format(result or abs(result), "f")
-        if isinstance(value, float):
-            return float(result)
-        return result if isinstance(value, Decimal) else int(result)
-
-
-    def _pad_char(text: str, width: int, encoding: str) -> str:
-        # Docstring: ``text`` blank-padded as Informix stores a CHAR: to ``width`` bytes of the
-        # database code set, so a multibyte character takes more than one of them.
-
-        missing = width - len(text.encode(encoding, "replace"))
-        return text + " " * missing if missing > 0 else text
-
-
-    def _rounded_half_up(value: Decimal, places: int) -> Decimal:
-        # Docstring: ``value`` at ``places``, a half away from zero as ROUND rounds one: under
-        # the default half-even, NVL(ROUND(vcol, 0), 2.5) landed 2 where ROUND lands 3.
-
-        with localcontext() as decimal_context:
-            # As _apply_function's: a DECIMAL(p) fallback of 1e100 at 2 places is 103 digits.
-            decimal_context.prec = 200
-            return value.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
-
-
-    def _number_text_places(operand: str | tuple) -> int | None:
-        # Docstring: The places a number function's text values carry (see _apply_function):
-        # ROUND's and TRUNC's digits, none for MOD, ABS those of what it reads; None for the
-        # column's own text, which drops trailing zeros.
-
-        while not isinstance(operand, str):
-            _, name, arguments = operand
-            if name in ("ROUND", "TRUNC"):
-                return max(int(arguments[1][1]) if len(arguments) > 1 else 0, 0)
-            if name == "MOD":
-                return 0
-            operand = arguments[0]
-        return None
-
-
-    def _number_for_column(value: Decimal, column: "Column", options: dict[str, str]) -> Any:
-        # Docstring: ``value`` as the Python number ``column``'s decoded values are.
-
-        if column.type_name in _INTEGER_RANKS:
-            return int(value)
-        if column.type_name in _UNLOAD_FLOAT_TYPES:
-            # As the column's own values: a SMALLFLOAT's 32 bits, so HASH reads its digits alike.
-            smallfloat = column.type_name in {"SMALLFLOAT", "REAL"}
-            return _float32(float(value)) if smallfloat else float(value)
-        if column.type_name in {"DECIMAL", "NUMERIC", "MONEY"}:
-            if _is_variable_scale_decimal(column):
-                target = _variable_decimal_target(column, options)
-                if target[0] == "decimal":
-                    # Rounded as below, not cut as the column's own values are.
-                    value = _rounded_half_up(value, target[2] or 0)
-                return _coerce_variable_decimal_value(value, column, target)
-            if column.scale is not None:
-                scale = column.scale
-            else:
-                scale = 2 if column.type_name == "MONEY" else 0
-            # Past the default 28 digits (a DECIMAL holds up to 32), and as ROUND rounds.
-            return _rounded_half_up(value, scale)
-        return value
-
-
-    def _fallback_value(literal: Any, operand: str | tuple, context: dict) -> Any:
-        # Docstring: NVL/COALESCE's fallback in the representation of what it stands in for.
-        #
-        # In a filter a CHAR column's fallback is padded to the column's width, as Informix
-        # pads it. In a transform a number literal, parsed as a Decimal, becomes the Python
-        # type the operand's other values have -- an int for an integer column or an
-        # integer-result function, a Decimal at the column's scale, or the configured
-        # variable-scale form -- so every row of a transformed column carries one type.
-        # ``context["columns"]`` supplies the columns, on demand when it is callable.
-
-        if isinstance(literal, str):
-            if isinstance(operand, str):
-                width = context.get("pad", {}).get(operand)
-                if width:
-                    return _pad_char(literal, width, context.get("encoding", "latin-1"))
-            return literal
-        if not isinstance(literal, Decimal):
-            return literal
-        if any(name in _INTEGER_RESULT_FUNCTIONS for name in _operand_functions(operand)):
-            return int(literal)
-        columns = context.get("columns")
-        if callable(columns):
-            columns = context["columns"] = {column.name: column for column in columns()}
-        column = (columns or {}).get(_expression_column(operand))
-        if column is None:
-            return literal
-        options = context.get("options") or {}
-        if not isinstance(operand, str):
-            # A function can land in another type than its column (see _transform_spark_type),
-            # and the fallback lands as the function's values do: ROUND(vcol, 0) is a
-            # DECIMAL(38,0) where vcol is a DECIMAL(38,18), and 10^20 fits the one, not the
-            # other; ROUND(int_col, -3) can be a BIGINT. So is ROUND's carry digit: under
-            # decimal(5,2), NVL(ROUND(vcol, 2), 1000) was checked against the DECIMAL(6,2)
-            # and then failed the first NULL against the column's decimal(5,2).
-            inner = _transform_spark_type(operand, column, options)
-            if isinstance(inner, (IntegerType, LongType)):
-                return int(literal)
-            places = None
-            if isinstance(inner, DecimalType) and inner != _spark_type(column, options):
-                places = inner.scale
-            elif isinstance(inner, StringType) and _is_variable_scale_decimal(column):
-                # As a string, at the places the function's values have: ROUND(vcol, 2)
-                # writes 12.30, so the fallback 12.3 must too, or HASH gave the two digests.
-                # Only padded: a string holds 12.345 as given.
-                places = _number_text_places(operand)
-                if places is not None:
-                    places = max(places, -literal.as_tuple().exponent)
-            if places is not None:
-                result = _rounded_half_up(literal, places)
-                if isinstance(inner, DecimalType):
-                    return result
-                return format(result or abs(result), "f")
-        return _number_for_column(literal, column, options)
-
-
-    def _expression_value(operand: str | tuple, row: dict, context: dict) -> Any:
-        # Docstring: Evaluate an operand on ``row``. In a filter, ``context["pad"]`` names the
-        # CHAR columns and their widths: Informix applies functions to the blank-padded
-        # value, which decoding stripped, so a CHAR operand is padded back first.
-
-        if isinstance(operand, str):
-            value = row.get(operand)
-            width = context.get("pad", {}).get(operand)
-            if width and value is not None:
-                value = _pad_char(str(value), width, context.get("encoding", "latin-1"))
-            return value
-        _, name, arguments = operand
-        value = _expression_value(arguments[0], row, context)
-        literals = [literal[1] for literal in arguments[1:]]
-        if name in ("NVL", "COALESCE") and value is None:
-            return _fallback_value(literals[0], arguments[0], context)
-        return _apply_function(name, value, literals, context)
-
-
-    def _transformed_rows(rows: Iterator[dict], transforms: tuple | None, context: dict):
-        # Docstring: ``rows`` with each transformed column's value replaced (source names).
-
-        if not transforms:
-            return rows
-
-        def apply(row: dict) -> dict:
-            out = dict(row)
-            for name, _, operand in transforms:
-                if name in out:
-                    value = _expression_value(operand, out, context)
-                    if (
-                        isinstance(value, int)
-                        and not isinstance(value, bool)
-                        and not -(1 << 63) <= value < (1 << 63)
-                    ):
-                        # ABS of the lowest INT8, or a BIGINT rounded up past the highest:
-                        # no 64-bit column holds it, and Informix refuses it too.
-                        # 451: Transform of column {} gives {}, which is outside the range of
-                        # a 64-bit integer
-                        raise InformixError(_m(451, name, value))
-                    if isinstance(value, Decimal) and value.is_finite() and value.adjusted() >= 38:
-                        # ROUND to a negative digit of a DECIMAL(38,0) (decimal.variable.type:
-                        # decimal(38,0)) has no digit left for the carry: 38 nines to the ten
-                        # is 10^38, which failed the batch in Spark.
-                        # 466: Transform of column {} gives {}, which has more integer digits
-                        # than a DECIMAL(38), Spark's largest, holds
-                        raise InformixError(_m(466, name, value))
-                    out[name] = _framework_value(value)
-            return out
-
-        return (apply(row) for row in rows)
-
-
-    def _renamed_rows(rows: Iterator[dict], renames: tuple[tuple[str, str], ...] | None):
-        # Docstring: ``rows`` with their keys under the destination names ``renames`` gives.
-
-        if not renames:
-            return rows
-        mapping = dict(renames)
-        return ({mapping.get(key, key): value for key, value in row.items()} for row in rows)
-
-
-    _ROW_FILTER_LIKE_CACHE: dict[tuple[str, str], re.Pattern] = {}
-
-
-    def _transform_may_null(operand: str | tuple) -> bool:
-        # Docstring: Whether a transform can turn a non-NULL value into NULL: NULLIFY always does
-        # and SUBSTR does past the end of the string. Every other function keeps a value, so a
-        # NOT NULL column stays NOT NULL through HASH, MASK, UPPER, ABS, and the rest.
-
-        return any(name in ("NULLIFY", "SUBSTR") for name in _operand_functions(operand))
-
-
-    def _apply_row_filter(table: Table, text: str | None) -> Table:
-        # Docstring: Validate ``text`` against ``table`` and record its canonical form on the table.
-
-        if text is None or not str(text).strip():
-            return table if table.row_filter is None else replace(table, row_filter=None)
-        if len(str(text)) > 8192:
-            # 115: Option '{}' cannot exceed 8192 characters, as given or written out in full
-            raise ValueError(_m(115, _ROW_FILTER_OPTION))
-        tree = _parse_row_filter(str(text))
-        _check_row_filter(tree, table)
-        canonical = _row_filter_text(tree)
-        if len(canonical) > 8192:
-            # The canonical form is what a schema refresh checks again: longer, it passed here
-            # and then failed the refresh.
-            # 115: Option '{}' cannot exceed 8192 characters, as given or written out in full
-            raise ValueError(_m(115, _ROW_FILTER_OPTION))
-        return table if table.row_filter == canonical else replace(table, row_filter=canonical)
-
-
-    def _filter_column_names(node: tuple):
-        # Docstring: The columns a row_filter tree reads.
-
-        if node[0] in ("and", "or"):
-            for child in node[1]:
-                yield from _filter_column_names(child)
-        elif node[0] == "not":
-            yield from _filter_column_names(node[1])
-        else:
-            yield _expression_column(node[1])
-
-
-    def _operand_kind(operand: str | tuple, kinds: dict) -> str | None:
-        # Docstring: The kind a validated operand evaluates to (see _expression_kind).
-
-        if isinstance(operand, str):
-            return kinds[operand]
-        result = _EXPRESSION_FUNCTIONS[operand[1]][2]
-        return _operand_kind(operand[2][0], kinds) if result == "same" else result
-
-
-    def _row_filter_like(pattern: str, escape: str) -> re.Pattern:
-        # Docstring: Compile a LIKE pattern (trailing blanks already removed) to a regex.
-
-        key = (pattern, escape)
-        compiled = _ROW_FILTER_LIKE_CACHE.get(key)
-        if compiled is None:
-            parts = []
-            index = 0
-            while index < len(pattern):
-                character = pattern[index]
-                if character == escape:
-                    index += 1
-                    parts.append(re.escape(pattern[index]))
-                elif character == "%":
-                    parts.append(".*")
-                elif character == "_":
-                    parts.append(".")
-                else:
-                    parts.append(re.escape(character))
-                index += 1
-            compiled = re.compile("".join(parts), re.DOTALL)
-            if len(_ROW_FILTER_LIKE_CACHE) >= 256:
-                _ROW_FILTER_LIKE_CACHE.clear()
-            _ROW_FILTER_LIKE_CACHE[key] = compiled
-        return compiled
-
-
-    def _row_filter_compare(value: Any, op: str, literal: Any, kind: str | None) -> bool:
-        if kind in ("string", "nstring"):
-            # Pad to equal width: SQL compares CHAR and VARCHAR as if blank-padded.
-            value = str(value)
-            width = max(len(value), len(literal))
-            value, literal = value.ljust(width), literal.ljust(width)
-        elif kind == "timestamp" and isinstance(value, datetime) and value.tzinfo is not None:
-            # The decoder tags year-1 values UTC only so PySpark accepts them.
-            value = value.replace(tzinfo=None)
-        elif kind == "float":
-            # As Informix compares: the literal read as a double, against the value's.
-            literal = float(literal)
-        elif kind == "smallfloat":
-            # In single precision, as Informix compares a SMALLFLOAT: the literal through a
-            # double to 32 bits, against the value's 32 bits (a .unl file gives 9 digits of it).
-            value, literal = _float32(value), _float32(float(literal))
-        if op == "=":
-            return value == literal
-        if op == "<>":
-            return value != literal
-        if op == "<":
-            return value < literal
-        if op == "<=":
-            return value <= literal
-        if op == ">":
-            return value > literal
-        return value >= literal
-
-
-    def _row_filter_value(node: tuple, row: dict, kinds: dict, context: dict) -> bool | None:
-        tag = node[0]
-        if tag in ("and", "or"):
-            # AND stops at the first False, OR at the first True; a NULL otherwise wins.
-            stop = tag == "or"
-            result: bool | None = not stop
-            for child in node[1]:
-                value = _row_filter_value(child, row, kinds, context)
-                if value is stop:
-                    return stop
-                if value is None:
-                    result = None
-            return result
-        if tag == "not":
-            value = _row_filter_value(node[1], row, kinds, context)
-            return None if value is None else not value
-        operand = node[1]
-        if isinstance(operand, str):
-            value, kind = row.get(operand), kinds[operand]
-        else:
-            value = _expression_value(operand, row, context)
-            kind = _operand_kind(operand, kinds)
-        if tag == "null":
-            return (value is None) != node[2]
-        if value is None:
-            return None
-        if tag == "cmp":
-            return _row_filter_compare(value, node[2], node[3][1], kind)
-        if tag == "in":
-            hit = any(_row_filter_compare(value, "=", literal[1], kind) for literal in node[3])
-            return hit != node[2]
-        if tag == "like":
-            hit = _row_filter_like(node[3][1], node[4]).fullmatch(str(value).rstrip(" ")) is not None
-            return hit != node[2]
-        inside = _row_filter_compare(value, ">=", node[3][1], kind) and _row_filter_compare(
-            value, "<=", node[4][1], kind
-        )
-        return inside != node[2]
-
-
-    def _row_filter_matches(predicate: tuple, row: dict) -> bool:
-        # Docstring: Whether ``row`` -- decoded Python values by column -- passes the filter.
-        # Unknown (NULL) counts as no match, exactly as in a SQL WHERE clause.
-
-        tree, kinds, context = predicate
-        return _row_filter_value(tree, row, kinds, context) is True
-
-
-    def _filtered_pages(consume: Callable, predicate: tuple, max_rows: int = 0) -> Callable:
-        # Docstring: ``consume`` given only the rows of each page that pass ``predicate``, its
-        # pages numbered on without a gap where none does, and no more than ``max_rows`` of them
-        # (0, any number): counted before the filter, a snapshot whose rows passed it read as
-        # too many, unlike the snapshot-only read's (see _read_snapshot_only).
-
-        kept = [0, 0]
-
-        def consumer(lsn: int, _index: int, rows: list) -> None:
-            rows = [row for row in rows if _row_filter_matches(predicate, row)]
-            kept[1] += len(rows)
-            if max_rows and kept[1] > max_rows:
-                # 52: Initial snapshot exceeds snapshot.max.rows={}
-                raise InformixError(_m(52, max_rows))
-            if rows:
-                consume(lsn, kept[0], rows)
-                kept[0] += 1
-
-        return consumer
-
-
-    def _row_filter_predicate(table: Table, encoding: str = "latin-1") -> tuple | None:
-        # Docstring: ``table``'s parsed row_filter with what evaluating it needs -- each
-        # column's kind and, for functions, the CHAR widths to re-pad and the byte encoding
-        # LENGTH counts in -- ready for :func:`_row_filter_matches`, or None without a filter.
-
-        if table.row_filter is None:
-            return None
-        kinds = {column.name: _row_filter_kind(column) for column in table.columns}
-        pad = {
-            column.name: int(column.length)
-            for column in table.columns
-            if column.type_name in {"CHAR", "NCHAR"} and column.length
-        }
-        return _parse_row_filter(table.row_filter), kinds, {"pad": pad, "encoding": encoding}
-
-
-    def _validated_volume_location(location: str, option_name: str, options: dict[str, str]) -> str:
-        if not os.path.isabs(location):
-            # 116: Option '{}' must be an absolute path
-            raise ValueError(_m(116, option_name))
-        normalized = os.path.normpath(location)
-        if normalized != location.rstrip("/") or any(
-            part in {".", ".."} for part in location.split("/")
-        ):
-            # 117: Option '{}' must not contain traversal
-            raise ValueError(_m(117, option_name))
-        if options.get("hostname"):
-            parts = normalized.split("/")
-            if len(parts) < 5 or parts[1] != "Volumes" or any(not part for part in parts[2:5]):
-                # 118: Option '{}' must be a Unity Catalog Volume path under
-                # /Volumes/<catalog>/<schema>/<volume>
-                raise ValueError(_m(118, option_name))
-        return normalized
-
-
-    def _newest_created_entry_mtime(path: str, recursive: bool = False) -> float:
-        # Docstring: Return the newest storage-assigned timestamp without trusting directory updates.
-        #
-        # Considers only the creation timestamps of the *files* found beneath ``path``.
-        # Every artifact this inspects is created with O_EXCL and never rewritten, so a
-        # file's mtime is its creation time.
-        #
-        # Directory mtimes are excluded because their meaning is filesystem-specific:
-        # a local POSIX filesystem advances them when entries are *removed*, while a
-        # Volume settles them to a creation-like whole second but briefly surfaces a
-        # transient post-mutation value first. Either way, cleaning an artifact's
-        # contents could make the artifact look newly created to a caller sampling at
-        # the wrong moment, keeping a stale lease alive. The scanned directory's own
-        # timestamp is used only when it contains no files at all, where it bounds the
-        # age rather than extending it.
-
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        root = os.open(path, flags)
-        newest: float | None = None
-        stack = [root]
-        try:
-            # Inside: a mount that dropped between the open and the stat left the root open.
-            root_mtime = os.fstat(root).st_mtime
-            while stack:
-                descriptor = stack.pop()
-                try:
-                    with os.scandir(descriptor) as entries:
-                        for entry in entries:
-                            metadata = entry.stat(follow_symlinks=False)
-                            if not stat.S_ISDIR(metadata.st_mode):
-                                created_at = metadata.st_mtime
-                                newest = created_at if newest is None else max(newest, created_at)
-                            elif recursive:
-                                stack.append(os.open(entry.name, flags, dir_fd=descriptor))
-                finally:
-                    os.close(descriptor)
-            return root_mtime if newest is None else newest
-        except BaseException:
-            for descriptor in stack:
-                os.close(descriptor)
-            raise
-
-
-    def _created_since(path: str, cutoff: float) -> bool:
-        # Docstring: Whether anything beneath ``path`` was created at or after ``cutoff``, by the
-        # rule of _newest_created_entry_mtime (files only; a tree with none goes by its own
-        # directory), stopping at the first such file. Directories are told apart by the listing
-        # where it carries the entry type, and only files are statted, so an active run of
-        # thousands of pages costs two listings and one stat, not a stat of every page over the
-        # mount.
-
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        root = os.open(path, flags)
-        stack = [root]
-        files = False
-        try:
-            root_mtime = os.fstat(root).st_mtime
-            while stack:
-                descriptor = stack.pop()
-                try:
-                    directories = []
-                    with os.scandir(descriptor) as entries:
-                        for entry in entries:
-                            if entry.is_dir(follow_symlinks=False):
-                                directories.append(entry.name)
-                            elif entry.stat(follow_symlinks=False).st_mtime >= cutoff:
-                                return True
-                            else:
-                                files = True
-                    for name in directories:
-                        stack.append(os.open(name, flags, dir_fd=descriptor))
-                finally:
-                    os.close(descriptor)
-            return not files and root_mtime >= cutoff
-        finally:
-            for descriptor in stack:
-                os.close(descriptor)
-
-
-    def _unchanged_directories(cutoff: float, *paths: str) -> list[str]:
-        # Docstring: Those of ``paths`` that no entry was added to or taken from since ``cutoff``.
-        #
-        # The sweeps took the runs, scans and stages out and left the directories that held
-        # them, one scope directory for every update that ever staged, each listed over the
-        # mount again by every later sweep. A sweep removes those it empties that were
-        # unchanged before it began on them: one that changed within the retention window may
-        # be where a reader of that update is staging.
-
-        unchanged = []
-        for path in paths:
-            with contextlib.suppress(OSError):
-                if os.stat(path, follow_symlinks=False).st_mtime < cutoff:
-                    unchanged.append(path)
-        return unchanged
-
-
-    def _staging_subdirectories(path: str) -> list[str]:
-        # Docstring: Immediate subdirectory paths of ``path``; empty if it is absent or unreadable.
-        #
-        # Best-effort helper for the retention sweep: a missing path (nothing staged) is not
-        # an error, and a scan failure must never fail a read -- the sweep is a background
-        # safety net.
-
-        try:
-            with os.scandir(path) as entries:
-                return [entry.path for entry in entries if entry.is_dir(follow_symlinks=False)]
-        except FileNotFoundError:
-            return []
-        except OSError:
-            # 119: Cannot scan Informix snapshot staging path: {}
-            logging.getLogger(__name__).warning(_m(119, path), exc_info=True)
-            return []
-
-
-    def _scandir(descriptor: int) -> os.ScandirIterator:
-        # Docstring: os.scandir of an open directory, which it closes if that fails (a dropped
-        # mount): it is on no stack yet, which would close it.
-
-        try:
-            return os.scandir(descriptor)
-        except BaseException:
-            os.close(descriptor)
-            raise
-
-
-    def _remove_candidate_tree_at(parent_descriptor: int, name: str) -> None:
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        root = os.open(name, flags, dir_fd=parent_descriptor)
-        stack: list[tuple[int, os.ScandirIterator, str | None]] = [(root, _scandir(root), None)]
-        try:
-            while stack:
-                descriptor, entries, child_name = stack[-1]
-                try:
-                    entry = next(entries)
-                except StopIteration:
-                    entries.close()
-                    os.close(descriptor)
-                    stack.pop()
-                    if stack and child_name is not None:
-                        os.rmdir(child_name, dir_fd=stack[-1][0])
-                    continue
-                metadata = entry.stat(follow_symlinks=False)
-                if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
-                    child = os.open(entry.name, flags, dir_fd=descriptor)
-                    stack.append((child, _scandir(child), entry.name))
-                else:
-                    os.unlink(entry.name, dir_fd=descriptor)
-        finally:
-            while stack:
-                descriptor, entries, _ = stack.pop()
-                entries.close()
-                os.close(descriptor)
-
-
-    def _path_present(path: str) -> bool:
-        # Docstring: Whether something may still be at ``path``: anything but its absence counts.
-        #
-        # Not os.path.lexists, which reads a dropped mount as nothing there: a stage was then
-        # recorded as cleaned with its pages left.
-
-        try:
-            os.lstat(path)
-        except FileNotFoundError:
-            return False
-        except OSError:
-            return True
-        return True
-
-
-    def _is_path(path: str, *, directory: bool = False) -> bool:
-        # Docstring: Whether ``path`` is a regular file (a directory with ``directory``).
-        #
-        # Not os.path.isfile or isdir, which read every OSError as False: a dropped Volume mount
-        # (ENOTCONN) passed for a missing file, and a read the mount retry would have carried
-        # failed for good instead (a snapshot.source with "no .unl files").
-
-        try:
-            mode = os.stat(path).st_mode
-        except (FileNotFoundError, NotADirectoryError):
-            return False
-        return stat.S_ISDIR(mode) if directory else stat.S_ISREG(mode)
-
-
-    def _remove_tree(path: str) -> None:
-        # Docstring: Remove a directory tree, a missing one counting as removed. Any other
-        # failure raises: rmtree's ignore_errors kept the records of a scan under a dropped
-        # mount, for a later read to take up as its own.
-
-        with contextlib.suppress(FileNotFoundError):
-            shutil.rmtree(path)
-
-
-    def _dropped_mount_error(error: BaseException) -> OSError | None:
-        # Docstring: Return the ENOTCONN in ``error``'s cause chain, if a dropped mount caused it.
-        #
-        # Snapshot page staging is the only remaining Volume user, but it still touches
-        # the mount from several calls -- open, makedirs, rename, listdir -- and only
-        # ``os.open`` goes through the retry helper. When the mount drops, whichever
-        # call runs first raises ENOTCONN, so no single site can be the place this is
-        # handled; production saw it surface from two different sites in consecutive
-        # updates.
-        #
-        # Classifying at the read boundary instead covers every site at once. The
-        # caller converts this into the same empty-batch checkpoint retry it already
-        # uses for a transiently inaccessible Volume, which is exactly what a remount
-        # needs: the mount returns within seconds and the next read proceeds.
-
-        seen: set[int] = set()
-        cursor: BaseException | None = error
-        while cursor is not None and id(cursor) not in seen:
-            seen.add(id(cursor))
-            if isinstance(cursor, OSError) and cursor.errno == errno.ENOTCONN:
-                return cursor
-            cursor = cursor.__cause__ or cursor.__context__
-        return None
-
-
-    def _open_state_entry_with_retry(path: str, flags: int, *, dir_fd: int | None = None) -> int:
-        # Docstring: Open one state entry, retrying transient Volume permission and mount failures.
-
-        last_error: OSError | None = None
-        for attempt in range(_SHARED_STATE_OPEN_ATTEMPTS):
-            try:
-                return os.open(path, flags, dir_fd=dir_fd)
-            except OSError as error:
-                if error.errno not in {errno.EPERM, errno.EACCES, errno.ENOTCONN}:
-                    raise
-                if error.errno == errno.ENOTCONN:
-                    # The Volume's FUSE mount dropped: the filesystem itself is
-                    # briefly gone rather than this entry being denied. Observed in
-                    # production taking down 23 flows at once, every one failing on
-                    # the shared-state root, while the mount was healthy again
-                    # moments later. A remount settles on a scale of seconds, not the
-                    # milliseconds a permission blip needs, so this backs off harder
-                    # (and skips the symlink check below, which exists only to
-                    # disambiguate EPERM and cannot stat an absent filesystem).
-                    last_error = error
-                    if attempt + 1 < _SHARED_STATE_OPEN_ATTEMPTS:
-                        delay = min(0.25 * (2**attempt), _SHARED_STATE_MOUNT_RETRY_MAX_SECONDS)
-                        time.sleep(random.uniform(delay / 2, delay))
-                    continue
-                # Some filesystems report EPERM rather than ELOOP for O_NOFOLLOW.
-                # Preserve the security distinction between a transiently denied
-                # Volume entry and a replaceable symlink.
-                try:
-                    entry = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
-                except OSError:
-                    entry = None
-                if entry is not None and stat.S_ISLNK(entry.st_mode):
-                    # 120: Informix shared-state path traverses symlink: '{}'
-                    raise InformixError(_m(120, path)) from error
-                last_error = error
-                if attempt + 1 < _SHARED_STATE_OPEN_ATTEMPTS:
-                    delay = min(0.01 * (2**attempt), 0.25)
-                    time.sleep(random.uniform(delay / 2, delay))
-        # 121: Informix shared state is temporarily inaccessible: '{}'
-        raise SharedStateAccessUnavailable(_m(121, path)) from last_error
-
-
-    def _open_state_directory(root: str, path: str) -> int:
-        # Docstring: Open a directory beneath root without following a replaceable symlink.
-        #
-        # Both are normalised first: commonpath keeps "..", so a path that climbed out of the
-        # root passed and was walked out of it a part at a time, and a root given with a
-        # trailing slash refused every path beneath it.
-
-        root, path = os.path.normpath(root), os.path.normpath(path)
-        if os.path.commonpath((root, path)) != root:
-            # 122: Informix shared-state path escapes '{}': '{}'
-            raise InformixError(_m(122, root, path))
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-
-        def entry(name: str, **kwargs: Any) -> int:
-            try:
-                return _open_state_entry_with_retry(name, flags, **kwargs)
-            except OSError as error:
-                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
-                    # 123: Informix shared-state path traverses symlink or non-directory: '{}'
-                    raise InformixError(_m(123, path)) from error
-                raise
-
-        descriptor = entry(root)
-        try:
-            relative = os.path.relpath(path, root)
-            for part in () if relative == "." else relative.split(os.sep):
-                child = entry(part, dir_fd=descriptor)
-                os.close(descriptor)
-                descriptor = child
-            return descriptor
-        except BaseException:
-            os.close(descriptor)
-            raise
-
-
-    def _open_state_file(root: str, path: str) -> int:
-        parent = os.path.dirname(path)
-        directory = _open_state_directory(root, parent)
-        try:
-            try:
-                return _open_state_entry_with_retry(
-                    os.path.basename(path),
-                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                    dir_fd=directory,
-                )
-            except OSError as error:
-                if error.errno == errno.ELOOP:
-                    # 124: Informix shared-state path traverses symlink '{}'
-                    raise InformixError(_m(124, path)) from error
-                raise
-        finally:
-            os.close(directory)
-
-
-    def _redirect_allowlist(value: str) -> frozenset[tuple[str, int]]:
-        result: set[tuple[str, int]] = set()
-        for item in filter(None, (part.strip() for part in value.split(","))):
-            host, separator, port_text = item.rpartition(":")
-            if not separator or not host or not port_text.isdigit() or not 1 <= int(port_text) <= 65535:
-                # 125: redirect.allowlist entries must be exact host:numeric-port pairs
-                raise ValueError(_m(125))
-            result.add((host, int(port_text)))
-        return frozenset(result)
-
-
-    def _operation(record: dict[str, Any]) -> str:
-        return str(record.get("op") or record.get("operation") or record.get("type") or "").upper()
-
-
-    def _strict_int(value: object, name: str) -> int:
-        if isinstance(value, bool) or not (
-            isinstance(value, int) or (isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value))
-        ):
-            # 335: {} must be an integer, not {!r}
-            raise ValueError(_m(335, name, value))
-        return int(value)
-
-
-    def _strict_lsn(value: object, name: str) -> int:
-        result = _strict_int(value, name)
-        if not 0 <= result < 1 << 64:
-            # 336: {} is outside the unsigned 64-bit LSN domain
-            raise ValueError(_m(336, name))
-        return result
-
-
-    def _lsn(record: dict[str, Any]) -> int:
-        value = record.get("lsn", record.get("sequence", record.get("sequence_id")))
-        if value is None:
-            raise InformixError(f"CDC record has no LSN: {record!r}")
-        try:
-            return _strict_lsn(value, "CDC record LSN")
-        except ValueError as error:
-            # 343: CDC record has an invalid LSN: {!r}
-            raise InformixError(_m(343, record)) from error
-
-
-    @dataclass(eq=False, repr=False)
-    class Transaction:
-        tx_id: int
-        begin_lsn: int
-        records: list[dict[str, Any]] = field(default_factory=list)
-        pending_before: dict[str, Any] | None = None
-        # One SPILLED record per table whose changes were written to staged pages (_CdcSpill).
-        spilled: list[dict[str, Any]] = field(default_factory=list)
-        # One SPILLING record per table while it is open: its changes went to pages, so they no
-        # longer show which tables it touches.
-        spilling: list[dict[str, Any]] = field(default_factory=list)
-        last_lsn: int = field(init=False)
-
-        def __post_init__(self) -> None:
-            self.last_lsn = self.begin_lsn
-
-        def advance(self, record: dict[str, Any]) -> int:
-            lsn = _lsn(record)
-            if lsn < self.last_lsn:
-                # 134: CDC LSN regressed in transaction {}: {} < {}
-                raise InformixError(_m(134, self.tx_id, lsn, self.last_lsn))
-            self.last_lsn = lsn
-            return lsn
-
-        def append(self, record: dict[str, Any]) -> None:
-            self.advance(record)
-            op = _operation(record)
-            if op == "BEFORE_UPDATE":
-                if self.pending_before is not None:
-                    # 135: Unpaired BEFORE_UPDATE in transaction {}
-                    raise InformixError(_m(135, self.tx_id))
-                self.pending_before = record
-                return
-            if op == "AFTER_UPDATE":
-                if self.pending_before is None:
-                    # 136: AFTER_UPDATE without BEFORE_UPDATE in transaction {}
-                    raise InformixError(_m(136, self.tx_id))
-                merged = dict(record)
-                merged["op"] = "UPDATE"
-                merged["before"] = self.pending_before.get("before", self.pending_before.get("row"))
-                merged["after"] = record.get("after", record.get("row"))
-                # The merged record is sequenced at the after-image. Keep the before-image's
-                # own, strictly earlier, log position too: the append path's old-key
-                # tombstone for a key-changing UPDATE is sequenced there, so it never ties
-                # with the new key's after-image on the cursor.
-                merged["before_lsn"] = _lsn(self.pending_before)
-                # The columns string.null.byte changed in either image (see decode_frame): the
-                # after-image's alone left a before-image's changed index value unseen.
-                nul = [*self.pending_before.get("nul", ()), *record.get("nul", ())]
-                if nul:
-                    merged["nul"] = nul
-                self.pending_before = None
-                self.records.append(merged)
-                return
-            self.records.append(record)
-
-        def discard(self, lsn: int) -> None:
-            # DISCARD carries the rollback cutoff, not the forward position of the
-            # DISCARD control record. It may legitimately precede the latest data LSN.
-            self.records = [r for r in self.records if _lsn(r) < lsn]
-            # A SPILLING record is at its table's earliest change left (see _CdcSpill.start), so
-            # one at or past the savepoint holds the table open no longer, as no record would.
-            self.spilling = [r for r in self.spilling if _lsn(r) < lsn]
-            if self.pending_before is not None and _lsn(self.pending_before) >= lsn:
-                self.pending_before = None
-
-
-    @dataclass(frozen=True, eq=False, repr=False)
-    class CommittedTransaction:
-        tx_id: int
-        begin_lsn: int
-        commit_lsn: int
-        restart_lsn: int
-        records: tuple[dict[str, Any], ...]
-        # UTC epoch seconds from the COMMIT record (kind 2); None if the record carried none.
-        # Stamped onto every row of the transaction as ``_informix_commit_time``.
-        commit_time: int | None = None
-        # The SPILLED records naming the staged pages that hold the rest of its changes.
-        spilled: tuple[dict[str, Any], ...] = ()
-
-
-    def _strict_tx_id(value: object, name: str = "tx_id") -> int:
-        result = _strict_int(value, name)
-        if not -(1 << 31) <= result < 1 << 32:
-            # 337: {} is outside the native 32-bit transaction-ID domain
-            raise ValueError(_m(337, name))
-        return result + (1 << 32) if result < 0 else result
-
-
-    def _tx_id(record: dict[str, Any]) -> int:
-        value = record.get("tx_id", record.get("transaction_id"))
-        if value is None:
-            # 346: CDC record has no transaction ID: {!r}
-            raise InformixError(_m(346, record))
-        try:
-            return _strict_tx_id(value, "CDC transaction ID")
-        except ValueError as error:
-            # 347: CDC record has an invalid transaction ID: {!r}
-            raise InformixError(_m(347, record)) from error
-
-
-    def _normalise_record(raw: dict[str, Any]) -> dict[str, Any]:
-        record = dict(raw)
-        record["op"] = _operation(record)
-        if record["op"] not in {"METADATA", "ERROR"}:
-            record["lsn"] = _lsn(record)
-        if record["op"] not in {"TIMEOUT", "METADATA", "ERROR"}:
-            record["tx_id"] = _tx_id(record)
-        return record
-
-
-    class TransactionBuffer:
-        # Docstring: Buffering for interleaved Informix transactions.
-
-        def __init__(self) -> None:
-            self.open: dict[int, Transaction] = {}
-
-        def feed(self, raw: dict[str, Any]) -> CommittedTransaction | None:
-            record = _normalise_record(raw)
-            op = _operation(record)
-            if op in {"TIMEOUT", "METADATA"}:
-                return None
-            if op == "ERROR":
-                detail = record.get("message") or record.get("payload") or ""
-                # 137: Informix CDC error {} with flags {}: {}
-                raise InformixError(
-                    _m(137, (record.get("error", "unknown")), (record.get("flags", "unknown")), detail)
-                )
-            tx_id = _tx_id(record)
-            if op == "BEGIN":
-                if tx_id in self.open:
-                    # 138: Duplicate CDC BEGIN for transaction {}
-                    raise InformixError(_m(138, tx_id))
-                self.open[tx_id] = Transaction(tx_id, _lsn(record))
-                return None
-            tx = self.open.get(tx_id)
-            if tx is None:
-                # 139: CDC {} for unknown transaction {}
-                raise InformixError(_m(139, op, tx_id))
-            if op in _DATA_OPS:
-                tx.append(record)
-                return None
-            if op == "SPILLED":
-                tx.spilled.append(record)
-                return None
-            if op == "SPILLING":
-                tx.spilling.append(record)
-                return None
-            if op == "DISCARD":
-                tx.discard(_lsn(record))
-                return None
-            if op == "ROLLBACK":
-                tx.advance(record)
-                del self.open[tx_id]
-                return None
-            if op != "COMMIT":
-                # 140: Unknown Informix CDC operation {!r}
-                raise InformixError(_m(140, op))
-            if tx.pending_before is not None:
-                # 141: Transaction {} committed with unpaired BEFORE_UPDATE
-                raise InformixError(_m(141, tx_id))
-            end = tx.advance(record)
-            del self.open[tx_id]
-            restart = min((item.begin_lsn for item in self.open.values()), default=end)
-            commit_time = record.get("timestamp")
-            return CommittedTransaction(
-                tx_id, tx.begin_lsn, end, restart, tuple(tx.records), commit_time, tuple(tx.spilled)
-            )
-
-
-    def _spill_scope(scope: Any) -> str | None:
-        # Docstring: The scope spilled pages are named under, or None without a valid scope.
-        #
-        # The pipeline's, not the update's: a later update reading a transaction again finds the
-        # pages and the Lakebase record an earlier one left, so a cancelled update leaves no copy
-        # behind. A scope outside a pipeline (random per registration) stays as it is.
-
-        if not isinstance(scope, str) or _PIPELINE_SCOPE.fullmatch(scope) is None:
-            return None
-        pipeline, separator, _update = scope.partition("_@_")
-        return pipeline.replace("-", "") if separator else scope
-
-
-    def _spill_run(layout: str, begin: int, tx_id: int, record: dict[str, Any]) -> str:
-        # Docstring: A run's name: its table's capture layout, its transaction's BEGIN LSN and ID,
-        # and a digest of the table's first change in it. A reinitialized log reuses positions, so
-        # the digest keeps a later transaction from taking an earlier one's pages or record.
-
-        first = json.dumps(
-            [record.get("lsn"), record.get("op"), record.get("row")], sort_keys=True, default=str
-        )
-        return f"{layout}-{begin}-{tx_id}-{hashlib.sha256(first.encode()).hexdigest()[:12]}"
-
-
-    def _record_matches(record: dict[str, Any], table: Table) -> bool:
-        identity = str(record.get("table") or record.get("identity") or "")
-        return not identity or identity in {
-            table.name,
-            table.exposed_name,
-            table.identity,
-            table.native_identity,
-        }
-
-
-    def _refuse_altered_changes(records, keys, table: "Table", options: dict[str, str]) -> None:
-        # Docstring: Refuse ``table``'s changes whose ``keys`` values string.null.byte changed
-        # (decode_frame's "nul"). An index-ordered snapshot places a change by the value read,
-        # not the one Informix sorts: settled as staged, or under a later page, an insert was
-        # dropped, and a delete was sent for a row no page had. The pages refuse such values too
-        # (_unaltered). A shared shard's transaction holds other tables' changes as well.
-
-        altered = sorted(
-            {
-                name
-                for r in records
-                if _record_matches(r, table)
-                for name in r.get("nul", ())
-                if name in keys
-            }
-        )
-        if altered:
-            mode = _null_byte_mode(options)
-            # 486: Informix table '{}' holds a NUL byte in key or index column {}, which
-            # string.null.byte={} changes, so the read can't page on or look up the value
-            # Informix holds; set snapshot.scan=cursor to read the table without paging on it
-            raise InformixError(_m(486, table.exposed_name, ", ".join(altered), mode))
-
-
-    def _spill_bytes(record: dict[str, Any]) -> int:
-        # Docstring: A change's weight on its page: wide text or byte columns end a page early,
-        # well inside the staged-page bound.
-
-        return 64 + sum(
-            len(value) if isinstance(value, (str, bytes, bytearray)) else 16
-            for value in (record.get("row") or {}).values()
-        )
-
-
-    def _spill_run_consumed(record: dict[str, Any]) -> bool:
-        # Docstring: Whether every channel a run's record requires has committed past it.
-
-        required, done = record.get("required"), record.get("done") or {}
-        return isinstance(required, list) and bool(required) and all(done.get(c) for c in required)
-
-
-    class _CdcSpill:
-        # Docstring: One poll's writer for open transactions that outgrow cdc.spill.records.
-        #
-        # Once an open transaction holds more changes than ``threshold``, those changes and
-        # every later one go to staged pages of up to _CDC_SPILL_PAGE_RECORDS, a run per table,
-        # instead of the poll's records. A page never ends between an UPDATE's before- and
-        # after-image, so each page shapes on its own. At COMMIT the transaction gets one
-        # SPILLED record per table naming its run, which the transaction buffer keeps in place
-        # of the changes; a ROLLBACK deletes the runs. A DISCARD (rollback to a savepoint) drops
-        # the changes it covers still in memory and records the LSN range for the pages, which
-        # readers skip. A table's run is named by its capture layout, the BEGIN LSN, the
-        # transaction and its first change (see _spill_run), so a poll that reads the
-        # transaction again, the other channel's, or a later update's, names the same pages.
-
-        def __init__(self, threshold, write, delete, layouts, scope, natives, commit=None) -> None:
-            self.threshold = threshold
-            self._write = write  # (native identity, table, run, page index, records)
-            self._delete = delete  # (native identity, run)
-            self._commit = commit  # (native identity, run, commit LSN), or None
-            self._layouts = layouts  # logical identity -> capture layout hash
-            self._scope = scope
-            self._natives = natives  # logical identity -> native identity
-            self._open: dict[int, tuple[int, dict[str, dict[str, Any]]]] = {}
-
-        def holds(self, tx_id: int) -> bool:
-            return tx_id in self._open
-
-        def start(self, tx_id: int, begin_lsn: int, records: list[dict[str, Any]]) -> dict[str, int]:
-            # Docstring: Start spilling a transaction with the changes it holds; return the tables
-            # with a change left, each at the earliest.
-
-            self._open[tx_id] = (begin_lsn, {})
-            # In order, a DISCARD where it came: a run's pages are its table's changes paged
-            # alike in every poll and channel that spills the transaction, wherever each began
-            # to, as the other channel's pages are kept, not written again. Rolled-back
-            # changes left out before paging gave one run two layouts, and a channel read the
-            # other's pages without the rollback (a run left with no change is deleted).
-            for record in records:
-                if record["op"] == "DISCARD":
-                    self.discard(tx_id, int(record["lsn"]))
-                else:
-                    self.add(record)
-            return {t: p["live"] for t, p in self._open[tx_id][1].items() if p["live"] is not None}
-
-        def add(self, record: dict[str, Any]) -> bool:
-            # Docstring: Add one change; return whether it is its table's earliest left, so its
-            # run's first or the first after rollbacks took back the rest.
-
-            tx_id = int(record.get("tx_id") or 0)
-            begin, parts = self._open[tx_id]
-            table = str(record.get("table") or "")
-            part = parts.get(table)
-            if part is None:
-                run = _spill_run(self._layouts.get(table, ""), begin, tx_id, record)
-                part = parts[table] = {
-                    "run": run,
-                    "pages": 0,
-                    "rows": [],
-                    "bytes": 0,
-                    # The earliest change no rollback has taken back, or None.
-                    "live": None,
-                    "last": 0,
-                    "discarded": [],
-                    "ops": set(),
-                }
-            # A capture label is the table's place in one shard's capture list: the other
-            # channel's shard can list it elsewhere, and both write the same pages.
-            part["rows"].append(
-                {key: value for key, value in record.items() if key not in ("label", "capture_label")}
-            )
-            part["ops"].add(record["op"])
-            part["last"] = int(record["lsn"])
-            began = part["live"] is None
-            if began:
-                part["live"] = part["last"]
-            part["bytes"] += _spill_bytes(record)
-            if record["op"] != "BEFORE_UPDATE" and (
-                len(part["rows"]) >= _CDC_SPILL_PAGE_RECORDS or part["bytes"] >= 32 << 20
-            ):
-                self._flush(table, part)
-            return began
-
-        def _flush(self, table: str, part: dict[str, Any]) -> None:
-            native = self._natives.get(table, table)
-            self._write(native, table, part["run"], part["pages"], part["rows"])
-            part["pages"] += 1
-            part["rows"] = []
-            part["bytes"] = 0
-
-        def discard(self, tx_id: int, lsn: int) -> None:
-            for part in self._open[tx_id][1].values():
-                part["rows"] = [record for record in part["rows"] if int(record["lsn"]) < lsn]
-                # Of what is left: the taken back ended a page early, and named operations, a
-                # DELETE's, that a channel then read the pages for.
-                part["bytes"] = sum(map(_spill_bytes, part["rows"]))
-                if not part["pages"]:
-                    part["ops"] = {record["op"] for record in part["rows"]}
-                if part["pages"] and part["last"] >= lsn:
-                    part["discarded"].append([lsn, part["last"]])
-                # A rollback takes back everything from its savepoint on, and changes come in
-                # LSN order: one at or before the earliest left leaves none.
-                if part["live"] is not None and part["live"] >= lsn:
-                    part["live"] = None
-
-        def drop(self, tx_id: int) -> None:
-            _begin, parts = self._open.pop(tx_id)
-            for table, part in parts.items():
-                if part["pages"]:
-                    self._delete(self._natives.get(table, table), part["run"])
-
-        def finish(self, tx_id: int, commit_lsn: int | None = None) -> list[dict[str, Any]]:
-            # Docstring: The SPILLED records of a transaction at its COMMIT (``commit_lsn``), which
-            # each run's record also learns.
-
-            _begin, parts = self._open.pop(tx_id)
-            spilled = []
-            for table, part in parts.items():
-                native = self._natives.get(table, table)
-                if part["live"] is None:
-                    # Rollbacks to savepoints took back every change of the run, in one or in
-                    # several: named, a table with none failed an index-ordered scan's stream.
-                    if part["pages"]:
-                        self._delete(native, part["run"])
-                    continue
-                if part["rows"]:
-                    self._flush(table, part)
-                if part["pages"]:
-                    if self._commit is not None and commit_lsn is not None:
-                        self._commit(native, part["run"], commit_lsn)
-                    spilled.append(
-                        {
-                            "op": "SPILLED",
-                            "tx_id": tx_id,
-                            "lsn": part["last"],
-                            "table": table,
-                            "native_identity": native,
-                            "pipeline_scope": self._scope,
-                            "run": part["run"],
-                            "pages": part["pages"],
-                            "discarded": part["discarded"],
-                            "ops": sorted(part["ops"]),
-                        }
-                    )
-            return spilled
-
-
-    def _before_lsn(record: dict[str, Any]) -> int:
-        # Docstring: The log position of an assembled UPDATE's before-image.
-        #
-        # Set when the transaction assembler pairs BEFORE_UPDATE with AFTER_UPDATE; the
-        # merged record's own ``lsn`` is the after-image's position.
-
-        value = record.get("before_lsn")
-        if value is None:
-            # 344: CDC update has no before-image LSN: {!r}
-            raise InformixError(_m(344, record))
-        try:
-            return _strict_lsn(value, "CDC before-image LSN")
-        except ValueError as error:
-            # 345: CDC update has an invalid before-image LSN: {!r}
-            raise InformixError(_m(345, record)) from error
-
-
-    def _key(row: dict[str, Any] | None, table: Table) -> tuple[Any, ...]:
-        if row is None:
-            # 349: Missing before/after image for {}
-            raise InformixError(_m(349, table.exposed_name))
-        return tuple(row.get(pk) for pk in table.primary_keys)
-
-
-    def _refuse_null_key(row: dict[str, Any], table: Table) -> None:
-        # Docstring: Fail on a NULL in a NOT NULL key column of a keyed table's snapshot row or
-        # upsert, as the delete channel does (_shape_delete).
-        #
-        # Under string.null.byte=null a key string holding a NUL byte reads as NULL: "a\x00"
-        # and "b\x00" both landed as the key NULL, one target row, and only a later delete
-        # of one of them failed.
-
-        nullable: set[str] | None = None
-        for pk in table.primary_keys:
-            if pk in row and row[pk] is None:
-                if nullable is None:
-                    nullable = {column.name for column in table.columns if column.nullable}
-                if pk not in nullable:
-                    # 463: A row of '{}' has NULL in NOT NULL key column {}, which would merge
-                    # distinct keys into one: '{}=null' turned a string holding a NUL byte into
-                    # NULL, or the row image is incomplete
-                    raise InformixError(_m(463, table.exposed_name, pk, _NULL_BYTE_OPTION))
-
-
-    def _commit_time_value(epoch_seconds: int | None) -> datetime | None:
-        # Docstring: A UTC ``datetime`` for the ``_informix_commit_time`` column, or None.
-        #
-        # The source supplies commit time as epoch seconds (Informix CDC BEGIN/COMMIT records
-        # and ``DBINFO('utc_current')``); TimestampType wants a ``datetime``. None stays None so
-        # a row with no source time (e.g. a file-source extract without a manifest boundary_time)
-        # lands as NULL.
-
-        if epoch_seconds is None:
-            return None
-        return datetime.fromtimestamp(int(epoch_seconds), tz=timezone.utc)
-
-
-    def _sortable_lsn(value: int) -> str:
-        lsn = int(value)
-        if not 0 <= lsn < 1 << 64:
-            # 364: Informix LSN {} is outside the unsigned 64-bit decimal domain
-            raise InformixError(_m(364, lsn))
-        return f"{lsn:0{_LSN_DECIMAL_WIDTH}d}"
-
-
-    def _shape_change(row, record, tx, op, *, lsn: int | None = None):
-        # Docstring: Shape one full-row change. ``lsn`` overrides the record's own cursor position.
-
-        if row is None:
-            # 350: CDC upsert has no after image
-            raise InformixError(_m(350))
-        result = _framework_row(row)
-        result.update(
-            {
-                CURSOR: _sortable_lsn(_lsn(record) if lsn is None else lsn),
-                COMMIT_LSN: _sortable_lsn(tx.commit_lsn),
-                TX_ID: tx.tx_id,
-                OP: op,
-                COMMIT_TIME: _commit_time_value(tx.commit_time),
-            }
-        )
-        return result
-
-
-    def _shape_tombstone(row, table, record, tx, *, lsn: int | None = None):
-        # Docstring: A full before-image as an append-path ``d`` row.
-        #
-        # Used for a DELETE and for the old key of a key-changing UPDATE; the latter passes
-        # ``lsn``, the before-image's own position. Not :func:`_shape_delete`, which nulls
-        # every non-key column and needs a primary key: an append destination does not
-        # merge, so the tombstone carries the whole removed row and is told apart from a
-        # live row only by ``_informix_op``.
-
-        if row is None:
-            # 351: CDC delete on append-only table {} has no before image; full-row logging is required
-            # to emit a delete tombstone
-            raise InformixError(_m(351, table.exposed_name))
-        return _shape_change(row, record, tx, "d", lsn=lsn)
-
-
-    ########################################################
-    # src/databricks/labs/community_connector/sources/informix/informix_shards.py
-    ########################################################
-
-    def _shape_delete(row, table, record, tx):
-        # Docstring: Shape a delete-channel row: the key values, with every other column NULL.
-        #
-        # A NULL key value passes through when its column is declared nullable. Such a key can
-        # only come from a ``primary.keys`` override (the wildcard included) or a nullable-index
-        # promotion, and the pipeline's AUTO CDC delete flow matches NULL key values, for SCD1
-        # and SCD2 alike.
-        #
-        # A NOT NULL key column -- every real catalog primary key -- can never legitimately
-        # hold NULL, so a NULL there still fails closed as a corrupt or incomplete before-image.
-        # So does a key column missing from the image entirely: the CDC decoder sets every
-        # captured column, using None for a SQL NULL, so an absent column is never a NULL.
-
-        if row is None:
-            # 352: CDC delete has no before image; full-row logging is required
-            raise InformixError(_m(352))
-        result = {column.name: None for column in table.columns}
-        nullable: set[str] | None = None
-        for pk in table.primary_keys:
-            if pk not in row:
-                # 353: CDC delete on '{}' has no value for key column {}; the before image is incomplete
-                raise InformixError(_m(353, table.exposed_name, pk))
-            value = row[pk]
-            if value is None:
-                if nullable is None:
-                    nullable = {column.name for column in table.columns if column.nullable}
-                if pk not in nullable:
-                    # 354: CDC delete on '{}' has NULL in NOT NULL key column {}; the before image is
-                    # corrupt or incomplete, or '{}=null' turned a string holding a NUL byte into NULL
-                    raise InformixError(_m(354, table.exposed_name, pk, _NULL_BYTE_OPTION))
-            result[pk] = _framework_value(value)
-        result.update(
-            {
-                CURSOR: _sortable_lsn(_lsn(record)),
-                COMMIT_LSN: _sortable_lsn(tx.commit_lsn),
-                TX_ID: tx.tx_id,
-                OP: "d",
-                COMMIT_TIME: _commit_time_value(tx.commit_time),
-            }
-        )
-        return result
-
-
-    def _project_transaction(
-        tx: CommittedTransaction,
-        table: Table,
-        deletes: bool,
-        tombstones: bool = False,
-        encoding: str = "latin-1",
-        options: dict[str, str] | None = None,
-    ) -> list[dict[str, Any]]:
-        # Docstring: Project one committed transaction onto one output channel.
-        #
-        # ``deletes`` selects the delete channel: key-only ``d`` rows for DELETEs and for the
-        # old key of a key-changing UPDATE. Otherwise this is the upsert channel, which emits
-        # INSERT/UPDATE after-images as ``c``/``u``. On the keyed CDC path the upsert channel
-        # deliberately skips DELETEs -- the pipeline applies deletes only through the
-        # separate delete flow, and a ``d`` row on the upsert view would be merged as an
-        # upsert. ``tombstones`` (the append path with ``append.delete.tombstones`` on) adds
-        # each DELETE's full before-image as a ``d`` row instead: the append destination
-        # lands rows as-is and never reads ``_informix_op``, so the delete stays in the
-        # change log rather than vanishing. On a keyed table forced onto the append path, a
-        # key-changing UPDATE is a delete of the old key too: with ``tombstones`` on it lands
-        # the before-image as a ``d`` row ahead of the new key's ``u`` row, sequenced at the
-        # before-image's own log position so the two never tie on the cursor. A keyless table
-        # has no key to tell which row an UPDATE replaced, so with ``tombstones`` on every
-        # UPDATE of one lands its before-image as a ``d`` row the same way, also when nothing
-        # changed: the log then nets to the table, an update being one row out and one in.
-        # Without ``tombstones`` its UPDATEs land only their after-image. TRUNCATE is
-        # unrepresentable on either channel.
-
-        #
-        # With a row_filter, membership comes from the images: a change whose rows never match
-        # is dropped, an UPDATE that moves a row out of the filter is a delete of its
-        # before-image, and one that moves a row in is an upsert of its after-image alone --
-        # its old key was never landed, so there is no old key to delete.
-        #
-        # An UPDATE changes the key as the key lands: a variable-scale DECIMAL key column is
-        # coerced to its target type (``options``), which can round 12.1 and 12.2 to one 12,
-        # and a delete of the old key at the update's LSN then tied with its upsert and could
-        # remove the row.
-
-        predicate = _row_filter_predicate(table, encoding)
-        coerced = any(
-            _is_variable_scale_decimal(column)
-            for column in table.columns
-            if column.name in table.primary_keys
-        )
-
-        def landed_key(row):
-            if coerced and row is not None:
-                # The key columns alone: another column's value, which a delete never lands,
-                # could fail its coercion.
-                row = _coerce_variable_decimal_values(
-                    {name: row.get(name) for name in table.primary_keys}, table, options or {}
-                )
-            # NaN equals nothing, itself included: a FLOAT key left NaN read as changed, and its
-            # delete tied with its upsert. The target's merge takes NaN for NaN.
-            return tuple(
-                "NaN" if isinstance(value, float) and math.isnan(value) else value
-                for value in _key(row, table)
-            )
-
-        output = []
-        for record in tx.records:
-            if not _record_matches(record, table):
-                continue
-            op = _operation(record)
-            if op == "TRUNCATE":
-                # 348: TRUNCATE on {} cannot be represented as keyed Lakeflow deletes
-                raise UnsupportedChangeError(_m(348, table.exposed_name))
-            before = record.get("before", record.get("row") if op == "DELETE" else None)
-            after = record.get("after", record.get("row") if op == "INSERT" else None)
-            entered = False
-            if predicate is not None:
-                # A missing image counts as in the filter, so the record reaches the shaping
-                # that fails closed on it, as it does without a filter, instead of dropping or
-                # reclassifying the change.
-                was_in = op in {"UPDATE", "DELETE"} and (
-                    before is None or _row_filter_matches(predicate, before)
-                )
-                is_in = op in {"INSERT", "UPDATE"} and (
-                    after is None or _row_filter_matches(predicate, after)
-                )
-                if not (was_in or is_in):
-                    continue
-                if op == "UPDATE" and not is_in:
-                    op = "DELETE"
-                entered = op == "UPDATE" and not was_in
-            key_changed = op == "UPDATE" and not entered and landed_key(before) != landed_key(after)
-            if deletes:
-                if op == "DELETE" or key_changed:
-                    output.append(_shape_delete(before, table, record, tx))
-            elif op in {"INSERT", "UPDATE"}:
-                if tombstones and (
-                    key_changed or (op == "UPDATE" and not entered and not table.primary_keys)
-                ):
-                    output.append(_shape_tombstone(before, table, record, tx, lsn=_before_lsn(record)))
-                if after is not None and table.primary_keys:
-                    _refuse_null_key(after, table)
-                output.append(_shape_change(after, record, tx, "u" if op == "UPDATE" else "c"))
-            elif op == "DELETE" and tombstones:
-                output.append(_shape_tombstone(before, table, record, tx))
-        return output
-
-
-    def _spilled_page_rows(read_page, part, page_index, tx, table, options, **shape):
-        # Docstring: One spilled page's rows on one channel, shaped as _read_stream shapes an
-        # in-memory transaction. ``tx`` is (tx_id, begin, commit, restart, commit time), ``shape``
-        # the deletes, tombstones and encoding _project_transaction takes.
-
-        _header, records = read_page(
-            part["native_identity"],
-            part["table"],
-            part["pipeline_scope"],
-            _CDC_SPILL_SCHEMA,
-            part["run"],
-            page_index,
-        )
-        discarded = part["discarded"]
-        buffer = Transaction(int(tx[0]), int(tx[1]))
-        for record in records:
-            record = _normalise_record(record)
-            if not any(low <= record["lsn"] <= high for low, high in discarded):
-                buffer.append(record)
-        if buffer.pending_before is not None:
-            # A page never ends between an UPDATE's images, so this transaction committed with
-            # one unpaired, as an in-memory one fails at its COMMIT.
-            # 141: Transaction {} committed with unpaired BEFORE_UPDATE
-            raise InformixError(_m(141, buffer.tx_id))
-        committed = CommittedTransaction(
-            int(tx[0]), int(tx[1]), int(tx[2]), int(tx[3]), tuple(buffer.records), tx[4]
-        )
-        for row in _project_transaction(committed, table, **shape, options=options):
-            yield _coerce_variable_decimal_values(row, table, options)
-
-
-    _HOST_SHARD_TABLE_COLUMN_FIELDS = ("columns", "catalog_columns", "unsupported_columns")
-
-
-    def _wire_table(table: Table) -> dict[str, Any]:
-        # Docstring: ``table`` as plain data. The merged deployment defines Table inside a
-        # function, so it can't be pickled by name between processes; Table(**fields) rebuilds it.
-
-        data = {}
-        for item in dataclasses.fields(table):
-            value = getattr(table, item.name)
-            if item.name in _HOST_SHARD_TABLE_COLUMN_FIELDS:
-                value = [dataclasses.asdict(column) for column in value]
-            data[item.name] = value
-        return data
-
-
-    class _SpilledRows:
-        # Docstring: A batch that is one spilled transaction: its rows on one channel, shaped
-        # from the staged pages only when iterated (the simple reader), or served page by page
-        # from executors through ``descriptors`` (the partitioned reader), so the driver never
-        # holds them.
-
-        def __init__(self, read_page, parts, tx, table, options, **shape) -> None:
-            self._read_page = read_page
-            self.parts = parts
-            self.tx = (tx.tx_id, tx.begin_lsn, tx.commit_lsn, tx.restart_lsn, tx.commit_time)
-            self.table = table
-            self.shape = shape
-            self._options = options
-            self._rows: Iterator[dict[str, Any]] | None = None
-
-        def __iter__(self) -> "_SpilledRows":
-            return self
-
-        def __next__(self) -> dict[str, Any]:
-            if self._rows is None:
-                self._rows = itertools.chain.from_iterable(
-                    _spilled_page_rows(
-                        self._read_page, part, page, self.tx, self.table, self._options, **self.shape
-                    )
-                    for part in self.parts
-                    for page in range(part["pages"])
-                )
-            return next(self._rows)
-
-        def descriptors(self, extra: dict[str, Any]) -> list[dict[str, Any]]:
-            table = _wire_table(self.table)
-            return [
-                {
-                    "kind": "spill",
-                    "part": part,
-                    "page_index": page,
-                    "tx": list(self.tx),
-                    "table": table,
-                    **self.shape,
-                    **extra,
-                }
-                for part in self.parts
-                for page in range(part["pages"])
-            ]
-
-
-    @dataclass(frozen=True, eq=False, repr=False)
-    class _SharedCdcSnapshot:
-        # Docstring: A coherent (schema, log position, transactions) view a consumer poll reads
-        # from a shard in place of touching Informix itself.
-
-        table: "Table"
-        fingerprint: str
-        min_lsn: int
-        current_lsn: int
-        committed: list
-        caught_up: bool
-        open_begin: int | None
-        # Where the daemon's latest read went idle (its TIMEOUT LSN), or None.
-        reached_lsn: int | None = None
-        # Where that idle read started (the shard's restart LSN), or None.
-        read_start_lsn: int | None = None
-
-
-    def _table_id(table: Table) -> int | None:
-        # Docstring: The Informix table ID a catalog read recorded as ``table.incarnation``.
-
-        try:
-            return int(table.incarnation)
-        except (TypeError, ValueError):
-            return None
-
-
-    class _ShardCatalog:
-        # Docstring: The catalog tables one shard's daemon reads under, re-read only when changed.
-        #
-        # Describing every subscribed table before every read cost two or three catalog
-        # queries a table each cycle. Instead the daemon keeps each table as last read, with
-        # its systables.version, and every _SNAPSHOT_SCHEMA_REFRESH_INTERVAL_SECONDS asks for all
-        # their versions in one query. Only the tables whose version moved, or whose table ID
-        # no longer names them, are read again, together in one batch (get_tables). Informix
-        # bumps the version on every change to a table's definition, and on UPDATE STATISTICS,
-        # which just costs a needless re-read. A new subscriber is read at once, and a failed
-        # read forces a check before the next one.
-        #
-        # A change waits for the next check without misreading rows. Informix rejects ALTER
-        # TABLE while full-row logging is on, which every read switches on, so a column change
-        # needs the pipelines stopped (see the README), and the restarted update gets a new
-        # shard, read afresh. A captured column changed anyway still fails the read that meets
-        # it, which compares the layout Informix reports with the catalog
-        # (_assert_capture_layout). What a check does pick up is an index or key constraint
-        # created or dropped while the table is captured, which Informix allows and which can
-        # change the key a table is merged by; consumers see it at the next check rather than
-        # the next read. A bridge without table_versions re-reads every table at each check,
-        # and one without get_tables reads them one at a time.
-        #
-        # Used by the shard's daemon thread alone, so it needs no lock; a consumer only ever
-        # calls force_check, a single assignment.
-
-        def __init__(self) -> None:
-            # identity -> (systables.version, or None when unknown, and the catalog table)
-            self.entries: dict[str, tuple[int | None, Table]] = {}
-            self.next_check = 0.0
-
-        def force_check(self) -> None:
-            self.next_check = 0.0
-
-        def tables(self, bridge, identities, now: float, check_seconds: float) -> dict[str, Table]:
-            # Docstring: The catalog table of each subscribed (identity, table) pair that still
-            # names one, re-read as the class describes.
-
-            wanted = dict(identities)
-            for identity in [identity for identity in self.entries if identity not in wanted]:
-                del self.entries[identity]
-            if now >= self.next_check:
-                self.next_check = now + check_seconds
-                check = wanted
-            else:
-                check = {
-                    identity: table
-                    for identity, table in wanted.items()
-                    if identity not in self.entries
-                }
-            if check:
-                self._refresh(bridge, check)
-            return {
-                identity: self.entries[identity][1] for identity in wanted if identity in self.entries
-            }
-
-        def _refresh(self, bridge, check: dict[str, Table]) -> None:
-            # The versions come first: a definition changed between this query and the reads
-            # below leaves an older version on the newer table, which the next check re-reads.
-            table_versions = getattr(bridge, "table_versions", None)
-            known = {
-                identity: self.entries[identity][1] if identity in self.entries else table
-                for identity, table in check.items()
-            }
-            versions = None
-            if table_versions is not None:
-                versions = table_versions(
-                    [tabid for tabid in map(_table_id, known.values()) if tabid is not None]
-                )
-            stale: dict[str, int | None] = {}
-            for identity, table in known.items():
-                version = None
-                found = versions.get(_table_id(table)) if versions is not None else None
-                if found is not None and found[:2] == (
-                    table.owner.rstrip(" "),
-                    table.name.rstrip(" "),
-                ):
-                    version = found[2]
-                entry = self.entries.get(identity)
-                if entry is None or version is None or entry[0] != version:
-                    stale[identity] = version
-            if not stale:
-                return
-            logical = {identity: check[identity].identity for identity in stale}
-            get_tables = getattr(bridge, "get_tables", None)
-            if get_tables is not None:
-                described = get_tables(sorted(set(logical.values())))
-            else:
-                described = {name: bridge.get_table(name) for name in sorted(set(logical.values()))}
-            for identity, version in stale.items():
-                raw = described.get(logical[identity])
-                try:
-                    fresh = (
-                        None
-                        if raw is None or raw.get("unreadable")
-                        else Table.parse(raw, check[identity].database)
-                    )
-                except (InformixError, ValueError):
-                    fresh = None  # unreadable (see _describe_tables): the same, for that table alone
-                if fresh is None:
-                    # The name no longer names a table: the subscriber is left to its own
-                    # direct read, which reports that.
-                    self.entries.pop(identity, None)
-                    continue
-                if fresh.incarnation != known[identity].incarnation:
-                    # Re-created under a new table ID, whose version wasn't asked for: the
-                    # next check reads it again with its version.
-                    version = None
-                self.entries[identity] = (version, fresh)
-
-
-    def _schema_fingerprint(table: Table) -> str:
-        parts: tuple[Any, ...] = (
-            table.database,
-            table.owner,
-            table.name,
-            table.incarnation,
-            table.primary_keys,
-            tuple(
-                (
-                    column.name,
-                    column.type_name,
-                    column.nullable,
-                    column.length,
-                    column.precision,
-                    column.scale,
-                    column.cdc_supported,
-                )
-                for column in table.columns
-            ),
-        )
-        # Appended only when set, so a table using neither keeps the fingerprint every
-        # existing checkpoint was written with.
-        if table.column_selection is not None:
-            parts += (("column_selection", table.column_selection),)
-        if table.row_filter is not None:
-            parts += (("row_filter", table.row_filter),)
-        if table.column_renames is not None:
-            parts += (("column_renames", table.column_renames),)
-        if table.column_transforms is not None:
-            parts += (("column_transforms", table.column_transforms, table.transform_key_id),)
-        if table.decimal_targets:
-            parts += (("decimal_targets", table.decimal_targets),)
-        return hashlib.sha256(repr(parts).encode("utf-8")).hexdigest()
-
-
-    class _SharedCdcShard:
-        # Docstring: One shard of the sharded daemon-reader CDC pool.
-        #
-        # A single daemon thread owns the Informix I/O for this shard's tables -- it reads
-        # the shared CDC session, fetches schema, and samples the log bounds -- and publishes
-        # the result here. Consumer streaming polls read the fanned-out transactions and the
-        # schema/log position from memory rather than connecting themselves. All mutable
-        # state is guarded by ``condition``.
-
-        def __init__(self) -> None:
-            self.condition = threading.Condition()
-            # identity -> {table, capture, checkpoint, floor, last_seen}
-            self.subscribers: dict[str, dict[str, Any]] = {}
-            self.buffers: dict[str, deque] = {}
-            # highest commit_lsn appended per table: dedups re-delivery and lets a lagging
-            # or late subscriber replay its own history exactly once.
-            self.cursors: dict[str, int] = {}
-            self.shared_restart: int | None = None
-            # coherent snapshot, published atomically at the end of each read cycle
-            self.schema: dict[str, "Table"] = {}
-            self.min_lsn: int | None = None
-            self.current_lsn: int | None = None
-            self.reached_lsn: int | None = None
-            self.read_start_lsn: int | None = None
-            self.caught_up = False
-            self.open_begins: dict[str, int | None] = {}
-            self.ready = False
-            # daemon configuration, set by the first subscriber
-            self.reader_factory: Callable[[], Any] | None = None
-            self.timeout_seconds = 5
-            self.max_records = _DEFAULT_CDC_MAX_RECORDS
-            self.buffer_cap = _DEFAULT_SHARED_CDC_BUFFER
-            self.subscriber_ttl = _SHARED_CDC_SUBSCRIBER_TTL_SECONDS
-            # The daemon's catalog tables, re-read only when they change; daemon-thread only.
-            self.catalog = _ShardCatalog()
-
-        def configure(
-            self, *, reader_factory, timeout_seconds, max_records, buffer_cap, subscriber_ttl
-        ):
-            # Every poll configures the shard with its own table's cdc.timeout and
-            # cdc.max.records, which are table options. Taken as given, the shared session
-            # flipped between the tables' values with the order of their polls. It keeps the
-            # shortest timeout and the largest record budget any of them asked for: neither
-            # makes a read wrong, only an idle read shorter or a read larger.
-            with self.condition:
-                if self.reader_factory is None:
-                    self.reader_factory = reader_factory
-                if not self.__dict__.get("_read_settings_given"):
-                    self._read_settings_given = True
-                    self.timeout_seconds = timeout_seconds
-                    self.max_records = max_records
-                else:
-                    self.timeout_seconds = min(self.timeout_seconds, timeout_seconds)
-                    self.max_records = max(self.max_records, max_records)
-                self.buffer_cap = buffer_cap
-                self.subscriber_ttl = subscriber_ttl
-
-        # ---- consumer side ------------------------------------------------------
-
-        def subscribe(self, identity, table, capture, checkpoint_commit_lsn, floor_lsn, owner=None):
-            # ``owner`` names the flow asking (each connector instance has its own). Returns
-            # False when another flow holds the table's place: this one then reads directly,
-            # and must not take a view either, which would cut the other's buffer at its own
-            # checkpoint.
-            with self.condition:
-                existing = self.subscribers.get(identity)
-                expired = (
-                    existing is not None
-                    and time.monotonic() - existing["last_seen"] > self.subscriber_ttl
-                )
-                if (
-                    existing is not None
-                    and owner is not None
-                    and existing.get("owner") not in (None, owner)
-                    and not expired
-                ):
-                    # A second flow reading the same table with the same layout (two
-                    # destinations, say). The table has one buffer, cut at one checkpoint:
-                    # served to both, the flow further on dropped transactions the other had
-                    # yet to read, which it then never saw, or each start-over wiped the
-                    # other's coverage. The first keeps the shard until it stops polling.
-                    return False
-                own = existing is not None and (
-                    expired or (owner is not None and existing.get("owner") == owner)
-                )
-                if own and (
-                    existing["capture"] != capture
-                    or _schema_fingerprint(existing["table"]) != _schema_fingerprint(table)
-                ):
-                    # This flow's own place, or one whose flow stopped polling, under a table that
-                    # changed since: a schema or key change the capture does not show too. Taken
-                    # for another flow's, it read directly until the place expired, and the
-                    # place's buffer, its checkpoint frozen, grew to the cap and held the shard.
-                    self._restart_table_locked(identity)
-                    existing = None
-                elif (
-                    existing is not None
-                    and existing["capture"] == capture
-                    and _schema_fingerprint(existing["table"]) != _schema_fingerprint(table)
-                ):
-                    # Another flow reading the table under other options (a schema change
-                    # changes the capture): the shard keeps the first one's table, buffer and
-                    # coverage, and this one reads directly.
-                    return False
-                elif (
-                    existing is not None
-                    and existing["capture"] != capture
-                    and existing["table"].column_selection != table.column_selection
-                ):
-                    # Another flow reading the table with other columns (include_columns or
-                    # exclude_columns): its capture differs for good, not because the table
-                    # changed. Taking it for a schema change, each flow dropped the other's
-                    # buffer and coverage at every poll, and neither was ever served. The
-                    # shard keeps the first one's, and this one reads directly.
-                    return False
-                elif existing is not None and existing["capture"] != capture:
-                    # The table's columns changed (its consumer moved to a new schema): what
-                    # was buffered under the old capture lacks the new columns, so drop it and
-                    # treat the table as new, re-read from its floor under the new capture.
-                    self._restart_table_locked(identity)
-                    existing = None
-                elif existing is not None and (
-                    checkpoint_commit_lsn < existing["checkpoint"] or floor_lsn < existing["floor"]
-                ):
-                    # The checkpoint or floor moved back (a consumer replaying from an earlier
-                    # commit, or an open transaction older than its floor): the buffer may lack
-                    # what lies above the new floor and the cursor would skip re-reading it, so
-                    # start the table over from its floor, on direct reads until covered again.
-                    self.buffers.pop(identity, None)
-                    self.cursors.pop(identity, None)
-                    existing = None
-                entry = {
-                    "table": table,
-                    "capture": capture,
-                    "checkpoint": checkpoint_commit_lsn,
-                    "floor": floor_lsn,
-                    "last_seen": time.monotonic(),
-                    # The lowest LSN a daemon read that captured this table was activated
-                    # at, or None until one has run. The table is *covered* -- its buffer
-                    # is authoritative from its floor on -- only once that read start is
-                    # at or below its floor (see _covered). Preserved across re-subscribes;
-                    # a TTL eviction drops the entry and so resets it.
-                    "covered_from": None if existing is None else existing.get("covered_from"),
-                    "owner": owner,
-                }
-                self.subscribers[identity] = entry
-                # Drop what the consumer has durably consumed, as a view does. A consumer on
-                # direct reads (the shard not ready, or the table not yet covered) gets no view,
-                # so without this its buffer could reach the cap and stop the shard reading.
-                buf = self.buffers.setdefault(identity, deque())
-                while buf and buf[0].commit_lsn <= checkpoint_commit_lsn:
-                    buf.popleft()
-                # Lower the shared read cursor to admit a newly subscribed or lagging
-                # table's history. It only moves backward here; the daemon advances it
-                # forward as it reads, but never past the floor of a table it has not yet
-                # covered (see ingest). Activating too low is merely wasteful (re-read then
-                # discarded per cursor / _recover); too high would skip a laggard's changes.
-                if self.shared_restart is None:
-                    self.shared_restart = floor_lsn
-                elif not self._covered(entry):
-                    self.shared_restart = min(self.shared_restart, floor_lsn)
-                self.condition.notify_all()
-                return True
-
-        def _restart_table_locked(self, identity) -> None:
-            # Docstring: Drop a table's buffer and cursor, so it is re-read from its floor as a
-            # new one, and read its catalog entry at the daemon's next cycle, not the next
-            # scheduled check. The caller makes its subscriber entry anew.
-
-            self.buffers.pop(identity, None)
-            self.cursors.pop(identity, None)
-            self.catalog.force_check()
-
-        def poll(self, identity, table, capture, checkpoint_commit_lsn, floor_lsn, owner=None):
-            # Docstring: Subscribe and take the view in one hold of the lock, so no other flow's
-            # subscribe cuts the buffer between them; None where the flow reads directly.
-
-            with self.condition:
-                if not self.subscribe(
-                    identity, table, capture, checkpoint_commit_lsn, floor_lsn, owner
-                ):
-                    return None
-                return self.snapshot(identity, checkpoint_commit_lsn)
-
-        @staticmethod
-        def _covered(entry) -> bool:
-            # Docstring: Whether a daemon read that captured this subscriber started at or below
-            # its floor, so its buffer holds every transaction above that floor.
-
-            covered_from = entry.get("covered_from")
-            return covered_from is not None and covered_from <= entry["floor"]
-
-        def snapshot(self, identity, checkpoint_commit_lsn):
-            # Docstring: Return a coherent view for one table, or None to fall back to a direct
-            # read (daemon not ready yet, or this table is unknown to the daemon).
-
-            with self.condition:
-                if not self.ready or identity not in self.schema:
-                    return None
-                entry = self.subscribers.get(identity)
-                if entry is None or not self._covered(entry):
-                    # No daemon read that captured this table has started at or below its
-                    # floor yet, so its buffer may have a gap right after its checkpoint. A
-                    # view is taken as authoritative and would skip that gap silently;
-                    # keep the consumer on direct reads until a covering read is ingested.
-                    return None
-                table = self.schema.get(identity)
-                if table is None or self.min_lsn is None or self.current_lsn is None:
-                    return None
-                if self.current_lsn < checkpoint_commit_lsn:
-                    # The consumer moved on by a direct read past the shard's last read: its log
-                    # position would look reinitialized (284) or behind a trigger boundary (295).
-                    return None
-                buf = self.buffers.get(identity)
-                if buf is None:
-                    return None
-                # Drop durably-consumed transactions; keep the rest (peek, don't pop) so a
-                # poll that consumes only part of its budget re-serves the remainder.
-                while buf and buf[0].commit_lsn <= checkpoint_commit_lsn:
-                    buf.popleft()
-                committed = list(buf)
-                # ``committed`` is the entire retained buffer, so nothing is withheld:
-                # the consumer is caught up exactly when the daemon reached end-of-log.
-                caught_up = self.caught_up
-                return _SharedCdcSnapshot(
-                    table=table,
-                    fingerprint=_schema_fingerprint(table),
-                    min_lsn=self.min_lsn,
-                    current_lsn=self.current_lsn,
-                    committed=committed,
-                    caught_up=caught_up,
-                    open_begin=self.open_begins.get(identity),
-                    reached_lsn=self.reached_lsn if caught_up else None,
-                    read_start_lsn=self.read_start_lsn if caught_up else None,
-                )
-
-        # ---- daemon side --------------------------------------------------------
-
-        def live_subscribers(self):
-            # Docstring: Drop subscribers past the TTL (a stopped flow must not pin the shard) and
-            # return the current set. Caller holds the lock.
-
-            now = time.monotonic()
-            for identity in list(self.subscribers):
-                if now - self.subscribers[identity]["last_seen"] > self.subscriber_ttl:
-                    self._evict_locked(identity)
-            return dict(self.subscribers)
-
-        def evict(self, identity):
-            # Docstring: Drop one subscriber and its state; it re-subscribes on its next poll.
-
-            with self.condition:
-                self._evict_locked(identity)
-
-        def _evict_locked(self, identity):
-            self.subscribers.pop(identity, None)
-            for store in (self.buffers, self.cursors, self.schema, self.open_begins):
-                store.pop(identity, None)
-
-        def ingest(self, raw, schema_map, min_lsn, current_lsn, read_start, captures=None):
-            # Docstring: Assemble one read's records into transactions, fan them out per table, and
-            # publish the coherent snapshot. Returns whether the shard is caught up.
-            #
-            # ``schema_map`` names the tables the read captured and ``read_start`` the LSN
-            # it was activated at; together they record which subscribers it covered.
-            # ``captures`` maps each to the capture the read used: a subscriber that has
-            # re-subscribed with another since gets nothing from this read.
-
-            buffer = TransactionBuffer()
-            committed = []
-            timed_out = False
-            reached = None
-            for record in raw:
-                if _operation(record) == "TIMEOUT":
-                    timed_out = True
-                    reached = _lsn(record)
-                done = buffer.feed(record)
-                if done is not None:
-                    committed.append(done)
-            committed.sort(key=lambda tx: (tx.commit_lsn, tx.tx_id))
-            with self.condition:
-                stale = {
-                    identity
-                    for identity, capture in (captures or {}).items()
-                    if (self.subscribers.get(identity) or {}).get("capture") != capture
-                }
-                # A subscriber started over (or joined) while this read was in flight, with a
-                # floor below where the read began, gets nothing from it: a partial delivery
-                # would move its cursor past the transactions the covering read must add.
-                stale |= {
-                    identity
-                    for identity, sub in self.subscribers.items()
-                    if not self._covered(sub) and read_start > sub["floor"]
-                }
-                for tx in committed:
-                    for identity, sub in self.subscribers.items():
-                        if identity in stale or tx.commit_lsn <= self.cursors.get(identity, 0):
-                            continue
-                        if any(
-                            _record_matches(record, sub["table"])
-                            for record in itertools.chain(tx.records, tx.spilled)
-                        ):
-                            self.buffers.setdefault(identity, deque()).append(tx)
-                            self.cursors[identity] = tx.commit_lsn
-                # A subscriber is covered once a read that captured it was activated at or
-                # below its floor: from then on its buffer holds everything above the floor.
-                for identity in schema_map:
-                    entry = self.subscribers.get(identity)
-                    if entry is None or identity in stale:
-                        continue
-                    previous = entry.get("covered_from")
-                    entry["covered_from"] = (
-                        read_start if previous is None else min(previous, read_start)
-                    )
-                # Resume the next read from the oldest open BEGIN so open transactions are
-                # recaptured; per-table cursors above dedup the resulting re-delivery.
-                global_open = min((item.begin_lsn for item in buffer.open.values()), default=None)
-                if global_open is not None:
-                    advanced = global_open
-                elif timed_out and reached is not None:
-                    # Idle with nothing open: everything the shard captures up to where the
-                    # log reader stopped has been delivered, so resume from there. Resuming
-                    # from the last commit instead rescans the same stretch of a busy log on
-                    # every poll and can time out before ever passing it. A position held back
-                    # short of where the read started (a quiet log, see _shared_cdc_snapshot)
-                    # resumes from the start: the read had nothing to deliver short of it.
-                    advanced = max(
-                        read_start, reached, committed[-1].commit_lsn if committed else reached
-                    )
-                elif committed:
-                    advanced = committed[-1].commit_lsn
-                else:
-                    advanced = self.shared_restart
-                # Never advance past the floor of a table this read did not cover. A
-                # subscriber that joined (or re-joined after TTL eviction) while the read
-                # was in flight lowered shared_restart to its floor; overwriting that here
-                # left its log between the floor and this read's end unread forever, and
-                # its first view then skipped that range silently.
-                pending = [
-                    entry["floor"] for entry in self.subscribers.values() if not self._covered(entry)
-                ]
-                candidates = [value for value in (advanced, *pending) if value is not None]
-                if candidates:
-                    self.shared_restart = min(candidates)
-                open_begins: dict[str, int | None] = {}
-                for identity, sub in self.subscribers.items():
-                    begins = [
-                        item.begin_lsn
-                        for item in buffer.open.values()
-                        if any(
-                            _record_matches(record, sub["table"])
-                            for record in itertools.chain(item.records, item.spilling)
-                        )
-                    ]
-                    open_begins[identity] = min(begins) if begins else None
-                self.open_begins = open_begins
-                self.schema = dict(schema_map)
-                self.min_lsn = min_lsn
-                # current_lsn was sampled before the read, which can then reach further, into the
-                # next logical log: a view must not report a log position older than the commits
-                # it hands out, or a consumer that took them reads as being ahead of the log.
-                self.current_lsn = max(
-                    current_lsn, reached or 0, committed[-1].commit_lsn if committed else 0
-                )
-                self.caught_up = timed_out and not buffer.open
-                self.reached_lsn = reached if self.caught_up else None
-                self.read_start_lsn = read_start if self.caught_up else None
-                self.ready = True
-                self.condition.notify_all()
-            return self.caught_up
-
-        def mark_unready(self):
-            with self.condition:
-                self.ready = False
-
-
-    # Serialization-safe registry (a bare module global becomes a function local in the
-    # merged deployment; a mutated dict survives, as with _lakebase_waiter_lock).
-    _SHARED_CDC_SHARDS: dict[tuple, _SharedCdcShard] = {}
-    _SHARED_CDC_THREADS: dict[tuple, threading.Thread] = {}
-    _SHARED_CDC_REGISTRY_LOCK: dict[str, threading.Lock] = {}
-
-
-    def _shared_cdc_registry_lock() -> threading.Lock:
-        lock = _SHARED_CDC_REGISTRY_LOCK.get("lock")
-        if lock is None:
-            lock = _SHARED_CDC_REGISTRY_LOCK.setdefault("lock", threading.Lock())
-        return lock
-
-
-    def _ensure_key_columns_exist(table: Table) -> None:
-        # Docstring: Fail when a carried key names a column the catalog no longer has.
-        #
-        # A primary.keys override or a nullable-index promotion is carried as listed, so a
-        # key column dropped at the source would otherwise outlive the refresh and every row
-        # would then key on NULL.
-
-        known = {column.name for column in table.columns}
-        missing = [key for key in table.primary_keys if key not in known]
-        if missing:
-            # 373: Key column(s) {} of '{}' no longer exist at the source; run a full refresh
-            raise InformixError(_m(373, (", ".join(missing)), table.exposed_name))
-
-
-    def _wildcard_key(columns: Iterable[Column], excepted: Iterable[str]) -> list[str]:
-        # Docstring: The names of ``columns`` a wildcard key covers: all of them, in order, but
-        # the ``excepted`` ones of a "* except(...)" key.
-        #
-        # Matched ignoring case, as Informix folds an undelimited identifier to lower case, so
-        # "* except(Note)" leaves out a column catalogued as ``note``.
-
-        folded = {name.casefold() for name in excepted or ()}
-        return [column.name for column in columns if column.name.casefold() not in folded]
-
-
-    def _ensure_excepted_columns_exist(table: Table, excepted: Iterable[str]) -> None:
-        # Docstring: Fail when a "* except(...)" key names a column the table doesn't have.
-        #
-        # Checked against every catalog column, those the column selection or an unsupported
-        # type leaves out included, and ignoring case as _wildcard_key matches, so a typo fails
-        # instead of quietly keeping the column it meant in the key. After a named column is
-        # dropped at the source, take it out of the list: the key stays as it was, so the
-        # schema transition accepts that edit. A column still to be added can't be named
-        # ahead; add it to the list once it exists, before the pipeline restarts.
-
-        known = {column.name.casefold() for column in table.catalog_columns or table.columns}
-        missing = [name for name in excepted or () if name.casefold() not in known]
-        if missing:
-            # 374: Option '{}' excepts column(s) that '{}' does not have: {}
-            raise InformixError(_m(374, _PRIMARY_KEYS_OPTION, table.exposed_name, (", ".join(missing))))
-
-
-    def _carry_key_override(fresh: Table, overridden: Table) -> Table:
-        # Docstring: Carry a ``primary.keys`` override from ``overridden`` onto a re-read ``fresh``
-        # table.
-        #
-        # An explicit key list is preserved as-is, with its adopted key-index directions. A
-        # wildcard key is re-expanded to ``fresh``'s columns, less any its except(...) names,
-        # keeping the directions only when the key is unchanged. A name whose column was
-        # dropped fails, as it does when the option is applied.
-
-        keys = overridden.primary_keys
-        descending = overridden.key_descending
-        if overridden.key_wildcard:
-            _ensure_excepted_columns_exist(fresh, overridden.key_wildcard_except)
-            keys = tuple(_wildcard_key(fresh.columns, overridden.key_wildcard_except))
-            if not keys:
-                # 192: Option '{}' excepts every column of '{}', leaving no key
-                raise InformixError(_m(192, _PRIMARY_KEYS_OPTION, fresh.exposed_name))
-            if keys != overridden.primary_keys:
-                descending = ()
-        return replace(
-            fresh,
-            primary_keys=keys,
-            key_override=True,
-            key_wildcard=overridden.key_wildcard,
-            key_wildcard_except=overridden.key_wildcard_except,
-            key_descending=descending,
-            # As the option was applied: a key a nullable index gave the table before it,
-            # which the catalog's re-read no longer has, still makes the option's key not its
-            # only one.
-            key_only_from_option=overridden.key_only_from_option and not fresh.primary_keys,
-        )
-
-
-    def _recorded_transforms(recorded: tuple | None) -> tuple | None:
-        # Docstring: Parse recorded (column, canonical) transforms back to (column, text, operand).
-
-        if recorded is None:
-            return None
-        return tuple(
-            (
-                name,
-                canonical,
-                _RowFilterParser(canonical, _TRANSFORM_COLUMNS_OPTION, "transform").parse_expression(),
-            )
-            for name, canonical in recorded
-        )
-
-
-    def _carry_table_options(fresh: Table, previous: Table) -> Table:
-        # Docstring: Re-apply ``previous``'s option-derived state to ``fresh``, re-read from
-        # the catalog.
-        #
-        # A catalog read knows nothing of table options, so without this a refresh would
-        # revert a column selection, a primary.keys override, a nullable-index promotion, or a
-        # row_filter, change the fingerprint, and read as drift. The selection runs first so a
-        # wildcard key re-expands over the selected columns only.
-
-        fresh = _apply_column_selection(fresh, previous.column_selection)
-        # The key the carry below gives ``fresh``: the override or promotion carried, else
-        # the catalog's; a wildcard keys on whatever is ingested.
-        if previous.key_wildcard:
-            key = None
-        elif previous.key_override or previous.key_from_nullable_index:
-            key = previous.primary_keys
-        else:
-            key = fresh.primary_keys
-        fresh = _leave_out_unsupported_columns(fresh, key)
-        if previous.key_override:
-            # A wildcard key is re-expanded to the fresh columns instead of kept as listed.
-            fresh = _carry_key_override(fresh, previous)
-        elif previous.key_from_nullable_index and not fresh.primary_keys and fresh.nullable_index_key:
-            # The catalog re-derives the table as key-less (no all-NOT-NULL index), so without
-            # this the promoted key -- and its directions -- would be dropped and the
-            # key-order guard would trip mid-copy. Promoted again from this read, as the
-            # option does: copied from the earlier one, an index dropped or replaced since, or
-            # a primary key added, read as no change, and the key drift went unseen.
-            fresh = replace(
-                fresh,
-                primary_keys=fresh.nullable_index_key,
-                key_descending=fresh.nullable_index_descending,
-                key_from_nullable_index=True,
-            )
-        _ensure_key_columns_exist(fresh)
-        _ensure_selected_keys(fresh)
-        fresh = _apply_row_filter(fresh, previous.row_filter)
-        fresh = _apply_column_renames(fresh, previous.column_renames)
-        if previous.decimal_targets is not None:
-            # Those of the columns still there: a dropped column takes its entry with it, and
-            # one the table gained takes the table-wide type, which the catalog doesn't know.
-            known = {column.name for column in previous.columns}
-            entries = dict(previous.decimal_targets)
-            targets = []
-            for column in fresh.columns:
-                if not _is_variable_scale_decimal(column):
-                    continue
-                if column.name in entries:
-                    targets.append((column.name, entries[column.name]))
-                elif column.name not in known and previous.decimal_default is not None:
-                    targets.append((column.name, previous.decimal_default))
-            fresh = replace(
-                fresh, decimal_targets=tuple(sorted(targets)), decimal_default=previous.decimal_default
-            )
-        carried = _recorded_transforms(previous.column_transforms)
-        return _apply_column_transforms(fresh, carried, None, key_id=previous.transform_key_id)
-
-
-    def _shard_schema_map(
-        bridge, identities, catalog: _ShardCatalog | None = None, check_seconds: float = 0
-    ) -> tuple[dict[str, Table], list[str]]:
-        # Docstring: Each subscriber's catalog table with its options carried, as
-        # _refresh_table_schema does, for one shard read: ``(identity -> table, unfit)``.
-        #
-        # The catalog tables come from ``catalog``, which re-reads only what changed (see
-        # _ShardCatalog); without one, every table is read now. Without the carry an overridden
-        # table's fingerprint never matches its checkpoint, so it would always fall back to a
-        # direct read and never benefit from sharding -- and its PK-change detection would use
-        # the wrong keys. A table whose options no longer fit its catalog (a selected, renamed,
-        # or transformed column gone, a carried key column dropped), or whose name no longer
-        # names a table, is listed as unfit instead of failing the whole read: its own direct
-        # read reports the error, and the shard keeps serving the others.
-
-        catalog = _ShardCatalog() if catalog is None else catalog
-        fresh_tables = catalog.tables(bridge, identities, time.monotonic(), check_seconds)
-        schema_map: dict[str, Table] = {}
-        unfit: list[str] = []
-        for identity, table in identities:
-            fresh = fresh_tables.get(identity)
-            if fresh is None:
-                # 152: Shared CDC shard leaves {} to direct reads: the catalog no longer has it
-                logging.getLogger(__name__).warning(
-                    _m(152, identity),
-                )
-                unfit.append(identity)
-                continue
-            try:
-                schema_map[identity] = _carry_table_options(fresh, table)
-            except (InformixError, ValueError):
-                # 153: Shared CDC shard leaves {} to direct reads: its table options no longer fit the
-                # catalog
-                logging.getLogger(__name__).warning(
-                    _m(153, identity),
-                    exc_info=True,
-                )
-                unfit.append(identity)
-        return schema_map, unfit
-
-
-    def _close_shared_cdc_reader(reader) -> None:
-        if reader is None:
-            return
-        try:
-            reader.close()
-        except Exception:  # noqa: BLE001 - best-effort slot release
-            # 154: shared CDC reader close failed
-            logging.getLogger(__name__).debug(_m(154), exc_info=True)
-
-
-    class _HostShardEndpoints:
-        # Docstring: This process's part in each host-shared shard: the lock and listener of a
-        # shard it leads, or its connection to the leader of one it follows.
-        #
-        # Never serialized: a worker that unpickles a reader starts with no roles of its own.
-
-        def __init__(self, directory: str | None = None) -> None:
-            self.lock = threading.Lock()
-            self.directory = directory
-            # key -> {"lock_fd", "listener", "reader_factory"}: the shards this process leads.
-            self.leading: dict[tuple, dict[str, Any]] = {}
-            self.clients: dict[tuple, Any] = {}
-            self.client_locks: dict[tuple, threading.Lock] = {}
-            # (key, identity) -> (checkpoint commit LSN, floor, capture, transactions) a follower
-            # holds from its earlier polls, so the leader sends each transaction only once.
-            self.mirrors: dict[tuple, tuple[int, int, dict, tuple]] = {}
-            # Set when this process can't lock or serve a shard at all, so it shares in
-            # process mode instead of reading directly on every poll.
-            self.unavailable: str | None = None
-
-        def __getstate__(self) -> dict[str, object]:
-            return {}
-
-        def __setstate__(self, state: dict[str, object]) -> None:
-            del state
-            self.__init__()
-
-        def paths(self, key: tuple) -> tuple[str, str, str]:
-            # Docstring: The shard's (lock, socket, auth key) paths, short enough for AF_UNIX.
-            #
-            # Whoever can write the directory could serve forged CDC rows, so one that isn't
-            # this user's alone raises, which turns host sharing off in this process.
-
-            directory = self.directory
-            if directory is None:
-                name = f"informix-cdc-shards-{os.getuid()}"
-                directory = os.path.join(tempfile.gettempdir(), name)
-                # A socket path must fit AF_UNIX's sun_path (104 bytes on macOS and BSD, 108 on
-                # Linux); a long TMPDIR would otherwise turn host sharing off. /tmp is short.
-                if len(os.fsencode(os.path.join(directory, "0" * 24 + ".sock"))) > 100:
-                    directory = os.path.join("/tmp", name)
-            os.makedirs(directory, mode=0o700, exist_ok=True)
-            info = os.lstat(directory)
-            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-                # 143: {} is not a directory only this user can access
-                raise PermissionError(_m(143, directory))
-            digest = hashlib.sha256(repr(key).encode()).hexdigest()[:24]
-            base = os.path.join(directory, digest)
-            return f"{base}.lock", f"{base}.sock", f"{base}.key"
-
-
-    _HOST_SHARD_ENDPOINTS = _HostShardEndpoints()
-
-
-    def _host_shard_stop_leading(
-        endpoints: _HostShardEndpoints, key: tuple, *, locked: bool = False
-    ) -> None:
-        # Docstring: Give up leading a shard nobody reads any more: close its listener, remove
-        # its socket and key files, and release its lock. A follower that polls later finds
-        # no leader and leads it itself. The lock file stays: removing it could let two
-        # processes lock different files of the same name. ``locked``: the caller holds the
-        # endpoints lock.
-
-        with contextlib.nullcontext() if locked else endpoints.lock:
-            leading = endpoints.leading.pop(key, None)
-            if leading is None:
-                return
-            with contextlib.suppress(Exception):
-                leading["listener"].close()
-            with contextlib.suppress(Exception):
-                _lock_path, socket_path, key_path = endpoints.paths(key)
-                for path in (socket_path, key_path):
-                    with contextlib.suppress(OSError):
-                        os.unlink(path)
-            with contextlib.suppress(OSError):
-                os.close(leading["lock_fd"])
-
-
-    def _retire_shared_cdc_shard(key: tuple, shard: _SharedCdcShard) -> bool:
-        # Docstring: Take an idle shard out of the registry, and give up leading it for other
-        # processes; False when a subscriber has come back. A consumer that asks for the
-        # shard afterwards gets a new one, with a new thread.
-
-        # The lead is given up under the locks the shard leaves the registry under, the
-        # endpoints lock first, as _host_shard_own_poll takes it: a poll that found this
-        # process leading between the two made a new shard and thread here, while another
-        # process took the lock and led the shard too.
-        # A shard already out of the registry (given up, see _host_shard_accept) leaves the
-        # lead alone: it is a newer shard's, if this process leads the key again.
-        endpoints = _HOST_SHARD_ENDPOINTS
-        with endpoints.lock, _shared_cdc_registry_lock():
-            with shard.condition:
-                if shard.live_subscribers():
-                    return False
-            if _SHARED_CDC_SHARDS.get(key) is shard:
-                _SHARED_CDC_SHARDS.pop(key, None)
-                _SHARED_CDC_THREADS.pop(key, None)
-                _host_shard_stop_leading(endpoints, key, locked=True)
-        return True
-
-
-    # pylint: disable-next=too-many-statements
-    def _run_shared_cdc_shard(shard: _SharedCdcShard, key: tuple | None = None) -> None:
-        # Docstring: Daemon loop for one shard: read the shared CDC session, fetch schema + log
-        # bounds, and publish. Holds one connection slot only across consecutive productive
-        # reads; releases it before any idle wait so consumer bootstrap can use the slot.
-        # Ends once the shard has had no subscriber for _SHARED_CDC_IDLE_EXIT_SECONDS.
-
-        logger = logging.getLogger(__name__)
-        reader = None
-        idle_since: float | None = None
-        try:
-            while True:
-                with shard.condition:
-                    subscribers = shard.live_subscribers()
-                    have_subscribers = bool(subscribers)
-                if have_subscribers:
-                    idle_since = None
-                elif key is not None:
-                    idle_since = idle_since or time.monotonic()
-                    if (
-                        time.monotonic() - idle_since >= _SHARED_CDC_IDLE_EXIT_SECONDS
-                        and _retire_shared_cdc_shard(key, shard)
-                    ):
-                        return
-                with shard.condition:
-                    throttled = have_subscribers and any(
-                        len(buf) >= shard.buffer_cap for buf in shard.buffers.values()
-                    )
-                    restart = shard.shared_restart
-                    identities = [(identity, sub["table"]) for identity, sub in subscribers.items()]
-                if not have_subscribers or throttled or restart is None or shard.reader_factory is None:
-                    _close_shared_cdc_reader(reader)
-                    reader = None
-                    with shard.condition:
-                        shard.condition.wait(timeout=_SHARED_CDC_IDLE_POLL_SECONDS)
-                    continue
-                if reader is None:
-                    reader = shard.reader_factory()
-                try:
-                    schema_map, unfit = _shard_schema_map(
-                        reader._bridge,
-                        identities,
-                        shard.catalog,
-                        _SNAPSHOT_SCHEMA_REFRESH_INTERVAL_SECONDS,
-                    )
-                    for identity in unfit:
-                        # Its consumer falls back to a direct read, which reports the error;
-                        # evicting it keeps its floor from pinning the shared restart.
-                        shard.evict(identity)
-                    if not schema_map:
-                        _close_shared_cdc_reader(reader)
-                        reader = None
-                        with shard.condition:
-                            shard.condition.wait(timeout=_SHARED_CDC_IDLE_POLL_SECONDS)
-                        continue
-                    captures = {identity: subscribers[identity]["capture"] for identity in schema_map}
-                    min_lsn = reader._bridge.minimum_lsn()
-                    current_lsn = reader._bridge.current_lsn()
-                    raw = reader._read_changes_with_reconnect(
-                        list(captures.values()),
-                        restart,
-                        shard.timeout_seconds,
-                        shard.max_records,
-                        table=subscribers[next(iter(schema_map))]["table"],
-                    )
-                    caught_up = shard.ingest(raw, schema_map, min_lsn, current_lsn, restart, captures)
-                except Exception:  # noqa: BLE001 - surfaced by degrading to direct reads
-                    # 155: Shared CDC shard read failed; consumers fall back to direct reads until it
-                    # recovers
-                    logger.warning(
-                        _m(155),
-                        exc_info=True,
-                    )
-                    shard.mark_unready()
-                    # Whatever failed, the next read starts from a fresh look at the catalog.
-                    shard.catalog.force_check()
-                    _close_shared_cdc_reader(reader)
-                    reader = None
-                    time.sleep(_SHARED_CDC_IDLE_POLL_SECONDS)
-                    continue
-                if caught_up:
-                    _close_shared_cdc_reader(reader)
-                    reader = None
-                    with shard.condition:
-                        shard.condition.wait(timeout=_SHARED_CDC_IDLE_POLL_SECONDS)
-        finally:
-            _close_shared_cdc_reader(reader)
-
-
-    def _shared_cdc_shard(
-        key, *, reader_factory, timeout_seconds, max_records, buffer_cap, subscriber_ttl
-    ) -> _SharedCdcShard:
-        with _shared_cdc_registry_lock():
-            shard = _SHARED_CDC_SHARDS.get(key)
-            if shard is None:
-                shard = _SHARED_CDC_SHARDS.setdefault(key, _SharedCdcShard())
-            shard.configure(
-                reader_factory=reader_factory,
-                timeout_seconds=timeout_seconds,
-                max_records=max_records,
-                buffer_cap=buffer_cap,
-                subscriber_ttl=subscriber_ttl,
-            )
-            thread = _SHARED_CDC_THREADS.get(key)
-            if thread is None or not thread.is_alive():
-                thread = threading.Thread(
-                    target=_run_shared_cdc_shard,
-                    args=(shard, key),
-                    daemon=True,
-                    name=f"informix-shared-cdc-{key[-2]}-{key[-1]}",
-                )
-                _SHARED_CDC_THREADS[key] = thread
-                thread.start()
-            return shard
-
-
-    # Host-shared shards (cdc.shared.session=host, the default). Serverless SDP runs each
-    # streaming flow's driver-side reader in its own Python process, all in one container on
-    # the driver host, so a process-local shard serves only its own flow's table and every
-    # flow opens its own CDC session. In host mode the first process to lock a shard's lock
-    # file leads it: it runs the shard and its reader thread exactly as process mode does,
-    # and serves the other flow processes' polls over a Unix socket in the local temp
-    # directory. A follower that can't reach the leader tries to take the lock, which the
-    # kernel releases when the leader's process exits, and otherwise reads directly for that
-    # poll, as any flow does while its shard isn't ready. A new leader starts an empty shard,
-    # which its subscribers cover again from their own checkpoints, as after a restart.
-    _SHARED_CDC_SESSION_HOST = "host"
-    _SHARED_CDC_SESSION_PROCESS = "process"
-    # How long a follower waits to connect to the leader, or for it to answer one poll,
-    # before reading directly.
-    _HOST_SHARD_REPLY_SECONDS = 60.0
-    # Consecutive accept failures after which a leader gives its shard up to another process.
-    _HOST_SHARD_ACCEPT_FAILURES = 8
-
-
-    def _shared_cdc_mode(options: dict[str, str]) -> str:
-        # Docstring: ``cdc.shared.session`` as host (the default) or process.
-        #
-        # ``host`` shares the shards between the flow processes on one host; ``process``
-        # keeps one shard registry per process.
-
-        value = options.get(_SHARED_CDC_SESSION_OPTION, _SHARED_CDC_SESSION_HOST).strip().lower()
-        if value in (_SHARED_CDC_SESSION_HOST, _SHARED_CDC_SESSION_PROCESS):
-            return value
-        # 142: Option '{}' must be 'host' or 'process'
-        raise ValueError(_m(142, _SHARED_CDC_SESSION_OPTION))
-
-
-    def _unwire_table(data: dict[str, Any]) -> Table:
-        fields = dict(data)
-        for name in _HOST_SHARD_TABLE_COLUMN_FIELDS:
-            fields[name] = tuple(Column(**column) for column in fields[name])
-        return Table(**fields)
-
-
-    def _unwire_json_table(data: dict[str, Any]) -> Table:
-        # Docstring: _unwire_table for a table that crossed JSON (a partition descriptor), which
-        # turned its tuples into lists.
-
-        def tuples(value: Any) -> Any:
-            return tuple(tuples(item) for item in value) if isinstance(value, list) else value
-
-        return _unwire_table(
-            {
-                name: value if name in _HOST_SHARD_TABLE_COLUMN_FIELDS else tuples(value)
-                for name, value in data.items()
-            }
-        )
-
-
-    def _wire_view(view: "_SharedCdcSnapshot") -> dict[str, Any]:
-        # Docstring: A shard view as plain data; its records already are (decoded CDC values).
-
-        return {
-            "table": _wire_table(view.table),
-            "fingerprint": view.fingerprint,
-            "min_lsn": view.min_lsn,
-            "current_lsn": view.current_lsn,
-            "committed": [
-                (
-                    tx.tx_id,
-                    tx.begin_lsn,
-                    tx.commit_lsn,
-                    tx.restart_lsn,
-                    tx.records,
-                    tx.commit_time,
-                    tx.spilled,
-                )
-                for tx in view.committed
-            ],
-            "caught_up": view.caught_up,
-            "open_begin": view.open_begin,
-            "reached_lsn": view.reached_lsn,
-            "read_start_lsn": view.read_start_lsn,
-        }
-
-
-    def _unwire_view(data: dict[str, Any]) -> "_SharedCdcSnapshot":
-        return _SharedCdcSnapshot(
-            table=_unwire_table(data["table"]),
-            fingerprint=data["fingerprint"],
-            min_lsn=data["min_lsn"],
-            current_lsn=data["current_lsn"],
-            committed=[CommittedTransaction(*tx) for tx in data["committed"]],
-            caught_up=data["caught_up"],
-            open_begin=data["open_begin"],
-            reached_lsn=data["reached_lsn"],
-            read_start_lsn=data.get("read_start_lsn"),
-        )
-
-
-    def _host_shard_local_poll(
-        key, reader_factory, config, identity, table, capture, commit, floor, owner=None
-    ):
-        # Docstring: Subscribe to and read this process's own shard, as process mode does;
-        # None for a flow the shard does not serve because another holds the table's place.
-
-        shard = _shared_cdc_shard(key, reader_factory=reader_factory, **config)
-        return shard.poll(identity, table, capture, commit, floor, owner)
-
-
-    def _host_shard_own_poll(endpoints, key, reader_factory, config, *poll):
-        # Docstring: _host_shard_local_poll of this process's own shard: within the process
-        # where the host can't share, else as its leader; None, to read directly, once this
-        # process leads it no more.
-        #
-        # The leader takes the shard under the endpoints lock, which an idle shard's retirement
-        # holds while it leaves the registry and gives the lead up (_retire_shared_cdc_shard).
-        # Taken after a check without it, a poll between the two made a new shard and reader
-        # thread in a process that then let its lock go, beside the leader another process
-        # became: two sessions reading one shard's tables.
-
-        if endpoints.unavailable:
-            return _host_shard_local_poll(key, reader_factory, config, *poll)
-        with endpoints.lock:
-            if key not in endpoints.leading:
-                return None
-            shard = _shared_cdc_shard(key, reader_factory=reader_factory, **config)
-        return shard.poll(*poll)
-
-
-    ########################################################
     # src/databricks/labs/community_connector/sources/informix/lakebase_state_store.py
     ########################################################
 
@@ -12520,6 +9848,19 @@ def register_lakeflow_source(spark):
         )
 
 
+    def redirect_host_key(host: str) -> str:
+        # Docstring: A redirect host as allow-list entries and redirect targets are compared: a
+        # name case-folded without its trailing dot (DNS names are case-insensitive), an IP
+        # address in its canonical form, an IPv6 one without its brackets.
+        name = host.strip()
+        if name.startswith("[") and name.endswith("]"):
+            name = name[1:-1]
+        try:
+            return ipaddress.ip_address(name).compressed
+        except ValueError:
+            return name.rstrip(".").casefold()
+
+
     def parse_redirect_detail(detail: str, allowlist: set[tuple[str, int]]) -> tuple[str, str, int]:
         tokens = re.split(r"[:=|]", detail)
         if (
@@ -12532,7 +9873,12 @@ def register_lakeflow_source(spark):
         server, host, port = tokens[-3], tokens[-2], int(tokens[-1])
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", server) or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
             raise SqliUnsupportedAuthentication("redirect detail has unsafe identifiers")
-        if not server or not host or not 1 <= port <= 65535 or (host, port) not in allowlist:
+        if (
+            not server
+            or not host
+            or not 1 <= port <= 65535
+            or (redirect_host_key(host), port) not in allowlist
+        ):
             raise SqliUnsupportedAuthentication("redirect target is not explicitly allow-listed")
         return server, host, port
 
@@ -13532,6 +10878,2703 @@ def register_lakeflow_source(spark):
         return isinstance(error, FileNotFoundError) and not str(path or "").startswith(
             _FUSE_PATH_PREFIXES
         )
+
+
+    ########################################################
+    # src/databricks/labs/community_connector/sources/informix/informix_transactions.py
+    ########################################################
+
+    def _apply_function(name: str, value: Any, literals: list, context: dict) -> Any:
+        # Docstring: Evaluate one function on an already-evaluated operand ``value``.
+        #
+        # NULL in gives NULL out, except NVL/COALESCE, which replace it, and NULLIFY, which
+        # always gives NULL. ``context`` holds the byte encoding LENGTH counts in and the
+        # HMAC key HASH uses.
+
+        if name == "NULLIFY":
+            return None
+        if name in ("NVL", "COALESCE"):
+            return literals[0] if value is None else value
+        if value is None:
+            return None
+        if name == "HASH":
+            key = context.get("hash_key")
+            if not key:
+                # 111: HASH needs the connection option '{}'
+                raise InformixError(_m(111, _TRANSFORM_HASH_KEY_OPTION))
+            return hmac.new(key, _hash_text(value).encode("utf-8"), hashlib.sha256).hexdigest()
+        if name in _STRING_FUNCTION_NAMES:
+            text = str(value)
+            if name in ("UPPER", "LOWER"):
+                return _case_map(text, name == "UPPER")
+            if name == "TRIM":
+                return text.strip(" ")
+            if name == "LTRIM":
+                return text.lstrip(" ")
+            if name == "RTRIM":
+                return text.rstrip(" ")
+            if name == "LENGTH":
+                # Bytes, without trailing blanks, as Informix counts.
+                return len(text.rstrip(" ").encode(context.get("encoding", "latin-1"), "replace"))
+            if name == "CHAR_LENGTH":
+                return len(text)
+            if name == "SUBSTR":
+                # A start past the end gives NULL, as on Informix; an in-range empty slice is ''.
+                start = int(literals[0]) - 1
+                if start >= len(text):
+                    return None
+                return text[start:] if len(literals) == 1 else text[start : start + int(literals[1])]
+            if name == "REPLACE":
+                return text.replace(literals[0], literals[1] if len(literals) > 1 else "")
+            if name in ("LPAD", "RPAD"):
+                width, pad = int(literals[0]), literals[1]
+                if len(text) >= width:
+                    return text[:width]
+                fill = (pad * width)[: width - len(text)]
+                return fill + text if name == "LPAD" else text + fill
+            # MASK keeps the last ``keep`` characters; a value no longer than that is
+            # masked whole, so a short value does not pass through unmasked.
+            keep = int(literals[0]) if literals else 0
+            character = literals[1] if len(literals) > 1 else "*"
+            if len(text) <= keep:
+                return character * len(text)
+            return character * (len(text) - keep) + (text[len(text) - keep :] if keep else "")
+        if name in ("YEAR", "MONTH", "DAY", "WEEKDAY"):
+            moment = _temporal(value)
+            if name == "WEEKDAY":
+                return moment.isoweekday() % 7  # Informix: 0 is Sunday
+            return getattr(moment, name.lower())
+        with localcontext() as decimal_context:
+            # Wide enough for a DECIMAL(p) with no scale, whose values run from 1E-130 to
+            # 1E+126: rounding one to a whole number takes over a hundred digits.
+            decimal_context.prec = 200
+            # A float by the digits it shows (1.15, not its binary 1.1499...), as
+            # _hash_number_text reads one, so a half rounds as the documentation says.
+            number = Decimal(repr(value)) if isinstance(value, float) else Decimal(value)
+            if name == "ABS":
+                result = abs(number)
+            elif name == "MOD":
+                # Informix truncates both operands to integers; the sign follows the dividend.
+                whole = number.to_integral_value(rounding=ROUND_DOWN)
+                result = whole % Decimal(literals[0]).to_integral_value(rounding=ROUND_DOWN)
+            else:
+                digits = int(literals[0]) if literals else 0
+                result = number.quantize(
+                    Decimal(1).scaleb(-digits),
+                    rounding=ROUND_HALF_UP if name == "ROUND" else ROUND_DOWN,
+                )
+                # Negative digits leave a positive exponent (1.2E+4): write it out in full.
+                result = result.quantize(Decimal(1)) if digits < 0 else result
+        # Back in the type the column's values arrive as, which the schema declares: a
+        # variable-scale DECIMAL can arrive as a float or a fixed-point string.
+        if isinstance(value, str):
+            # Zero unsigned, as Informix and the decimal decoders write it ("-0" hashed apart).
+            return format(result or abs(result), "f")
+        if isinstance(value, float):
+            return float(result)
+        return result if isinstance(value, Decimal) else int(result)
+
+
+    def _pad_char(text: str, width: int, encoding: str) -> str:
+        # Docstring: ``text`` blank-padded as Informix stores a CHAR: to ``width`` bytes of the
+        # database code set, so a multibyte character takes more than one of them.
+
+        missing = width - len(text.encode(encoding, "replace"))
+        return text + " " * missing if missing > 0 else text
+
+
+    def _rounded_half_up(value: Decimal, places: int) -> Decimal:
+        # Docstring: ``value`` at ``places``, a half away from zero as ROUND rounds one: under
+        # the default half-even, NVL(ROUND(vcol, 0), 2.5) landed 2 where ROUND lands 3.
+
+        with localcontext() as decimal_context:
+            # As _apply_function's: a DECIMAL(p) fallback of 1e100 at 2 places is 103 digits.
+            decimal_context.prec = 200
+            return value.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+
+
+    def _number_text_places(operand: str | tuple) -> int | None:
+        # Docstring: The places a number function's text values carry (see _apply_function):
+        # ROUND's and TRUNC's digits, none for MOD, ABS those of what it reads; None for the
+        # column's own text, which drops trailing zeros.
+
+        while not isinstance(operand, str):
+            _, name, arguments = operand
+            if name in ("ROUND", "TRUNC"):
+                return max(int(arguments[1][1]) if len(arguments) > 1 else 0, 0)
+            if name == "MOD":
+                return 0
+            operand = arguments[0]
+        return None
+
+
+    def _number_for_column(value: Decimal, column: "Column", options: dict[str, str]) -> Any:
+        # Docstring: ``value`` as the Python number ``column``'s decoded values are.
+
+        if column.type_name in _INTEGER_RANKS:
+            return int(value)
+        if column.type_name in _UNLOAD_FLOAT_TYPES:
+            # As the column's own values: a SMALLFLOAT's 32 bits, so HASH reads its digits alike.
+            smallfloat = column.type_name in {"SMALLFLOAT", "REAL"}
+            return _float32(float(value)) if smallfloat else float(value)
+        if column.type_name in {"DECIMAL", "NUMERIC", "MONEY"}:
+            if _is_variable_scale_decimal(column):
+                target = _variable_decimal_target(column, options)
+                if target[0] == "decimal":
+                    # Rounded as below, not cut as the column's own values are.
+                    value = _rounded_half_up(value, target[2] or 0)
+                return _coerce_variable_decimal_value(value, column, target)
+            if column.scale is not None:
+                scale = column.scale
+            else:
+                scale = 2 if column.type_name == "MONEY" else 0
+            # Past the default 28 digits (a DECIMAL holds up to 32), and as ROUND rounds.
+            return _rounded_half_up(value, scale)
+        return value
+
+
+    def _fallback_value(literal: Any, operand: str | tuple, context: dict) -> Any:
+        # Docstring: NVL/COALESCE's fallback in the representation of what it stands in for.
+        #
+        # In a filter a CHAR column's fallback is padded to the column's width, as Informix
+        # pads it. In a transform a number literal, parsed as a Decimal, becomes the Python
+        # type the operand's other values have -- an int for an integer column or an
+        # integer-result function, a Decimal at the column's scale, or the configured
+        # variable-scale form -- so every row of a transformed column carries one type.
+        # ``context["columns"]`` supplies the columns, on demand when it is callable.
+
+        if isinstance(literal, str):
+            if isinstance(operand, str):
+                width = context.get("pad", {}).get(operand)
+                if width:
+                    return _pad_char(literal, width, context.get("encoding", "latin-1"))
+            return literal
+        if not isinstance(literal, Decimal):
+            return literal
+        if any(name in _INTEGER_RESULT_FUNCTIONS for name in _operand_functions(operand)):
+            return int(literal)
+        columns = context.get("columns")
+        if callable(columns):
+            columns = context["columns"] = {column.name: column for column in columns()}
+        column = (columns or {}).get(_expression_column(operand))
+        if column is None:
+            return literal
+        options = context.get("options") or {}
+        if not isinstance(operand, str):
+            # A function can land in another type than its column (see _transform_spark_type),
+            # and the fallback lands as the function's values do: ROUND(vcol, 0) is a
+            # DECIMAL(38,0) where vcol is a DECIMAL(38,18), and 10^20 fits the one, not the
+            # other; ROUND(int_col, -3) can be a BIGINT. So is ROUND's carry digit: under
+            # decimal(5,2), NVL(ROUND(vcol, 2), 1000) was checked against the DECIMAL(6,2)
+            # and then failed the first NULL against the column's decimal(5,2).
+            inner = _transform_spark_type(operand, column, options)
+            if isinstance(inner, (IntegerType, LongType)):
+                return int(literal)
+            places = None
+            if isinstance(inner, DecimalType) and inner != _spark_type(column, options):
+                places = inner.scale
+            elif isinstance(inner, StringType) and _is_variable_scale_decimal(column):
+                # As a string, at the places the function's values have: ROUND(vcol, 2)
+                # writes 12.30, so the fallback 12.3 must too, or HASH gave the two digests.
+                # Only padded: a string holds 12.345 as given.
+                places = _number_text_places(operand)
+                if places is not None:
+                    places = max(places, -literal.as_tuple().exponent)
+            if places is not None:
+                result = _rounded_half_up(literal, places)
+                if isinstance(inner, DecimalType):
+                    return result
+                return format(result or abs(result), "f")
+        return _number_for_column(literal, column, options)
+
+
+    def _expression_value(operand: str | tuple, row: dict, context: dict) -> Any:
+        # Docstring: Evaluate an operand on ``row``. In a filter, ``context["pad"]`` names the
+        # CHAR columns and their widths: Informix applies functions to the blank-padded
+        # value, which decoding stripped, so a CHAR operand is padded back first.
+
+        if isinstance(operand, str):
+            value = row.get(operand)
+            width = context.get("pad", {}).get(operand)
+            if width and value is not None:
+                value = _pad_char(str(value), width, context.get("encoding", "latin-1"))
+            return value
+        _, name, arguments = operand
+        value = _expression_value(arguments[0], row, context)
+        literals = [literal[1] for literal in arguments[1:]]
+        if name in ("NVL", "COALESCE") and value is None:
+            return _fallback_value(literals[0], arguments[0], context)
+        return _apply_function(name, value, literals, context)
+
+
+    def _transformed_rows(rows: Iterator[dict], transforms: tuple | None, context: dict):
+        # Docstring: ``rows`` with each transformed column's value replaced (source names).
+
+        if not transforms:
+            return rows
+
+        def apply(row: dict) -> dict:
+            out = dict(row)
+            for name, _, operand in transforms:
+                if name in out:
+                    value = _expression_value(operand, out, context)
+                    if (
+                        isinstance(value, int)
+                        and not isinstance(value, bool)
+                        and not -(1 << 63) <= value < (1 << 63)
+                    ):
+                        # ABS of the lowest INT8, or a BIGINT rounded up past the highest:
+                        # no 64-bit column holds it, and Informix refuses it too.
+                        # 451: Transform of column {} gives {}, which is outside the range of
+                        # a 64-bit integer
+                        raise InformixError(_m(451, name, value))
+                    if isinstance(value, Decimal) and value.is_finite() and value.adjusted() >= 38:
+                        # ROUND to a negative digit of a DECIMAL(38,0) (decimal.variable.type:
+                        # decimal(38,0)) has no digit left for the carry: 38 nines to the ten
+                        # is 10^38, which failed the batch in Spark.
+                        # 466: Transform of column {} gives {}, which has more integer digits
+                        # than a DECIMAL(38), Spark's largest, holds
+                        raise InformixError(_m(466, name, value))
+                    out[name] = _framework_value(value)
+            return out
+
+        return (apply(row) for row in rows)
+
+
+    def _renamed_rows(rows: Iterator[dict], renames: tuple[tuple[str, str], ...] | None):
+        # Docstring: ``rows`` with their keys under the destination names ``renames`` gives.
+
+        if not renames:
+            return rows
+        mapping = dict(renames)
+        return ({mapping.get(key, key): value for key, value in row.items()} for row in rows)
+
+
+    _ROW_FILTER_LIKE_CACHE: dict[tuple[str, str], re.Pattern] = {}
+
+
+    def _transform_may_null(operand: str | tuple) -> bool:
+        # Docstring: Whether a transform can turn a non-NULL value into NULL: NULLIFY always does
+        # and SUBSTR does past the end of the string. Every other function keeps a value, so a
+        # NOT NULL column stays NOT NULL through HASH, MASK, UPPER, ABS, and the rest.
+
+        return any(name in ("NULLIFY", "SUBSTR") for name in _operand_functions(operand))
+
+
+    def _apply_row_filter(table: Table, text: str | None) -> Table:
+        # Docstring: Validate ``text`` against ``table`` and record its canonical form on the table.
+
+        if text is None or not str(text).strip():
+            return table if table.row_filter is None else replace(table, row_filter=None)
+        if len(str(text)) > 8192:
+            # 115: Option '{}' cannot exceed 8192 characters, as given or written out in full
+            raise ValueError(_m(115, _ROW_FILTER_OPTION))
+        tree = _parse_row_filter(str(text))
+        _check_row_filter(tree, table)
+        canonical = _row_filter_text(tree)
+        if len(canonical) > 8192:
+            # The canonical form is what a schema refresh checks again: longer, it passed here
+            # and then failed the refresh.
+            # 115: Option '{}' cannot exceed 8192 characters, as given or written out in full
+            raise ValueError(_m(115, _ROW_FILTER_OPTION))
+        return table if table.row_filter == canonical else replace(table, row_filter=canonical)
+
+
+    def _filter_column_names(node: tuple):
+        # Docstring: The columns a row_filter tree reads.
+
+        if node[0] in ("and", "or"):
+            for child in node[1]:
+                yield from _filter_column_names(child)
+        elif node[0] == "not":
+            yield from _filter_column_names(node[1])
+        else:
+            yield _expression_column(node[1])
+
+
+    def _operand_kind(operand: str | tuple, kinds: dict) -> str | None:
+        # Docstring: The kind a validated operand evaluates to (see _expression_kind).
+
+        if isinstance(operand, str):
+            return kinds[operand]
+        result = _EXPRESSION_FUNCTIONS[operand[1]][2]
+        return _operand_kind(operand[2][0], kinds) if result == "same" else result
+
+
+    def _row_filter_like(pattern: str, escape: str) -> re.Pattern:
+        # Docstring: Compile a LIKE pattern (trailing blanks already removed) to a regex.
+
+        key = (pattern, escape)
+        compiled = _ROW_FILTER_LIKE_CACHE.get(key)
+        if compiled is None:
+            parts = []
+            index = 0
+            while index < len(pattern):
+                character = pattern[index]
+                if character == escape:
+                    index += 1
+                    parts.append(re.escape(pattern[index]))
+                elif character == "%":
+                    parts.append(".*")
+                elif character == "_":
+                    parts.append(".")
+                else:
+                    parts.append(re.escape(character))
+                index += 1
+            compiled = re.compile("".join(parts), re.DOTALL)
+            if len(_ROW_FILTER_LIKE_CACHE) >= 256:
+                _ROW_FILTER_LIKE_CACHE.clear()
+            _ROW_FILTER_LIKE_CACHE[key] = compiled
+        return compiled
+
+
+    def _row_filter_compare(value: Any, op: str, literal: Any, kind: str | None) -> bool:
+        if kind in ("string", "nstring"):
+            # Pad to equal width: SQL compares CHAR and VARCHAR as if blank-padded.
+            value = str(value)
+            width = max(len(value), len(literal))
+            value, literal = value.ljust(width), literal.ljust(width)
+        elif kind == "timestamp" and isinstance(value, datetime) and value.tzinfo is not None:
+            # The decoder tags year-1 values UTC only so PySpark accepts them.
+            value = value.replace(tzinfo=None)
+        elif kind == "float":
+            # As Informix compares: the literal read as a double, against the value's.
+            literal = float(literal)
+        elif kind == "smallfloat":
+            # In single precision, as Informix compares a SMALLFLOAT: the literal through a
+            # double to 32 bits, against the value's 32 bits (a .unl file gives 9 digits of it).
+            value, literal = _float32(value), _float32(float(literal))
+        if op == "=":
+            return value == literal
+        if op == "<>":
+            return value != literal
+        if op == "<":
+            return value < literal
+        if op == "<=":
+            return value <= literal
+        if op == ">":
+            return value > literal
+        return value >= literal
+
+
+    def _row_filter_value(node: tuple, row: dict, kinds: dict, context: dict) -> bool | None:
+        tag = node[0]
+        if tag in ("and", "or"):
+            # AND stops at the first False, OR at the first True; a NULL otherwise wins.
+            stop = tag == "or"
+            result: bool | None = not stop
+            for child in node[1]:
+                value = _row_filter_value(child, row, kinds, context)
+                if value is stop:
+                    return stop
+                if value is None:
+                    result = None
+            return result
+        if tag == "not":
+            value = _row_filter_value(node[1], row, kinds, context)
+            return None if value is None else not value
+        operand = node[1]
+        if isinstance(operand, str):
+            value, kind = row.get(operand), kinds[operand]
+        else:
+            value = _expression_value(operand, row, context)
+            kind = _operand_kind(operand, kinds)
+        if tag == "null":
+            return (value is None) != node[2]
+        if value is None:
+            return None
+        if tag == "cmp":
+            return _row_filter_compare(value, node[2], node[3][1], kind)
+        if tag == "in":
+            hit = any(_row_filter_compare(value, "=", literal[1], kind) for literal in node[3])
+            return hit != node[2]
+        if tag == "like":
+            hit = _row_filter_like(node[3][1], node[4]).fullmatch(str(value).rstrip(" ")) is not None
+            return hit != node[2]
+        inside = _row_filter_compare(value, ">=", node[3][1], kind) and _row_filter_compare(
+            value, "<=", node[4][1], kind
+        )
+        return inside != node[2]
+
+
+    def _row_filter_matches(predicate: tuple, row: dict) -> bool:
+        # Docstring: Whether ``row`` -- decoded Python values by column -- passes the filter.
+        # Unknown (NULL) counts as no match, exactly as in a SQL WHERE clause.
+
+        tree, kinds, context = predicate
+        return _row_filter_value(tree, row, kinds, context) is True
+
+
+    def _filtered_pages(consume: Callable, predicate: tuple, max_rows: int = 0) -> Callable:
+        # Docstring: ``consume`` given only the rows of each page that pass ``predicate``, its
+        # pages numbered on without a gap where none does, and no more than ``max_rows`` of them
+        # (0, any number): counted before the filter, a snapshot whose rows passed it read as
+        # too many, unlike the snapshot-only read's (see _read_snapshot_only).
+
+        kept = [0, 0]
+
+        def consumer(lsn: int, _index: int, rows: list) -> None:
+            rows = [row for row in rows if _row_filter_matches(predicate, row)]
+            kept[1] += len(rows)
+            if max_rows and kept[1] > max_rows:
+                # 52: Initial snapshot exceeds snapshot.max.rows={}
+                raise InformixError(_m(52, max_rows))
+            if rows:
+                consume(lsn, kept[0], rows)
+                kept[0] += 1
+
+        return consumer
+
+
+    def _row_filter_predicate(table: Table, encoding: str = "latin-1") -> tuple | None:
+        # Docstring: ``table``'s parsed row_filter with what evaluating it needs -- each
+        # column's kind and, for functions, the CHAR widths to re-pad and the byte encoding
+        # LENGTH counts in -- ready for :func:`_row_filter_matches`, or None without a filter.
+
+        if table.row_filter is None:
+            return None
+        kinds = {column.name: _row_filter_kind(column) for column in table.columns}
+        pad = {
+            column.name: int(column.length)
+            for column in table.columns
+            if column.type_name in {"CHAR", "NCHAR"} and column.length
+        }
+        return _parse_row_filter(table.row_filter), kinds, {"pad": pad, "encoding": encoding}
+
+
+    def _validated_volume_location(location: str, option_name: str, options: dict[str, str]) -> str:
+        if not os.path.isabs(location):
+            # 116: Option '{}' must be an absolute path
+            raise ValueError(_m(116, option_name))
+        normalized = os.path.normpath(location)
+        if normalized != location.rstrip("/") or any(
+            part in {".", ".."} for part in location.split("/")
+        ):
+            # 117: Option '{}' must not contain traversal
+            raise ValueError(_m(117, option_name))
+        if options.get("hostname"):
+            parts = normalized.split("/")
+            if len(parts) < 5 or parts[1] != "Volumes" or any(not part for part in parts[2:5]):
+                # 118: Option '{}' must be a Unity Catalog Volume path under
+                # /Volumes/<catalog>/<schema>/<volume>
+                raise ValueError(_m(118, option_name))
+        return normalized
+
+
+    def _newest_created_entry_mtime(path: str, recursive: bool = False) -> float:
+        # Docstring: Return the newest storage-assigned timestamp without trusting directory updates.
+        #
+        # Considers only the creation timestamps of the *files* found beneath ``path``.
+        # Every artifact this inspects is created with O_EXCL and never rewritten, so a
+        # file's mtime is its creation time.
+        #
+        # Directory mtimes are excluded because their meaning is filesystem-specific:
+        # a local POSIX filesystem advances them when entries are *removed*, while a
+        # Volume settles them to a creation-like whole second but briefly surfaces a
+        # transient post-mutation value first. Either way, cleaning an artifact's
+        # contents could make the artifact look newly created to a caller sampling at
+        # the wrong moment, keeping a stale lease alive. The scanned directory's own
+        # timestamp is used only when it contains no files at all, where it bounds the
+        # age rather than extending it.
+
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        root = os.open(path, flags)
+        newest: float | None = None
+        stack = [root]
+        try:
+            # Inside: a mount that dropped between the open and the stat left the root open.
+            root_mtime = os.fstat(root).st_mtime
+            while stack:
+                descriptor = stack.pop()
+                try:
+                    with os.scandir(descriptor) as entries:
+                        for entry in entries:
+                            metadata = entry.stat(follow_symlinks=False)
+                            if not stat.S_ISDIR(metadata.st_mode):
+                                created_at = metadata.st_mtime
+                                newest = created_at if newest is None else max(newest, created_at)
+                            elif recursive:
+                                stack.append(os.open(entry.name, flags, dir_fd=descriptor))
+                finally:
+                    os.close(descriptor)
+            return root_mtime if newest is None else newest
+        except BaseException:
+            for descriptor in stack:
+                os.close(descriptor)
+            raise
+
+
+    def _created_since(path: str, cutoff: float) -> bool:
+        # Docstring: Whether anything beneath ``path`` was created at or after ``cutoff``, by the
+        # rule of _newest_created_entry_mtime (files only; a tree with none goes by its own
+        # directory), stopping at the first such file. Directories are told apart by the listing
+        # where it carries the entry type, and only files are statted, so an active run of
+        # thousands of pages costs two listings and one stat, not a stat of every page over the
+        # mount.
+
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        root = os.open(path, flags)
+        stack = [root]
+        files = False
+        try:
+            root_mtime = os.fstat(root).st_mtime
+            while stack:
+                descriptor = stack.pop()
+                try:
+                    directories = []
+                    with os.scandir(descriptor) as entries:
+                        for entry in entries:
+                            if entry.is_dir(follow_symlinks=False):
+                                directories.append(entry.name)
+                            elif entry.stat(follow_symlinks=False).st_mtime >= cutoff:
+                                return True
+                            else:
+                                files = True
+                    for name in directories:
+                        stack.append(os.open(name, flags, dir_fd=descriptor))
+                finally:
+                    os.close(descriptor)
+            return not files and root_mtime >= cutoff
+        finally:
+            for descriptor in stack:
+                os.close(descriptor)
+
+
+    def _unchanged_directories(cutoff: float, *paths: str) -> list[str]:
+        # Docstring: Those of ``paths`` that no entry was added to or taken from since ``cutoff``.
+        #
+        # The sweeps took the runs, scans and stages out and left the directories that held
+        # them, one scope directory for every update that ever staged, each listed over the
+        # mount again by every later sweep. A sweep removes those it empties that were
+        # unchanged before it began on them: one that changed within the retention window may
+        # be where a reader of that update is staging.
+
+        unchanged = []
+        for path in paths:
+            with contextlib.suppress(OSError):
+                if os.stat(path, follow_symlinks=False).st_mtime < cutoff:
+                    unchanged.append(path)
+        return unchanged
+
+
+    def _staging_subdirectories(path: str) -> list[str]:
+        # Docstring: Immediate subdirectory paths of ``path``; empty if it is absent or unreadable.
+        #
+        # Best-effort helper for the retention sweep: a missing path (nothing staged) is not
+        # an error, and a scan failure must never fail a read -- the sweep is a background
+        # safety net.
+
+        try:
+            with os.scandir(path) as entries:
+                return [entry.path for entry in entries if entry.is_dir(follow_symlinks=False)]
+        except FileNotFoundError:
+            return []
+        except OSError:
+            # 119: Cannot scan Informix snapshot staging path: {}
+            logging.getLogger(__name__).warning(_m(119, path), exc_info=True)
+            return []
+
+
+    def _scandir(descriptor: int) -> os.ScandirIterator:
+        # Docstring: os.scandir of an open directory, which it closes if that fails (a dropped
+        # mount): it is on no stack yet, which would close it.
+
+        try:
+            return os.scandir(descriptor)
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+
+    def _remove_candidate_tree_at(parent_descriptor: int, name: str) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        root = os.open(name, flags, dir_fd=parent_descriptor)
+        stack: list[tuple[int, os.ScandirIterator, str | None]] = [(root, _scandir(root), None)]
+        try:
+            while stack:
+                descriptor, entries, child_name = stack[-1]
+                try:
+                    entry = next(entries)
+                except StopIteration:
+                    entries.close()
+                    os.close(descriptor)
+                    stack.pop()
+                    if stack and child_name is not None:
+                        os.rmdir(child_name, dir_fd=stack[-1][0])
+                    continue
+                metadata = entry.stat(follow_symlinks=False)
+                if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+                    child = os.open(entry.name, flags, dir_fd=descriptor)
+                    stack.append((child, _scandir(child), entry.name))
+                else:
+                    os.unlink(entry.name, dir_fd=descriptor)
+        finally:
+            while stack:
+                descriptor, entries, _ = stack.pop()
+                entries.close()
+                os.close(descriptor)
+
+
+    def _path_present(path: str) -> bool:
+        # Docstring: Whether something may still be at ``path``: anything but its absence counts.
+        #
+        # Not os.path.lexists, which reads a dropped mount as nothing there: a stage was then
+        # recorded as cleaned with its pages left.
+
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return True
+
+
+    def _is_path(path: str, *, directory: bool = False) -> bool:
+        # Docstring: Whether ``path`` is a regular file (a directory with ``directory``).
+        #
+        # Not os.path.isfile or isdir, which read every OSError as False: a dropped Volume mount
+        # (ENOTCONN) passed for a missing file, and a read the mount retry would have carried
+        # failed for good instead (a snapshot.source with "no .unl files").
+
+        try:
+            mode = os.stat(path).st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        return stat.S_ISDIR(mode) if directory else stat.S_ISREG(mode)
+
+
+    def _remove_tree(path: str) -> None:
+        # Docstring: Remove a directory tree, a missing one counting as removed. Any other
+        # failure raises: rmtree's ignore_errors kept the records of a scan under a dropped
+        # mount, for a later read to take up as its own.
+
+        with contextlib.suppress(FileNotFoundError):
+            shutil.rmtree(path)
+
+
+    def _dropped_mount_error(error: BaseException) -> OSError | None:
+        # Docstring: Return the ENOTCONN in ``error``'s cause chain, if a dropped mount caused it.
+        #
+        # Snapshot page staging is the only remaining Volume user, but it still touches
+        # the mount from several calls -- open, makedirs, rename, listdir -- and only
+        # ``os.open`` goes through the retry helper. When the mount drops, whichever
+        # call runs first raises ENOTCONN, so no single site can be the place this is
+        # handled; production saw it surface from two different sites in consecutive
+        # updates.
+        #
+        # Classifying at the read boundary instead covers every site at once. The
+        # caller converts this into the same empty-batch checkpoint retry it already
+        # uses for a transiently inaccessible Volume, which is exactly what a remount
+        # needs: the mount returns within seconds and the next read proceeds.
+
+        seen: set[int] = set()
+        cursor: BaseException | None = error
+        while cursor is not None and id(cursor) not in seen:
+            seen.add(id(cursor))
+            if isinstance(cursor, OSError) and cursor.errno == errno.ENOTCONN:
+                return cursor
+            cursor = cursor.__cause__ or cursor.__context__
+        return None
+
+
+    def _open_state_entry_with_retry(path: str, flags: int, *, dir_fd: int | None = None) -> int:
+        # Docstring: Open one state entry, retrying transient Volume permission and mount failures.
+
+        last_error: OSError | None = None
+        for attempt in range(_SHARED_STATE_OPEN_ATTEMPTS):
+            try:
+                return os.open(path, flags, dir_fd=dir_fd)
+            except OSError as error:
+                if error.errno not in {errno.EPERM, errno.EACCES, errno.ENOTCONN}:
+                    raise
+                if error.errno == errno.ENOTCONN:
+                    # The Volume's FUSE mount dropped: the filesystem itself is
+                    # briefly gone rather than this entry being denied. Observed in
+                    # production taking down 23 flows at once, every one failing on
+                    # the shared-state root, while the mount was healthy again
+                    # moments later. A remount settles on a scale of seconds, not the
+                    # milliseconds a permission blip needs, so this backs off harder
+                    # (and skips the symlink check below, which exists only to
+                    # disambiguate EPERM and cannot stat an absent filesystem).
+                    last_error = error
+                    if attempt + 1 < _SHARED_STATE_OPEN_ATTEMPTS:
+                        delay = min(0.25 * (2**attempt), _SHARED_STATE_MOUNT_RETRY_MAX_SECONDS)
+                        time.sleep(random.uniform(delay / 2, delay))
+                    continue
+                # Some filesystems report EPERM rather than ELOOP for O_NOFOLLOW.
+                # Preserve the security distinction between a transiently denied
+                # Volume entry and a replaceable symlink.
+                try:
+                    entry = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+                except OSError:
+                    entry = None
+                if entry is not None and stat.S_ISLNK(entry.st_mode):
+                    # 120: Informix shared-state path traverses symlink: '{}'
+                    raise InformixError(_m(120, path)) from error
+                last_error = error
+                if attempt + 1 < _SHARED_STATE_OPEN_ATTEMPTS:
+                    delay = min(0.01 * (2**attempt), 0.25)
+                    time.sleep(random.uniform(delay / 2, delay))
+        # 121: Informix shared state is temporarily inaccessible: '{}'
+        raise SharedStateAccessUnavailable(_m(121, path)) from last_error
+
+
+    def _open_state_directory(root: str, path: str) -> int:
+        # Docstring: Open a directory beneath root without following a replaceable symlink.
+        #
+        # Both are normalised first: commonpath keeps "..", so a path that climbed out of the
+        # root passed and was walked out of it a part at a time, and a root given with a
+        # trailing slash refused every path beneath it.
+
+        root, path = os.path.normpath(root), os.path.normpath(path)
+        if os.path.commonpath((root, path)) != root:
+            # 122: Informix shared-state path escapes '{}': '{}'
+            raise InformixError(_m(122, root, path))
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+        def entry(name: str, **kwargs: Any) -> int:
+            try:
+                return _open_state_entry_with_retry(name, flags, **kwargs)
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    # 123: Informix shared-state path traverses symlink or non-directory: '{}'
+                    raise InformixError(_m(123, path)) from error
+                raise
+
+        descriptor = entry(root)
+        try:
+            relative = os.path.relpath(path, root)
+            for part in () if relative == "." else relative.split(os.sep):
+                child = entry(part, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+
+    def _open_state_file(root: str, path: str) -> int:
+        parent = os.path.dirname(path)
+        directory = _open_state_directory(root, parent)
+        try:
+            try:
+                return _open_state_entry_with_retry(
+                    os.path.basename(path),
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory,
+                )
+            except OSError as error:
+                if error.errno == errno.ELOOP:
+                    # 124: Informix shared-state path traverses symlink '{}'
+                    raise InformixError(_m(124, path)) from error
+                raise
+        finally:
+            os.close(directory)
+
+
+    def _redirect_allowlist(value: str) -> frozenset[tuple[str, int]]:
+        # Docstring: The allow-listed redirect destinations as redirect_host_key compares them.
+        #
+        # A host name matches whatever case the Connection Manager names it in. An IPv6 address
+        # goes in brackets: unbracketed, fd00::1:9088 could be an address with no port.
+        result: set[tuple[str, int]] = set()
+        for item in filter(None, (part.strip() for part in value.split(","))):
+            host, separator, port_text = item.rpartition(":")
+            if (
+                not separator
+                or not host
+                or not port_text.isdigit()
+                or not 1 <= int(port_text) <= 65535
+                or not _redirect_host_form(host)
+            ):
+                # 125: redirect.allowlist entries must be exact host:numeric-port pairs, an IPv6
+                # address in brackets ([fd00::1]:9088)
+                raise ValueError(_m(125))
+            result.add((redirect_host_key(host), int(port_text)))
+        return frozenset(result)
+
+
+    def _redirect_host_form(host: str) -> bool:
+        # Docstring: Whether an allow-list entry's host is written as one: a name or IPv4
+        # address bare, an IPv6 address in brackets and only that.
+        if not (host.startswith("[") and host.endswith("]")):
+            return ":" not in host
+        try:
+            return ipaddress.ip_address(host[1:-1]).version == 6
+        except ValueError:
+            return False
+
+
+    def _operation(record: dict[str, Any]) -> str:
+        return str(record.get("op") or record.get("operation") or record.get("type") or "").upper()
+
+
+    def _strict_int(value: object, name: str) -> int:
+        if isinstance(value, bool) or not (
+            isinstance(value, int) or (isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value))
+        ):
+            # 335: {} must be an integer, not {!r}
+            raise ValueError(_m(335, name, value))
+        return int(value)
+
+
+    def _strict_lsn(value: object, name: str) -> int:
+        result = _strict_int(value, name)
+        if not 0 <= result < 1 << 64:
+            # 336: {} is outside the unsigned 64-bit LSN domain
+            raise ValueError(_m(336, name))
+        return result
+
+
+    def _lsn(record: dict[str, Any]) -> int:
+        value = record.get("lsn", record.get("sequence", record.get("sequence_id")))
+        if value is None:
+            raise InformixError(f"CDC record has no LSN: {record!r}")
+        try:
+            return _strict_lsn(value, "CDC record LSN")
+        except ValueError as error:
+            # 343: CDC record has an invalid LSN: {!r}
+            raise InformixError(_m(343, record)) from error
+
+
+    @dataclass(eq=False, repr=False)
+    class Transaction:
+        tx_id: int
+        begin_lsn: int
+        records: list[dict[str, Any]] = field(default_factory=list)
+        pending_before: dict[str, Any] | None = None
+        # One SPILLED record per table whose changes were written to staged pages (_CdcSpill).
+        spilled: list[dict[str, Any]] = field(default_factory=list)
+        # One SPILLING record per table while it is open: its changes went to pages, so they no
+        # longer show which tables it touches.
+        spilling: list[dict[str, Any]] = field(default_factory=list)
+        last_lsn: int = field(init=False)
+
+        def __post_init__(self) -> None:
+            self.last_lsn = self.begin_lsn
+
+        def advance(self, record: dict[str, Any]) -> int:
+            lsn = _lsn(record)
+            if lsn < self.last_lsn:
+                # 134: CDC LSN regressed in transaction {}: {} < {}
+                raise InformixError(_m(134, self.tx_id, lsn, self.last_lsn))
+            self.last_lsn = lsn
+            return lsn
+
+        def append(self, record: dict[str, Any]) -> None:
+            self.advance(record)
+            op = _operation(record)
+            if op == "BEFORE_UPDATE":
+                if self.pending_before is not None:
+                    # 135: Unpaired BEFORE_UPDATE in transaction {}
+                    raise InformixError(_m(135, self.tx_id))
+                self.pending_before = record
+                return
+            if op == "AFTER_UPDATE":
+                if self.pending_before is None:
+                    # 136: AFTER_UPDATE without BEFORE_UPDATE in transaction {}
+                    raise InformixError(_m(136, self.tx_id))
+                merged = dict(record)
+                merged["op"] = "UPDATE"
+                merged["before"] = self.pending_before.get("before", self.pending_before.get("row"))
+                merged["after"] = record.get("after", record.get("row"))
+                # The merged record is sequenced at the after-image. Keep the before-image's
+                # own, strictly earlier, log position too: the append path's old-key
+                # tombstone for a key-changing UPDATE is sequenced there, so it never ties
+                # with the new key's after-image on the cursor.
+                merged["before_lsn"] = _lsn(self.pending_before)
+                # The columns string.null.byte changed in either image (see decode_frame): the
+                # after-image's alone left a before-image's changed index value unseen.
+                nul = [*self.pending_before.get("nul", ()), *record.get("nul", ())]
+                if nul:
+                    merged["nul"] = nul
+                self.pending_before = None
+                self.records.append(merged)
+                return
+            self.records.append(record)
+
+        def discard(self, lsn: int) -> None:
+            # DISCARD carries the rollback cutoff, not the forward position of the
+            # DISCARD control record. It may legitimately precede the latest data LSN.
+            self.records = [r for r in self.records if _lsn(r) < lsn]
+            # A SPILLING record is at its table's earliest change left (see _CdcSpill.start), so
+            # one at or past the savepoint holds the table open no longer, as no record would.
+            self.spilling = [r for r in self.spilling if _lsn(r) < lsn]
+            if self.pending_before is not None and _lsn(self.pending_before) >= lsn:
+                self.pending_before = None
+
+
+    @dataclass(frozen=True, eq=False, repr=False)
+    class CommittedTransaction:
+        tx_id: int
+        begin_lsn: int
+        commit_lsn: int
+        restart_lsn: int
+        records: tuple[dict[str, Any], ...]
+        # UTC epoch seconds from the COMMIT record (kind 2); None if the record carried none.
+        # Stamped onto every row of the transaction as ``_informix_commit_time``.
+        commit_time: int | None = None
+        # The SPILLED records naming the staged pages that hold the rest of its changes.
+        spilled: tuple[dict[str, Any], ...] = ()
+
+
+    def _strict_tx_id(value: object, name: str = "tx_id") -> int:
+        result = _strict_int(value, name)
+        if not -(1 << 31) <= result < 1 << 32:
+            # 337: {} is outside the native 32-bit transaction-ID domain
+            raise ValueError(_m(337, name))
+        return result + (1 << 32) if result < 0 else result
+
+
+    def _tx_id(record: dict[str, Any]) -> int:
+        value = record.get("tx_id", record.get("transaction_id"))
+        if value is None:
+            # 346: CDC record has no transaction ID: {!r}
+            raise InformixError(_m(346, record))
+        try:
+            return _strict_tx_id(value, "CDC transaction ID")
+        except ValueError as error:
+            # 347: CDC record has an invalid transaction ID: {!r}
+            raise InformixError(_m(347, record)) from error
+
+
+    def _normalise_record(raw: dict[str, Any]) -> dict[str, Any]:
+        record = dict(raw)
+        record["op"] = _operation(record)
+        if record["op"] not in {"METADATA", "ERROR"}:
+            record["lsn"] = _lsn(record)
+        if record["op"] not in {"TIMEOUT", "METADATA", "ERROR"}:
+            record["tx_id"] = _tx_id(record)
+        return record
+
+
+    class TransactionBuffer:
+        # Docstring: Buffering for interleaved Informix transactions.
+
+        def __init__(self) -> None:
+            self.open: dict[int, Transaction] = {}
+
+        def feed(self, raw: dict[str, Any]) -> CommittedTransaction | None:
+            record = _normalise_record(raw)
+            op = _operation(record)
+            if op in {"TIMEOUT", "METADATA"}:
+                return None
+            if op == "ERROR":
+                detail = record.get("message") or record.get("payload") or ""
+                # 137: Informix CDC error {} with flags {}: {}
+                raise InformixError(
+                    _m(137, (record.get("error", "unknown")), (record.get("flags", "unknown")), detail)
+                )
+            tx_id = _tx_id(record)
+            if op == "BEGIN":
+                if tx_id in self.open:
+                    # 138: Duplicate CDC BEGIN for transaction {}
+                    raise InformixError(_m(138, tx_id))
+                self.open[tx_id] = Transaction(tx_id, _lsn(record))
+                return None
+            tx = self.open.get(tx_id)
+            if tx is None:
+                # 139: CDC {} for unknown transaction {}
+                raise InformixError(_m(139, op, tx_id))
+            if op in _DATA_OPS:
+                tx.append(record)
+                return None
+            if op == "SPILLED":
+                tx.spilled.append(record)
+                return None
+            if op == "SPILLING":
+                tx.spilling.append(record)
+                return None
+            if op == "DISCARD":
+                tx.discard(_lsn(record))
+                return None
+            if op == "ROLLBACK":
+                tx.advance(record)
+                del self.open[tx_id]
+                return None
+            if op != "COMMIT":
+                # 140: Unknown Informix CDC operation {!r}
+                raise InformixError(_m(140, op))
+            if tx.pending_before is not None:
+                # 141: Transaction {} committed with unpaired BEFORE_UPDATE
+                raise InformixError(_m(141, tx_id))
+            end = tx.advance(record)
+            del self.open[tx_id]
+            restart = min((item.begin_lsn for item in self.open.values()), default=end)
+            commit_time = record.get("timestamp")
+            return CommittedTransaction(
+                tx_id, tx.begin_lsn, end, restart, tuple(tx.records), commit_time, tuple(tx.spilled)
+            )
+
+
+    def _spill_scope(scope: Any) -> str | None:
+        # Docstring: The scope spilled pages are named under, or None without a valid scope.
+        #
+        # The pipeline's, not the update's: a later update reading a transaction again finds the
+        # pages and the Lakebase record an earlier one left, so a cancelled update leaves no copy
+        # behind. A scope outside a pipeline (random per registration) stays as it is.
+
+        if not isinstance(scope, str) or _PIPELINE_SCOPE.fullmatch(scope) is None:
+            return None
+        pipeline, separator, _update = scope.partition("_@_")
+        return pipeline.replace("-", "") if separator else scope
+
+
+    def _spill_run(layout: str, begin: int, tx_id: int, record: dict[str, Any]) -> str:
+        # Docstring: A run's name: its table's capture layout, its transaction's BEGIN LSN and ID,
+        # and a digest of the table's first change in it. A reinitialized log reuses positions, so
+        # the digest keeps a later transaction from taking an earlier one's pages or record.
+
+        first = json.dumps(
+            [record.get("lsn"), record.get("op"), record.get("row")], sort_keys=True, default=str
+        )
+        return f"{layout}-{begin}-{tx_id}-{hashlib.sha256(first.encode()).hexdigest()[:12]}"
+
+
+    def _record_matches(record: dict[str, Any], table: Table) -> bool:
+        identity = str(record.get("table") or record.get("identity") or "")
+        return not identity or identity in {
+            table.name,
+            table.exposed_name,
+            table.identity,
+            table.native_identity,
+        }
+
+
+    def _refuse_altered_changes(records, keys, table: "Table", options: dict[str, str]) -> None:
+        # Docstring: Refuse ``table``'s changes whose ``keys`` values string.null.byte changed
+        # (decode_frame's "nul"). An index-ordered snapshot places a change by the value read,
+        # not the one Informix sorts: settled as staged, or under a later page, an insert was
+        # dropped, and a delete was sent for a row no page had. The pages refuse such values too
+        # (_unaltered). A shared shard's transaction holds other tables' changes as well.
+
+        altered = sorted(
+            {
+                name
+                for r in records
+                if _record_matches(r, table)
+                for name in r.get("nul", ())
+                if name in keys
+            }
+        )
+        if altered:
+            mode = _null_byte_mode(options)
+            # 486: Informix table '{}' holds a NUL byte in key or index column {}, which
+            # string.null.byte={} changes, so the read can't page on or look up the value
+            # Informix holds; set snapshot.scan=cursor to read the table without paging on it
+            raise InformixError(_m(486, table.exposed_name, ", ".join(altered), mode))
+
+
+    def _spill_bytes(record: dict[str, Any]) -> int:
+        # Docstring: A change's weight on its page: wide text or byte columns end a page early,
+        # well inside the staged-page bound.
+
+        return 64 + sum(
+            len(value) if isinstance(value, (str, bytes, bytearray)) else 16
+            for value in (record.get("row") or {}).values()
+        )
+
+
+    def _spill_run_consumed(record: dict[str, Any]) -> bool:
+        # Docstring: Whether every channel a run's record requires has committed past it.
+
+        required, done = record.get("required"), record.get("done") or {}
+        return isinstance(required, list) and bool(required) and all(done.get(c) for c in required)
+
+
+    class _CdcSpill:
+        # Docstring: One poll's writer for open transactions that outgrow cdc.spill.records.
+        #
+        # Once an open transaction holds more changes than ``threshold``, those changes and
+        # every later one go to staged pages of up to _CDC_SPILL_PAGE_RECORDS, a run per table,
+        # instead of the poll's records. A page never ends between an UPDATE's before- and
+        # after-image, so each page shapes on its own. At COMMIT the transaction gets one
+        # SPILLED record per table naming its run, which the transaction buffer keeps in place
+        # of the changes; a ROLLBACK deletes the runs. A DISCARD (rollback to a savepoint) drops
+        # the changes it covers still in memory and records the LSN range for the pages, which
+        # readers skip. A table's run is named by its capture layout, the BEGIN LSN, the
+        # transaction and its first change (see _spill_run), so a poll that reads the
+        # transaction again, the other channel's, or a later update's, names the same pages.
+
+        def __init__(self, threshold, write, delete, layouts, scope, natives, commit=None) -> None:
+            self.threshold = threshold
+            self._write = write  # (native identity, table, run, page index, records)
+            self._delete = delete  # (native identity, run)
+            self._commit = commit  # (native identity, run, commit LSN), or None
+            self._layouts = layouts  # logical identity -> capture layout hash
+            self._scope = scope
+            self._natives = natives  # logical identity -> native identity
+            self._open: dict[int, tuple[int, dict[str, dict[str, Any]]]] = {}
+
+        def holds(self, tx_id: int) -> bool:
+            return tx_id in self._open
+
+        def start(self, tx_id: int, begin_lsn: int, records: list[dict[str, Any]]) -> dict[str, int]:
+            # Docstring: Start spilling a transaction with the changes it holds; return the tables
+            # with a change left, each at the earliest.
+
+            self._open[tx_id] = (begin_lsn, {})
+            # In order, a DISCARD where it came: a run's pages are its table's changes paged
+            # alike in every poll and channel that spills the transaction, wherever each began
+            # to, as the other channel's pages are kept, not written again. Rolled-back
+            # changes left out before paging gave one run two layouts, and a channel read the
+            # other's pages without the rollback (a run left with no change is deleted).
+            for record in records:
+                if record["op"] == "DISCARD":
+                    self.discard(tx_id, int(record["lsn"]))
+                else:
+                    self.add(record)
+            return {t: p["live"] for t, p in self._open[tx_id][1].items() if p["live"] is not None}
+
+        def add(self, record: dict[str, Any]) -> bool:
+            # Docstring: Add one change; return whether it is its table's earliest left, so its
+            # run's first or the first after rollbacks took back the rest.
+
+            tx_id = int(record.get("tx_id") or 0)
+            begin, parts = self._open[tx_id]
+            table = str(record.get("table") or "")
+            part = parts.get(table)
+            if part is None:
+                run = _spill_run(self._layouts.get(table, ""), begin, tx_id, record)
+                part = parts[table] = {
+                    "run": run,
+                    "pages": 0,
+                    "rows": [],
+                    "bytes": 0,
+                    # The earliest change no rollback has taken back, or None.
+                    "live": None,
+                    "last": 0,
+                    "discarded": [],
+                    "ops": set(),
+                }
+            # A capture label is the table's place in one shard's capture list: the other
+            # channel's shard can list it elsewhere, and both write the same pages.
+            part["rows"].append(
+                {key: value for key, value in record.items() if key not in ("label", "capture_label")}
+            )
+            part["ops"].add(record["op"])
+            part["last"] = int(record["lsn"])
+            began = part["live"] is None
+            if began:
+                part["live"] = part["last"]
+            part["bytes"] += _spill_bytes(record)
+            if record["op"] != "BEFORE_UPDATE" and (
+                len(part["rows"]) >= _CDC_SPILL_PAGE_RECORDS or part["bytes"] >= 32 << 20
+            ):
+                self._flush(table, part)
+            return began
+
+        def _flush(self, table: str, part: dict[str, Any]) -> None:
+            native = self._natives.get(table, table)
+            self._write(native, table, part["run"], part["pages"], part["rows"])
+            part["pages"] += 1
+            part["rows"] = []
+            part["bytes"] = 0
+
+        def discard(self, tx_id: int, lsn: int) -> None:
+            for part in self._open[tx_id][1].values():
+                part["rows"] = [record for record in part["rows"] if int(record["lsn"]) < lsn]
+                # Of what is left: the taken back ended a page early, and named operations, a
+                # DELETE's, that a channel then read the pages for.
+                part["bytes"] = sum(map(_spill_bytes, part["rows"]))
+                if not part["pages"]:
+                    part["ops"] = {record["op"] for record in part["rows"]}
+                if part["pages"] and part["last"] >= lsn:
+                    part["discarded"].append([lsn, part["last"]])
+                # A rollback takes back everything from its savepoint on, and changes come in
+                # LSN order: one at or before the earliest left leaves none.
+                if part["live"] is not None and part["live"] >= lsn:
+                    part["live"] = None
+
+        def drop(self, tx_id: int) -> None:
+            _begin, parts = self._open.pop(tx_id)
+            for table, part in parts.items():
+                if part["pages"]:
+                    self._delete(self._natives.get(table, table), part["run"])
+
+        def finish(self, tx_id: int, commit_lsn: int | None = None) -> list[dict[str, Any]]:
+            # Docstring: The SPILLED records of a transaction at its COMMIT (``commit_lsn``), which
+            # each run's record also learns.
+
+            _begin, parts = self._open.pop(tx_id)
+            spilled = []
+            for table, part in parts.items():
+                native = self._natives.get(table, table)
+                if part["live"] is None:
+                    # Rollbacks to savepoints took back every change of the run, in one or in
+                    # several: named, a table with none failed an index-ordered scan's stream.
+                    if part["pages"]:
+                        self._delete(native, part["run"])
+                    continue
+                if part["rows"]:
+                    self._flush(table, part)
+                if part["pages"]:
+                    if self._commit is not None and commit_lsn is not None:
+                        self._commit(native, part["run"], commit_lsn)
+                    spilled.append(
+                        {
+                            "op": "SPILLED",
+                            "tx_id": tx_id,
+                            "lsn": part["last"],
+                            "table": table,
+                            "native_identity": native,
+                            "pipeline_scope": self._scope,
+                            "run": part["run"],
+                            "pages": part["pages"],
+                            "discarded": part["discarded"],
+                            "ops": sorted(part["ops"]),
+                        }
+                    )
+            return spilled
+
+
+    def _before_lsn(record: dict[str, Any]) -> int:
+        # Docstring: The log position of an assembled UPDATE's before-image.
+        #
+        # Set when the transaction assembler pairs BEFORE_UPDATE with AFTER_UPDATE; the
+        # merged record's own ``lsn`` is the after-image's position.
+
+        value = record.get("before_lsn")
+        if value is None:
+            # 344: CDC update has no before-image LSN: {!r}
+            raise InformixError(_m(344, record))
+        try:
+            return _strict_lsn(value, "CDC before-image LSN")
+        except ValueError as error:
+            # 345: CDC update has an invalid before-image LSN: {!r}
+            raise InformixError(_m(345, record)) from error
+
+
+    def _key(row: dict[str, Any] | None, table: Table) -> tuple[Any, ...]:
+        if row is None:
+            # 349: Missing before/after image for {}
+            raise InformixError(_m(349, table.exposed_name))
+        return tuple(row.get(pk) for pk in table.primary_keys)
+
+
+    def _refuse_null_key(row: dict[str, Any], table: Table) -> None:
+        # Docstring: Fail on a NULL in a NOT NULL key column of a keyed table's snapshot row or
+        # upsert, as the delete channel does (_shape_delete).
+        #
+        # Under string.null.byte=null a key string holding a NUL byte reads as NULL: "a\x00"
+        # and "b\x00" both landed as the key NULL, one target row, and only a later delete
+        # of one of them failed.
+
+        nullable: set[str] | None = None
+        for pk in table.primary_keys:
+            if pk in row and row[pk] is None:
+                if nullable is None:
+                    nullable = {column.name for column in table.columns if column.nullable}
+                if pk not in nullable:
+                    # 463: A row of '{}' has NULL in NOT NULL key column {}, which would merge
+                    # distinct keys into one: '{}=null' turned a string holding a NUL byte into
+                    # NULL, or the row image is incomplete
+                    raise InformixError(_m(463, table.exposed_name, pk, _NULL_BYTE_OPTION))
+
+
+    def _commit_time_value(epoch_seconds: int | None) -> datetime | None:
+        # Docstring: A UTC ``datetime`` for the ``_informix_commit_time`` column, or None.
+        #
+        # The source supplies commit time as epoch seconds (Informix CDC BEGIN/COMMIT records
+        # and ``DBINFO('utc_current')``); TimestampType wants a ``datetime``. None stays None so
+        # a row with no source time (e.g. a file-source extract without a manifest boundary_time)
+        # lands as NULL.
+
+        if epoch_seconds is None:
+            return None
+        return datetime.fromtimestamp(int(epoch_seconds), tz=timezone.utc)
+
+
+    def _sortable_lsn(value: int) -> str:
+        lsn = int(value)
+        if not 0 <= lsn < 1 << 64:
+            # 364: Informix LSN {} is outside the unsigned 64-bit decimal domain
+            raise InformixError(_m(364, lsn))
+        return f"{lsn:0{_LSN_DECIMAL_WIDTH}d}"
+
+
+    def _shape_change(row, record, tx, op, *, lsn: int | None = None):
+        # Docstring: Shape one full-row change. ``lsn`` overrides the record's own cursor position.
+
+        if row is None:
+            # 350: CDC upsert has no after image
+            raise InformixError(_m(350))
+        result = _framework_row(row)
+        result.update(
+            {
+                CURSOR: _sortable_lsn(_lsn(record) if lsn is None else lsn),
+                COMMIT_LSN: _sortable_lsn(tx.commit_lsn),
+                TX_ID: tx.tx_id,
+                OP: op,
+                COMMIT_TIME: _commit_time_value(tx.commit_time),
+            }
+        )
+        return result
+
+
+    def _shape_tombstone(row, table, record, tx, *, lsn: int | None = None):
+        # Docstring: A full before-image as an append-path ``d`` row.
+        #
+        # Used for a DELETE and for the old key of a key-changing UPDATE; the latter passes
+        # ``lsn``, the before-image's own position. Not :func:`_shape_delete`, which nulls
+        # every non-key column and needs a primary key: an append destination does not
+        # merge, so the tombstone carries the whole removed row and is told apart from a
+        # live row only by ``_informix_op``.
+
+        if row is None:
+            # 351: CDC delete on append-only table {} has no before image; full-row logging is required
+            # to emit a delete tombstone
+            raise InformixError(_m(351, table.exposed_name))
+        return _shape_change(row, record, tx, "d", lsn=lsn)
+
+
+    ########################################################
+    # src/databricks/labs/community_connector/sources/informix/informix_shards.py
+    ########################################################
+
+    def _shape_delete(row, table, record, tx):
+        # Docstring: Shape a delete-channel row: the key values, with every other column NULL.
+        #
+        # A NULL key value passes through when its column is declared nullable. Such a key can
+        # only come from a ``primary.keys`` override (the wildcard included) or a nullable-index
+        # promotion, and the pipeline's AUTO CDC delete flow matches NULL key values, for SCD1
+        # and SCD2 alike.
+        #
+        # A NOT NULL key column -- every real catalog primary key -- can never legitimately
+        # hold NULL, so a NULL there still fails closed as a corrupt or incomplete before-image.
+        # So does a key column missing from the image entirely: the CDC decoder sets every
+        # captured column, using None for a SQL NULL, so an absent column is never a NULL.
+
+        if row is None:
+            # 352: CDC delete has no before image; full-row logging is required
+            raise InformixError(_m(352))
+        result = {column.name: None for column in table.columns}
+        nullable: set[str] | None = None
+        for pk in table.primary_keys:
+            if pk not in row:
+                # 353: CDC delete on '{}' has no value for key column {}; the before image is incomplete
+                raise InformixError(_m(353, table.exposed_name, pk))
+            value = row[pk]
+            if value is None:
+                if nullable is None:
+                    nullable = {column.name for column in table.columns if column.nullable}
+                if pk not in nullable:
+                    # 354: CDC delete on '{}' has NULL in NOT NULL key column {}; the before image is
+                    # corrupt or incomplete, or '{}=null' turned a string holding a NUL byte into NULL
+                    raise InformixError(_m(354, table.exposed_name, pk, _NULL_BYTE_OPTION))
+            result[pk] = _framework_value(value)
+        result.update(
+            {
+                CURSOR: _sortable_lsn(_lsn(record)),
+                COMMIT_LSN: _sortable_lsn(tx.commit_lsn),
+                TX_ID: tx.tx_id,
+                OP: "d",
+                COMMIT_TIME: _commit_time_value(tx.commit_time),
+            }
+        )
+        return result
+
+
+    def _project_transaction(
+        tx: CommittedTransaction,
+        table: Table,
+        deletes: bool,
+        tombstones: bool = False,
+        encoding: str = "latin-1",
+        options: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        # Docstring: Project one committed transaction onto one output channel.
+        #
+        # ``deletes`` selects the delete channel: key-only ``d`` rows for DELETEs and for the
+        # old key of a key-changing UPDATE. Otherwise this is the upsert channel, which emits
+        # INSERT/UPDATE after-images as ``c``/``u``. On the keyed CDC path the upsert channel
+        # deliberately skips DELETEs -- the pipeline applies deletes only through the
+        # separate delete flow, and a ``d`` row on the upsert view would be merged as an
+        # upsert. ``tombstones`` (the append path with ``append.delete.tombstones`` on) adds
+        # each DELETE's full before-image as a ``d`` row instead: the append destination
+        # lands rows as-is and never reads ``_informix_op``, so the delete stays in the
+        # change log rather than vanishing. On a keyed table forced onto the append path, a
+        # key-changing UPDATE is a delete of the old key too: with ``tombstones`` on it lands
+        # the before-image as a ``d`` row ahead of the new key's ``u`` row, sequenced at the
+        # before-image's own log position so the two never tie on the cursor. A keyless table
+        # has no key to tell which row an UPDATE replaced, so with ``tombstones`` on every
+        # UPDATE of one lands its before-image as a ``d`` row the same way, also when nothing
+        # changed: the log then nets to the table, an update being one row out and one in.
+        # Without ``tombstones`` its UPDATEs land only their after-image. TRUNCATE is
+        # unrepresentable on either channel.
+
+        #
+        # With a row_filter, membership comes from the images: a change whose rows never match
+        # is dropped, an UPDATE that moves a row out of the filter is a delete of its
+        # before-image, and one that moves a row in is an upsert of its after-image alone --
+        # its old key was never landed, so there is no old key to delete.
+        #
+        # An UPDATE changes the key as the key lands: a variable-scale DECIMAL key column is
+        # coerced to its target type (``options``), which can round 12.1 and 12.2 to one 12,
+        # and a delete of the old key at the update's LSN then tied with its upsert and could
+        # remove the row.
+
+        predicate = _row_filter_predicate(table, encoding)
+        coerced = any(
+            _is_variable_scale_decimal(column)
+            for column in table.columns
+            if column.name in table.primary_keys
+        )
+
+        def landed_key(row):
+            if coerced and row is not None:
+                # The key columns alone: another column's value, which a delete never lands,
+                # could fail its coercion.
+                row = _coerce_variable_decimal_values(
+                    {name: row.get(name) for name in table.primary_keys}, table, options or {}
+                )
+            # NaN equals nothing, itself included: a FLOAT key left NaN read as changed, and its
+            # delete tied with its upsert. The target's merge takes NaN for NaN.
+            return tuple(
+                "NaN" if isinstance(value, float) and math.isnan(value) else value
+                for value in _key(row, table)
+            )
+
+        output = []
+        for record in tx.records:
+            if not _record_matches(record, table):
+                continue
+            op = _operation(record)
+            if op == "TRUNCATE":
+                # 348: TRUNCATE on {} cannot be represented as keyed Lakeflow deletes
+                raise UnsupportedChangeError(_m(348, table.exposed_name))
+            before = record.get("before", record.get("row") if op == "DELETE" else None)
+            after = record.get("after", record.get("row") if op == "INSERT" else None)
+            entered = False
+            if predicate is not None:
+                # A missing image counts as in the filter, so the record reaches the shaping
+                # that fails closed on it, as it does without a filter, instead of dropping or
+                # reclassifying the change.
+                was_in = op in {"UPDATE", "DELETE"} and (
+                    before is None or _row_filter_matches(predicate, before)
+                )
+                is_in = op in {"INSERT", "UPDATE"} and (
+                    after is None or _row_filter_matches(predicate, after)
+                )
+                if not (was_in or is_in):
+                    continue
+                if op == "UPDATE" and not is_in:
+                    op = "DELETE"
+                entered = op == "UPDATE" and not was_in
+            key_changed = op == "UPDATE" and not entered and landed_key(before) != landed_key(after)
+            if deletes:
+                if op == "DELETE" or key_changed:
+                    output.append(_shape_delete(before, table, record, tx))
+            elif op in {"INSERT", "UPDATE"}:
+                if tombstones and (
+                    key_changed or (op == "UPDATE" and not entered and not table.primary_keys)
+                ):
+                    output.append(_shape_tombstone(before, table, record, tx, lsn=_before_lsn(record)))
+                if after is not None and table.primary_keys:
+                    _refuse_null_key(after, table)
+                output.append(_shape_change(after, record, tx, "u" if op == "UPDATE" else "c"))
+            elif op == "DELETE" and tombstones:
+                output.append(_shape_tombstone(before, table, record, tx))
+        return output
+
+
+    def _spilled_page_rows(read_page, part, page_index, tx, table, options, **shape):
+        # Docstring: One spilled page's rows on one channel, shaped as _read_stream shapes an
+        # in-memory transaction. ``tx`` is (tx_id, begin, commit, restart, commit time), ``shape``
+        # the deletes, tombstones and encoding _project_transaction takes.
+
+        _header, records = read_page(
+            part["native_identity"],
+            part["table"],
+            part["pipeline_scope"],
+            _CDC_SPILL_SCHEMA,
+            part["run"],
+            page_index,
+        )
+        discarded = part["discarded"]
+        buffer = Transaction(int(tx[0]), int(tx[1]))
+        for record in records:
+            record = _normalise_record(record)
+            if not any(low <= record["lsn"] <= high for low, high in discarded):
+                buffer.append(record)
+        if buffer.pending_before is not None:
+            # A page never ends between an UPDATE's images, so this transaction committed with
+            # one unpaired, as an in-memory one fails at its COMMIT.
+            # 141: Transaction {} committed with unpaired BEFORE_UPDATE
+            raise InformixError(_m(141, buffer.tx_id))
+        committed = CommittedTransaction(
+            int(tx[0]), int(tx[1]), int(tx[2]), int(tx[3]), tuple(buffer.records), tx[4]
+        )
+        for row in _project_transaction(committed, table, **shape, options=options):
+            yield _coerce_variable_decimal_values(row, table, options)
+
+
+    _HOST_SHARD_TABLE_COLUMN_FIELDS = ("columns", "catalog_columns", "unsupported_columns")
+
+
+    def _wire_table(table: Table) -> dict[str, Any]:
+        # Docstring: ``table`` as plain data. The merged deployment defines Table inside a
+        # function, so it can't be pickled by name between processes; Table(**fields) rebuilds it.
+
+        data = {}
+        for item in dataclasses.fields(table):
+            value = getattr(table, item.name)
+            if item.name in _HOST_SHARD_TABLE_COLUMN_FIELDS:
+                value = [dataclasses.asdict(column) for column in value]
+            data[item.name] = value
+        return data
+
+
+    class _SpilledRows:
+        # Docstring: A batch that is one spilled transaction: its rows on one channel, shaped
+        # from the staged pages only when iterated (the simple reader), or served page by page
+        # from executors through ``descriptors`` (the partitioned reader), so the driver never
+        # holds them.
+
+        def __init__(self, read_page, parts, tx, table, options, **shape) -> None:
+            self._read_page = read_page
+            self.parts = parts
+            self.tx = (tx.tx_id, tx.begin_lsn, tx.commit_lsn, tx.restart_lsn, tx.commit_time)
+            self.table = table
+            self.shape = shape
+            self._options = options
+            self._rows: Iterator[dict[str, Any]] | None = None
+
+        def __iter__(self) -> "_SpilledRows":
+            return self
+
+        def __next__(self) -> dict[str, Any]:
+            if self._rows is None:
+                self._rows = itertools.chain.from_iterable(
+                    _spilled_page_rows(
+                        self._read_page, part, page, self.tx, self.table, self._options, **self.shape
+                    )
+                    for part in self.parts
+                    for page in range(part["pages"])
+                )
+            return next(self._rows)
+
+        def descriptors(self, extra: dict[str, Any]) -> list[dict[str, Any]]:
+            table = _wire_table(self.table)
+            return [
+                {
+                    "kind": "spill",
+                    "part": part,
+                    "page_index": page,
+                    "tx": list(self.tx),
+                    "table": table,
+                    **self.shape,
+                    **extra,
+                }
+                for part in self.parts
+                for page in range(part["pages"])
+            ]
+
+
+    @dataclass(frozen=True, eq=False, repr=False)
+    class _SharedCdcSnapshot:
+        # Docstring: A coherent (schema, log position, transactions) view a consumer poll reads
+        # from a shard in place of touching Informix itself.
+
+        table: "Table"
+        fingerprint: str
+        min_lsn: int
+        current_lsn: int
+        committed: list
+        caught_up: bool
+        open_begin: int | None
+        # Where the daemon's latest read went idle (its TIMEOUT LSN), or None.
+        reached_lsn: int | None = None
+        # Where that idle read started (the shard's restart LSN), or None.
+        read_start_lsn: int | None = None
+
+
+    def _table_id(table: Table) -> int | None:
+        # Docstring: The Informix table ID a catalog read recorded as ``table.incarnation``.
+
+        try:
+            return int(table.incarnation)
+        except (TypeError, ValueError):
+            return None
+
+
+    class _ShardCatalog:
+        # Docstring: The catalog tables one shard's daemon reads under, re-read only when changed.
+        #
+        # Describing every subscribed table before every read cost two or three catalog
+        # queries a table each cycle. Instead the daemon keeps each table as last read, with
+        # its systables.version, and every _SNAPSHOT_SCHEMA_REFRESH_INTERVAL_SECONDS asks for all
+        # their versions in one query. Only the tables whose version moved, or whose table ID
+        # no longer names them, are read again, together in one batch (get_tables). Informix
+        # bumps the version on every change to a table's definition, and on UPDATE STATISTICS,
+        # which just costs a needless re-read. A new subscriber is read at once, and a failed
+        # read forces a check before the next one.
+        #
+        # A change waits for the next check without misreading rows. Informix rejects ALTER
+        # TABLE while full-row logging is on, which every read switches on, so a column change
+        # needs the pipelines stopped (see the README), and the restarted update gets a new
+        # shard, read afresh. A captured column changed anyway still fails the read that meets
+        # it, which compares the layout Informix reports with the catalog
+        # (_assert_capture_layout). What a check does pick up is an index or key constraint
+        # created or dropped while the table is captured, which Informix allows and which can
+        # change the key a table is merged by; consumers see it at the next check rather than
+        # the next read. A bridge without table_versions re-reads every table at each check,
+        # and one without get_tables reads them one at a time.
+        #
+        # Used by the shard's daemon thread alone, so it needs no lock; a consumer only ever
+        # calls force_check, a single assignment.
+
+        def __init__(self) -> None:
+            # identity -> (systables.version, or None when unknown, and the catalog table)
+            self.entries: dict[str, tuple[int | None, Table]] = {}
+            self.next_check = 0.0
+
+        def force_check(self) -> None:
+            self.next_check = 0.0
+
+        def tables(self, bridge, identities, now: float, check_seconds: float) -> dict[str, Table]:
+            # Docstring: The catalog table of each subscribed (identity, table) pair that still
+            # names one, re-read as the class describes.
+
+            wanted = dict(identities)
+            for identity in [identity for identity in self.entries if identity not in wanted]:
+                del self.entries[identity]
+            if now >= self.next_check:
+                self.next_check = now + check_seconds
+                check = wanted
+            else:
+                check = {
+                    identity: table
+                    for identity, table in wanted.items()
+                    if identity not in self.entries
+                }
+            if check:
+                self._refresh(bridge, check)
+            return {
+                identity: self.entries[identity][1] for identity in wanted if identity in self.entries
+            }
+
+        def _refresh(self, bridge, check: dict[str, Table]) -> None:
+            # The versions come first: a definition changed between this query and the reads
+            # below leaves an older version on the newer table, which the next check re-reads.
+            table_versions = getattr(bridge, "table_versions", None)
+            known = {
+                identity: self.entries[identity][1] if identity in self.entries else table
+                for identity, table in check.items()
+            }
+            versions = None
+            if table_versions is not None:
+                versions = table_versions(
+                    [tabid for tabid in map(_table_id, known.values()) if tabid is not None]
+                )
+            stale: dict[str, int | None] = {}
+            for identity, table in known.items():
+                version = None
+                found = versions.get(_table_id(table)) if versions is not None else None
+                if found is not None and found[:2] == (
+                    table.owner.rstrip(" "),
+                    table.name.rstrip(" "),
+                ):
+                    version = found[2]
+                entry = self.entries.get(identity)
+                if entry is None or version is None or entry[0] != version:
+                    stale[identity] = version
+            if not stale:
+                return
+            logical = {identity: check[identity].identity for identity in stale}
+            get_tables = getattr(bridge, "get_tables", None)
+            if get_tables is not None:
+                described = get_tables(sorted(set(logical.values())))
+            else:
+                described = {name: bridge.get_table(name) for name in sorted(set(logical.values()))}
+            for identity, version in stale.items():
+                raw = described.get(logical[identity])
+                try:
+                    fresh = (
+                        None
+                        if raw is None or raw.get("unreadable")
+                        else Table.parse(raw, check[identity].database)
+                    )
+                except (InformixError, ValueError):
+                    fresh = None  # unreadable (see _describe_tables): the same, for that table alone
+                if fresh is None:
+                    # The name no longer names a table: the subscriber is left to its own
+                    # direct read, which reports that.
+                    self.entries.pop(identity, None)
+                    continue
+                if fresh.incarnation != known[identity].incarnation:
+                    # Re-created under a new table ID, whose version wasn't asked for: the
+                    # next check reads it again with its version.
+                    version = None
+                self.entries[identity] = (version, fresh)
+
+
+    def _schema_fingerprint(table: Table) -> str:
+        parts: tuple[Any, ...] = (
+            table.database,
+            table.owner,
+            table.name,
+            table.incarnation,
+            table.primary_keys,
+            tuple(
+                (
+                    column.name,
+                    column.type_name,
+                    column.nullable,
+                    column.length,
+                    column.precision,
+                    column.scale,
+                    column.cdc_supported,
+                )
+                for column in table.columns
+            ),
+        )
+        # Appended only when set, so a table using neither keeps the fingerprint every
+        # existing checkpoint was written with.
+        if table.column_selection is not None:
+            parts += (("column_selection", table.column_selection),)
+        if table.row_filter is not None:
+            parts += (("row_filter", table.row_filter),)
+        if table.column_renames is not None:
+            parts += (("column_renames", table.column_renames),)
+        if table.column_transforms is not None:
+            parts += (("column_transforms", table.column_transforms, table.transform_key_id),)
+        if table.decimal_targets:
+            parts += (("decimal_targets", table.decimal_targets),)
+        return hashlib.sha256(repr(parts).encode("utf-8")).hexdigest()
+
+
+    class _SharedCdcShard:
+        # Docstring: One shard of the sharded daemon-reader CDC pool.
+        #
+        # A single daemon thread owns the Informix I/O for this shard's tables -- it reads
+        # the shared CDC session, fetches schema, and samples the log bounds -- and publishes
+        # the result here. Consumer streaming polls read the fanned-out transactions and the
+        # schema/log position from memory rather than connecting themselves. All mutable
+        # state is guarded by ``condition``.
+
+        def __init__(self) -> None:
+            self.condition = threading.Condition()
+            # identity -> {table, capture, checkpoint, floor, last_seen}
+            self.subscribers: dict[str, dict[str, Any]] = {}
+            self.buffers: dict[str, deque] = {}
+            # highest commit_lsn appended per table: dedups re-delivery and lets a lagging
+            # or late subscriber replay its own history exactly once.
+            self.cursors: dict[str, int] = {}
+            self.shared_restart: int | None = None
+            # coherent snapshot, published atomically at the end of each read cycle
+            self.schema: dict[str, "Table"] = {}
+            self.min_lsn: int | None = None
+            self.current_lsn: int | None = None
+            self.reached_lsn: int | None = None
+            self.read_start_lsn: int | None = None
+            self.caught_up = False
+            self.open_begins: dict[str, int | None] = {}
+            self.ready = False
+            # daemon configuration, set by the first subscriber
+            self.reader_factory: Callable[[], Any] | None = None
+            self.timeout_seconds = 5
+            self.max_records = _DEFAULT_CDC_MAX_RECORDS
+            self.buffer_cap = _DEFAULT_SHARED_CDC_BUFFER
+            self.subscriber_ttl = _SHARED_CDC_SUBSCRIBER_TTL_SECONDS
+            # The daemon's catalog tables, re-read only when they change; daemon-thread only.
+            self.catalog = _ShardCatalog()
+
+        def configure(
+            self, *, reader_factory, timeout_seconds, max_records, buffer_cap, subscriber_ttl
+        ):
+            # Every poll configures the shard with its own table's cdc.timeout and
+            # cdc.max.records, which are table options. Taken as given, the shared session
+            # flipped between the tables' values with the order of their polls. It keeps the
+            # shortest timeout and the largest record budget any of them asked for: neither
+            # makes a read wrong, only an idle read shorter or a read larger.
+            with self.condition:
+                if self.reader_factory is None:
+                    self.reader_factory = reader_factory
+                if not self.__dict__.get("_read_settings_given"):
+                    self._read_settings_given = True
+                    self.timeout_seconds = timeout_seconds
+                    self.max_records = max_records
+                else:
+                    self.timeout_seconds = min(self.timeout_seconds, timeout_seconds)
+                    self.max_records = max(self.max_records, max_records)
+                self.buffer_cap = buffer_cap
+                self.subscriber_ttl = subscriber_ttl
+
+        # ---- consumer side ------------------------------------------------------
+
+        def subscribe(self, identity, table, capture, checkpoint_commit_lsn, floor_lsn, owner=None):
+            # ``owner`` names the flow asking (each connector instance has its own). Returns
+            # False when another flow holds the table's place: this one then reads directly,
+            # and must not take a view either, which would cut the other's buffer at its own
+            # checkpoint.
+            with self.condition:
+                existing = self.subscribers.get(identity)
+                expired = (
+                    existing is not None
+                    and time.monotonic() - existing["last_seen"] > self.subscriber_ttl
+                )
+                if (
+                    existing is not None
+                    and owner is not None
+                    and existing.get("owner") not in (None, owner)
+                    and not expired
+                ):
+                    # A second flow reading the same table with the same layout (two
+                    # destinations, say). The table has one buffer, cut at one checkpoint:
+                    # served to both, the flow further on dropped transactions the other had
+                    # yet to read, which it then never saw, or each start-over wiped the
+                    # other's coverage. The first keeps the shard until it stops polling.
+                    return False
+                own = existing is not None and (
+                    expired or (owner is not None and existing.get("owner") == owner)
+                )
+                if own and (
+                    existing["capture"] != capture
+                    or _schema_fingerprint(existing["table"]) != _schema_fingerprint(table)
+                ):
+                    # This flow's own place, or one whose flow stopped polling, under a table that
+                    # changed since: a schema or key change the capture does not show too. Taken
+                    # for another flow's, it read directly until the place expired, and the
+                    # place's buffer, its checkpoint frozen, grew to the cap and held the shard.
+                    self._restart_table_locked(identity)
+                    existing = None
+                elif (
+                    existing is not None
+                    and existing["capture"] == capture
+                    and _schema_fingerprint(existing["table"]) != _schema_fingerprint(table)
+                ):
+                    # Another flow reading the table under other options (a schema change
+                    # changes the capture): the shard keeps the first one's table, buffer and
+                    # coverage, and this one reads directly.
+                    return False
+                elif (
+                    existing is not None
+                    and existing["capture"] != capture
+                    and existing["table"].column_selection != table.column_selection
+                ):
+                    # Another flow reading the table with other columns (include_columns or
+                    # exclude_columns): its capture differs for good, not because the table
+                    # changed. Taking it for a schema change, each flow dropped the other's
+                    # buffer and coverage at every poll, and neither was ever served. The
+                    # shard keeps the first one's, and this one reads directly.
+                    return False
+                elif existing is not None and existing["capture"] != capture:
+                    # The table's columns changed (its consumer moved to a new schema): what
+                    # was buffered under the old capture lacks the new columns, so drop it and
+                    # treat the table as new, re-read from its floor under the new capture.
+                    self._restart_table_locked(identity)
+                    existing = None
+                elif existing is not None and (
+                    checkpoint_commit_lsn < existing["checkpoint"] or floor_lsn < existing["floor"]
+                ):
+                    # The checkpoint or floor moved back (a consumer replaying from an earlier
+                    # commit, or an open transaction older than its floor): the buffer may lack
+                    # what lies above the new floor and the cursor would skip re-reading it, so
+                    # start the table over from its floor, on direct reads until covered again.
+                    self.buffers.pop(identity, None)
+                    self.cursors.pop(identity, None)
+                    existing = None
+                entry = {
+                    "table": table,
+                    "capture": capture,
+                    "checkpoint": checkpoint_commit_lsn,
+                    "floor": floor_lsn,
+                    "last_seen": time.monotonic(),
+                    # The lowest LSN a daemon read that captured this table was activated
+                    # at, or None until one has run. The table is *covered* -- its buffer
+                    # is authoritative from its floor on -- only once that read start is
+                    # at or below its floor (see _covered). Preserved across re-subscribes;
+                    # a TTL eviction drops the entry and so resets it.
+                    "covered_from": None if existing is None else existing.get("covered_from"),
+                    "owner": owner,
+                }
+                self.subscribers[identity] = entry
+                # Drop what the consumer has durably consumed, as a view does. A consumer on
+                # direct reads (the shard not ready, or the table not yet covered) gets no view,
+                # so without this its buffer could reach the cap and stop the shard reading.
+                buf = self.buffers.setdefault(identity, deque())
+                while buf and buf[0].commit_lsn <= checkpoint_commit_lsn:
+                    buf.popleft()
+                # Lower the shared read cursor to admit a newly subscribed or lagging
+                # table's history. It only moves backward here; the daemon advances it
+                # forward as it reads, but never past the floor of a table it has not yet
+                # covered (see ingest). Activating too low is merely wasteful (re-read then
+                # discarded per cursor / _recover); too high would skip a laggard's changes.
+                if self.shared_restart is None:
+                    self.shared_restart = floor_lsn
+                elif not self._covered(entry):
+                    self.shared_restart = min(self.shared_restart, floor_lsn)
+                self.condition.notify_all()
+                return True
+
+        def _restart_table_locked(self, identity) -> None:
+            # Docstring: Drop a table's buffer and cursor, so it is re-read from its floor as a
+            # new one, and read its catalog entry at the daemon's next cycle, not the next
+            # scheduled check. The caller makes its subscriber entry anew.
+
+            self.buffers.pop(identity, None)
+            self.cursors.pop(identity, None)
+            self.catalog.force_check()
+
+        def poll(self, identity, table, capture, checkpoint_commit_lsn, floor_lsn, owner=None):
+            # Docstring: Subscribe and take the view in one hold of the lock, so no other flow's
+            # subscribe cuts the buffer between them; None where the flow reads directly.
+
+            with self.condition:
+                if not self.subscribe(
+                    identity, table, capture, checkpoint_commit_lsn, floor_lsn, owner
+                ):
+                    return None
+                return self.snapshot(identity, checkpoint_commit_lsn)
+
+        @staticmethod
+        def _covered(entry) -> bool:
+            # Docstring: Whether a daemon read that captured this subscriber started at or below
+            # its floor, so its buffer holds every transaction above that floor.
+
+            covered_from = entry.get("covered_from")
+            return covered_from is not None and covered_from <= entry["floor"]
+
+        def snapshot(self, identity, checkpoint_commit_lsn):
+            # Docstring: Return a coherent view for one table, or None to fall back to a direct
+            # read (daemon not ready yet, or this table is unknown to the daemon).
+
+            with self.condition:
+                if not self.ready or identity not in self.schema:
+                    return None
+                entry = self.subscribers.get(identity)
+                if entry is None or not self._covered(entry):
+                    # No daemon read that captured this table has started at or below its
+                    # floor yet, so its buffer may have a gap right after its checkpoint. A
+                    # view is taken as authoritative and would skip that gap silently;
+                    # keep the consumer on direct reads until a covering read is ingested.
+                    return None
+                table = self.schema.get(identity)
+                if table is None or self.min_lsn is None or self.current_lsn is None:
+                    return None
+                if self.current_lsn < checkpoint_commit_lsn:
+                    # The consumer moved on by a direct read past the shard's last read: its log
+                    # position would look reinitialized (284) or behind a trigger boundary (295).
+                    return None
+                buf = self.buffers.get(identity)
+                if buf is None:
+                    return None
+                # Drop durably-consumed transactions; keep the rest (peek, don't pop) so a
+                # poll that consumes only part of its budget re-serves the remainder.
+                while buf and buf[0].commit_lsn <= checkpoint_commit_lsn:
+                    buf.popleft()
+                committed = list(buf)
+                # ``committed`` is the entire retained buffer, so nothing is withheld:
+                # the consumer is caught up exactly when the daemon reached end-of-log.
+                caught_up = self.caught_up
+                return _SharedCdcSnapshot(
+                    table=table,
+                    fingerprint=_schema_fingerprint(table),
+                    min_lsn=self.min_lsn,
+                    current_lsn=self.current_lsn,
+                    committed=committed,
+                    caught_up=caught_up,
+                    open_begin=self.open_begins.get(identity),
+                    reached_lsn=self.reached_lsn if caught_up else None,
+                    read_start_lsn=self.read_start_lsn if caught_up else None,
+                )
+
+        # ---- daemon side --------------------------------------------------------
+
+        def live_subscribers(self):
+            # Docstring: Drop subscribers past the TTL (a stopped flow must not pin the shard) and
+            # return the current set. Caller holds the lock.
+
+            now = time.monotonic()
+            for identity in list(self.subscribers):
+                if now - self.subscribers[identity]["last_seen"] > self.subscriber_ttl:
+                    self._evict_locked(identity)
+            return dict(self.subscribers)
+
+        def evict(self, identity):
+            # Docstring: Drop one subscriber and its state; it re-subscribes on its next poll.
+
+            with self.condition:
+                self._evict_locked(identity)
+
+        def _evict_locked(self, identity):
+            self.subscribers.pop(identity, None)
+            for store in (self.buffers, self.cursors, self.schema, self.open_begins):
+                store.pop(identity, None)
+
+        def ingest(self, raw, schema_map, min_lsn, current_lsn, read_start, captures=None):
+            # Docstring: Assemble one read's records into transactions, fan them out per table, and
+            # publish the coherent snapshot. Returns whether the shard is caught up.
+            #
+            # ``schema_map`` names the tables the read captured and ``read_start`` the LSN
+            # it was activated at; together they record which subscribers it covered.
+            # ``captures`` maps each to the capture the read used: a subscriber that has
+            # re-subscribed with another since gets nothing from this read.
+
+            buffer = TransactionBuffer()
+            committed = []
+            timed_out = False
+            reached = None
+            for record in raw:
+                if _operation(record) == "TIMEOUT":
+                    timed_out = True
+                    reached = _lsn(record)
+                done = buffer.feed(record)
+                if done is not None:
+                    committed.append(done)
+            committed.sort(key=lambda tx: (tx.commit_lsn, tx.tx_id))
+            with self.condition:
+                stale = {
+                    identity
+                    for identity, capture in (captures or {}).items()
+                    if (self.subscribers.get(identity) or {}).get("capture") != capture
+                }
+                # A subscriber started over (or joined) while this read was in flight, with a
+                # floor below where the read began, gets nothing from it: a partial delivery
+                # would move its cursor past the transactions the covering read must add.
+                stale |= {
+                    identity
+                    for identity, sub in self.subscribers.items()
+                    if not self._covered(sub) and read_start > sub["floor"]
+                }
+                for tx in committed:
+                    for identity, sub in self.subscribers.items():
+                        if identity in stale or tx.commit_lsn <= self.cursors.get(identity, 0):
+                            continue
+                        if any(
+                            _record_matches(record, sub["table"])
+                            for record in itertools.chain(tx.records, tx.spilled)
+                        ):
+                            self.buffers.setdefault(identity, deque()).append(tx)
+                            self.cursors[identity] = tx.commit_lsn
+                # A subscriber is covered once a read that captured it was activated at or
+                # below its floor: from then on its buffer holds everything above the floor.
+                for identity in schema_map:
+                    entry = self.subscribers.get(identity)
+                    if entry is None or identity in stale:
+                        continue
+                    previous = entry.get("covered_from")
+                    entry["covered_from"] = (
+                        read_start if previous is None else min(previous, read_start)
+                    )
+                # Resume the next read from the oldest open BEGIN so open transactions are
+                # recaptured; per-table cursors above dedup the resulting re-delivery.
+                global_open = min((item.begin_lsn for item in buffer.open.values()), default=None)
+                if global_open is not None:
+                    advanced = global_open
+                elif timed_out and reached is not None:
+                    # Idle with nothing open: everything the shard captures up to where the
+                    # log reader stopped has been delivered, so resume from there. Resuming
+                    # from the last commit instead rescans the same stretch of a busy log on
+                    # every poll and can time out before ever passing it. A position held back
+                    # short of where the read started (a quiet log, see _shared_cdc_snapshot)
+                    # resumes from the start: the read had nothing to deliver short of it.
+                    advanced = max(
+                        read_start, reached, committed[-1].commit_lsn if committed else reached
+                    )
+                elif committed:
+                    advanced = committed[-1].commit_lsn
+                else:
+                    advanced = self.shared_restart
+                # Never advance past the floor of a table this read did not cover. A
+                # subscriber that joined (or re-joined after TTL eviction) while the read
+                # was in flight lowered shared_restart to its floor; overwriting that here
+                # left its log between the floor and this read's end unread forever, and
+                # its first view then skipped that range silently.
+                pending = [
+                    entry["floor"] for entry in self.subscribers.values() if not self._covered(entry)
+                ]
+                candidates = [value for value in (advanced, *pending) if value is not None]
+                if candidates:
+                    self.shared_restart = min(candidates)
+                open_begins: dict[str, int | None] = {}
+                for identity, sub in self.subscribers.items():
+                    begins = [
+                        item.begin_lsn
+                        for item in buffer.open.values()
+                        if any(
+                            _record_matches(record, sub["table"])
+                            for record in itertools.chain(item.records, item.spilling)
+                        )
+                    ]
+                    open_begins[identity] = min(begins) if begins else None
+                self.open_begins = open_begins
+                self.schema = dict(schema_map)
+                self.min_lsn = min_lsn
+                # current_lsn was sampled before the read, which can then reach further, into the
+                # next logical log: a view must not report a log position older than the commits
+                # it hands out, or a consumer that took them reads as being ahead of the log.
+                self.current_lsn = max(
+                    current_lsn, reached or 0, committed[-1].commit_lsn if committed else 0
+                )
+                self.caught_up = timed_out and not buffer.open
+                self.reached_lsn = reached if self.caught_up else None
+                self.read_start_lsn = read_start if self.caught_up else None
+                self.ready = True
+                self.condition.notify_all()
+            return self.caught_up
+
+        def mark_unready(self):
+            with self.condition:
+                self.ready = False
+
+
+    # Serialization-safe registry (a bare module global becomes a function local in the
+    # merged deployment; a mutated dict survives, as with _lakebase_waiter_lock).
+    _SHARED_CDC_SHARDS: dict[tuple, _SharedCdcShard] = {}
+    _SHARED_CDC_THREADS: dict[tuple, threading.Thread] = {}
+    _SHARED_CDC_REGISTRY_LOCK: dict[str, threading.Lock] = {}
+
+
+    def _shared_cdc_registry_lock() -> threading.Lock:
+        lock = _SHARED_CDC_REGISTRY_LOCK.get("lock")
+        if lock is None:
+            lock = _SHARED_CDC_REGISTRY_LOCK.setdefault("lock", threading.Lock())
+        return lock
+
+
+    def _ensure_key_columns_exist(table: Table) -> None:
+        # Docstring: Fail when a carried key names a column the catalog no longer has.
+        #
+        # A primary.keys override or a nullable-index promotion is carried as listed, so a
+        # key column dropped at the source would otherwise outlive the refresh and every row
+        # would then key on NULL.
+
+        known = {column.name for column in table.columns}
+        missing = [key for key in table.primary_keys if key not in known]
+        if missing:
+            # 373: Key column(s) {} of '{}' no longer exist at the source; run a full refresh
+            raise InformixError(_m(373, (", ".join(missing)), table.exposed_name))
+
+
+    def _wildcard_key(columns: Iterable[Column], excepted: Iterable[str]) -> list[str]:
+        # Docstring: The names of ``columns`` a wildcard key covers: all of them, in order, but
+        # the ``excepted`` ones of a "* except(...)" key.
+        #
+        # Matched ignoring case, as Informix folds an undelimited identifier to lower case, so
+        # "* except(Note)" leaves out a column catalogued as ``note``.
+
+        folded = {name.casefold() for name in excepted or ()}
+        return [column.name for column in columns if column.name.casefold() not in folded]
+
+
+    def _ensure_excepted_columns_exist(table: Table, excepted: Iterable[str]) -> None:
+        # Docstring: Fail when a "* except(...)" key names a column the table doesn't have.
+        #
+        # Checked against every catalog column, those the column selection or an unsupported
+        # type leaves out included, and ignoring case as _wildcard_key matches, so a typo fails
+        # instead of quietly keeping the column it meant in the key. After a named column is
+        # dropped at the source, take it out of the list: the key stays as it was, so the
+        # schema transition accepts that edit. A column still to be added can't be named
+        # ahead; add it to the list once it exists, before the pipeline restarts.
+
+        known = {column.name.casefold() for column in table.catalog_columns or table.columns}
+        missing = [name for name in excepted or () if name.casefold() not in known]
+        if missing:
+            # 374: Option '{}' excepts column(s) that '{}' does not have: {}
+            raise InformixError(_m(374, _PRIMARY_KEYS_OPTION, table.exposed_name, (", ".join(missing))))
+
+
+    def _carry_key_override(fresh: Table, overridden: Table) -> Table:
+        # Docstring: Carry a ``primary.keys`` override from ``overridden`` onto a re-read ``fresh``
+        # table.
+        #
+        # An explicit key list is preserved as-is, with its adopted key-index directions. A
+        # wildcard key is re-expanded to ``fresh``'s columns, less any its except(...) names,
+        # keeping the directions only when the key is unchanged. A name whose column was
+        # dropped fails, as it does when the option is applied.
+
+        keys = overridden.primary_keys
+        descending = overridden.key_descending
+        if overridden.key_wildcard:
+            _ensure_excepted_columns_exist(fresh, overridden.key_wildcard_except)
+            keys = tuple(_wildcard_key(fresh.columns, overridden.key_wildcard_except))
+            if not keys:
+                # 192: Option '{}' excepts every column of '{}', leaving no key
+                raise InformixError(_m(192, _PRIMARY_KEYS_OPTION, fresh.exposed_name))
+            if keys != overridden.primary_keys:
+                descending = ()
+        return replace(
+            fresh,
+            primary_keys=keys,
+            key_override=True,
+            key_wildcard=overridden.key_wildcard,
+            key_wildcard_except=overridden.key_wildcard_except,
+            key_descending=descending,
+            # As the option was applied: a key a nullable index gave the table before it,
+            # which the catalog's re-read no longer has, still makes the option's key not its
+            # only one.
+            key_only_from_option=overridden.key_only_from_option and not fresh.primary_keys,
+        )
+
+
+    def _recorded_transforms(recorded: tuple | None) -> tuple | None:
+        # Docstring: Parse recorded (column, canonical) transforms back to (column, text, operand).
+
+        if recorded is None:
+            return None
+        return tuple(
+            (
+                name,
+                canonical,
+                _RowFilterParser(canonical, _TRANSFORM_COLUMNS_OPTION, "transform").parse_expression(),
+            )
+            for name, canonical in recorded
+        )
+
+
+    def _carry_table_options(fresh: Table, previous: Table) -> Table:
+        # Docstring: Re-apply ``previous``'s option-derived state to ``fresh``, re-read from
+        # the catalog.
+        #
+        # A catalog read knows nothing of table options, so without this a refresh would
+        # revert a column selection, a primary.keys override, a nullable-index promotion, or a
+        # row_filter, change the fingerprint, and read as drift. The selection runs first so a
+        # wildcard key re-expands over the selected columns only.
+
+        fresh = _apply_column_selection(fresh, previous.column_selection)
+        # The key the carry below gives ``fresh``: the override or promotion carried, else
+        # the catalog's; a wildcard keys on whatever is ingested.
+        if previous.key_wildcard:
+            key = None
+        elif previous.key_override or previous.key_from_nullable_index:
+            key = previous.primary_keys
+        else:
+            key = fresh.primary_keys
+        fresh = _leave_out_unsupported_columns(fresh, key)
+        if previous.key_override:
+            # A wildcard key is re-expanded to the fresh columns instead of kept as listed.
+            fresh = _carry_key_override(fresh, previous)
+        elif previous.key_from_nullable_index and not fresh.primary_keys and fresh.nullable_index_key:
+            # The catalog re-derives the table as key-less (no all-NOT-NULL index), so without
+            # this the promoted key -- and its directions -- would be dropped and the
+            # key-order guard would trip mid-copy. Promoted again from this read, as the
+            # option does: copied from the earlier one, an index dropped or replaced since, or
+            # a primary key added, read as no change, and the key drift went unseen.
+            fresh = replace(
+                fresh,
+                primary_keys=fresh.nullable_index_key,
+                key_descending=fresh.nullable_index_descending,
+                key_from_nullable_index=True,
+            )
+        _ensure_key_columns_exist(fresh)
+        _ensure_selected_keys(fresh)
+        fresh = _apply_row_filter(fresh, previous.row_filter)
+        fresh = _apply_column_renames(fresh, previous.column_renames)
+        if previous.decimal_targets is not None:
+            # Those of the columns still there: a dropped column takes its entry with it, and
+            # one the table gained takes the table-wide type, which the catalog doesn't know.
+            known = {column.name for column in previous.columns}
+            entries = dict(previous.decimal_targets)
+            targets = []
+            for column in fresh.columns:
+                if not _is_variable_scale_decimal(column):
+                    continue
+                if column.name in entries:
+                    targets.append((column.name, entries[column.name]))
+                elif column.name not in known and previous.decimal_default is not None:
+                    targets.append((column.name, previous.decimal_default))
+            fresh = replace(
+                fresh, decimal_targets=tuple(sorted(targets)), decimal_default=previous.decimal_default
+            )
+        carried = _recorded_transforms(previous.column_transforms)
+        return _apply_column_transforms(fresh, carried, None, key_id=previous.transform_key_id)
+
+
+    def _shard_schema_map(
+        bridge, identities, catalog: _ShardCatalog | None = None, check_seconds: float = 0
+    ) -> tuple[dict[str, Table], list[str]]:
+        # Docstring: Each subscriber's catalog table with its options carried, as
+        # _refresh_table_schema does, for one shard read: ``(identity -> table, unfit)``.
+        #
+        # The catalog tables come from ``catalog``, which re-reads only what changed (see
+        # _ShardCatalog); without one, every table is read now. Without the carry an overridden
+        # table's fingerprint never matches its checkpoint, so it would always fall back to a
+        # direct read and never benefit from sharding -- and its PK-change detection would use
+        # the wrong keys. A table whose options no longer fit its catalog (a selected, renamed,
+        # or transformed column gone, a carried key column dropped), or whose name no longer
+        # names a table, is listed as unfit instead of failing the whole read: its own direct
+        # read reports the error, and the shard keeps serving the others.
+
+        catalog = _ShardCatalog() if catalog is None else catalog
+        fresh_tables = catalog.tables(bridge, identities, time.monotonic(), check_seconds)
+        schema_map: dict[str, Table] = {}
+        unfit: list[str] = []
+        for identity, table in identities:
+            fresh = fresh_tables.get(identity)
+            if fresh is None:
+                # 152: Shared CDC shard leaves {} to direct reads: the catalog no longer has it
+                logging.getLogger(__name__).warning(
+                    _m(152, identity),
+                )
+                unfit.append(identity)
+                continue
+            try:
+                schema_map[identity] = _carry_table_options(fresh, table)
+            except (InformixError, ValueError):
+                # 153: Shared CDC shard leaves {} to direct reads: its table options no longer fit the
+                # catalog
+                logging.getLogger(__name__).warning(
+                    _m(153, identity),
+                    exc_info=True,
+                )
+                unfit.append(identity)
+        return schema_map, unfit
+
+
+    def _close_shared_cdc_reader(reader) -> None:
+        if reader is None:
+            return
+        try:
+            reader.close()
+        except Exception:  # noqa: BLE001 - best-effort slot release
+            # 154: shared CDC reader close failed
+            logging.getLogger(__name__).debug(_m(154), exc_info=True)
+
+
+    class _HostShardEndpoints:
+        # Docstring: This process's part in each host-shared shard: the lock and listener of a
+        # shard it leads, or its connection to the leader of one it follows.
+        #
+        # Never serialized: a worker that unpickles a reader starts with no roles of its own.
+
+        def __init__(self, directory: str | None = None) -> None:
+            self.lock = threading.Lock()
+            self.directory = directory
+            # key -> {"lock_fd", "listener", "reader_factory"}: the shards this process leads.
+            self.leading: dict[tuple, dict[str, Any]] = {}
+            self.clients: dict[tuple, Any] = {}
+            self.client_locks: dict[tuple, threading.Lock] = {}
+            # (key, identity) -> (checkpoint commit LSN, floor, capture, transactions) a follower
+            # holds from its earlier polls, so the leader sends each transaction only once.
+            self.mirrors: dict[tuple, tuple[int, int, dict, tuple]] = {}
+            # Set when this process can't lock or serve a shard at all, so it shares in
+            # process mode instead of reading directly on every poll.
+            self.unavailable: str | None = None
+
+        def __getstate__(self) -> dict[str, object]:
+            return {}
+
+        def __setstate__(self, state: dict[str, object]) -> None:
+            del state
+            self.__init__()
+
+        def paths(self, key: tuple) -> tuple[str, str, str]:
+            # Docstring: The shard's (lock, socket, auth key) paths, short enough for AF_UNIX.
+            #
+            # Whoever can write the directory could serve forged CDC rows, so one that isn't
+            # this user's alone raises, which turns host sharing off in this process.
+
+            directory = self.directory
+            if directory is None:
+                name = f"informix-cdc-shards-{os.getuid()}"
+                directory = os.path.join(tempfile.gettempdir(), name)
+                # A socket path must fit AF_UNIX's sun_path (104 bytes on macOS and BSD, 108 on
+                # Linux); a long TMPDIR would otherwise turn host sharing off. /tmp is short.
+                if len(os.fsencode(os.path.join(directory, "0" * 24 + ".sock"))) > 100:
+                    directory = os.path.join("/tmp", name)
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            info = os.lstat(directory)
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                # 143: {} is not a directory only this user can access
+                raise PermissionError(_m(143, directory))
+            digest = hashlib.sha256(repr(key).encode()).hexdigest()[:24]
+            base = os.path.join(directory, digest)
+            return f"{base}.lock", f"{base}.sock", f"{base}.key"
+
+
+    _HOST_SHARD_ENDPOINTS = _HostShardEndpoints()
+
+
+    def _host_shard_stop_leading(
+        endpoints: _HostShardEndpoints, key: tuple, *, locked: bool = False
+    ) -> None:
+        # Docstring: Give up leading a shard nobody reads any more: close its listener, remove
+        # its socket and key files, and release its lock. A follower that polls later finds
+        # no leader and leads it itself. The lock file stays: removing it could let two
+        # processes lock different files of the same name. ``locked``: the caller holds the
+        # endpoints lock.
+
+        with contextlib.nullcontext() if locked else endpoints.lock:
+            leading = endpoints.leading.pop(key, None)
+            if leading is None:
+                return
+            with contextlib.suppress(Exception):
+                leading["listener"].close()
+            with contextlib.suppress(Exception):
+                _lock_path, socket_path, key_path = endpoints.paths(key)
+                for path in (socket_path, key_path):
+                    with contextlib.suppress(OSError):
+                        os.unlink(path)
+            with contextlib.suppress(OSError):
+                os.close(leading["lock_fd"])
+
+
+    def _retire_shared_cdc_shard(key: tuple, shard: _SharedCdcShard) -> bool:
+        # Docstring: Take an idle shard out of the registry, and give up leading it for other
+        # processes; False when a subscriber has come back. A consumer that asks for the
+        # shard afterwards gets a new one, with a new thread.
+
+        # The lead is given up under the locks the shard leaves the registry under, the
+        # endpoints lock first, as _host_shard_own_poll takes it: a poll that found this
+        # process leading between the two made a new shard and thread here, while another
+        # process took the lock and led the shard too.
+        # A shard already out of the registry (given up, see _host_shard_accept) leaves the
+        # lead alone: it is a newer shard's, if this process leads the key again.
+        endpoints = _HOST_SHARD_ENDPOINTS
+        with endpoints.lock, _shared_cdc_registry_lock():
+            with shard.condition:
+                if shard.live_subscribers():
+                    return False
+            if _SHARED_CDC_SHARDS.get(key) is shard:
+                _SHARED_CDC_SHARDS.pop(key, None)
+                _SHARED_CDC_THREADS.pop(key, None)
+                _host_shard_stop_leading(endpoints, key, locked=True)
+        return True
+
+
+    # pylint: disable-next=too-many-statements
+    def _run_shared_cdc_shard(shard: _SharedCdcShard, key: tuple | None = None) -> None:
+        # Docstring: Daemon loop for one shard: read the shared CDC session, fetch schema + log
+        # bounds, and publish. Holds one connection slot only across consecutive productive
+        # reads; releases it before any idle wait so consumer bootstrap can use the slot.
+        # Ends once the shard has had no subscriber for _SHARED_CDC_IDLE_EXIT_SECONDS.
+
+        logger = logging.getLogger(__name__)
+        reader = None
+        idle_since: float | None = None
+        try:
+            while True:
+                with shard.condition:
+                    subscribers = shard.live_subscribers()
+                    have_subscribers = bool(subscribers)
+                if have_subscribers:
+                    idle_since = None
+                elif key is not None:
+                    idle_since = idle_since or time.monotonic()
+                    if (
+                        time.monotonic() - idle_since >= _SHARED_CDC_IDLE_EXIT_SECONDS
+                        and _retire_shared_cdc_shard(key, shard)
+                    ):
+                        return
+                with shard.condition:
+                    throttled = have_subscribers and any(
+                        len(buf) >= shard.buffer_cap for buf in shard.buffers.values()
+                    )
+                    restart = shard.shared_restart
+                    identities = [(identity, sub["table"]) for identity, sub in subscribers.items()]
+                if not have_subscribers or throttled or restart is None or shard.reader_factory is None:
+                    _close_shared_cdc_reader(reader)
+                    reader = None
+                    with shard.condition:
+                        shard.condition.wait(timeout=_SHARED_CDC_IDLE_POLL_SECONDS)
+                    continue
+                if reader is None:
+                    reader = shard.reader_factory()
+                try:
+                    schema_map, unfit = _shard_schema_map(
+                        reader._bridge,
+                        identities,
+                        shard.catalog,
+                        _SNAPSHOT_SCHEMA_REFRESH_INTERVAL_SECONDS,
+                    )
+                    for identity in unfit:
+                        # Its consumer falls back to a direct read, which reports the error;
+                        # evicting it keeps its floor from pinning the shared restart.
+                        shard.evict(identity)
+                    if not schema_map:
+                        _close_shared_cdc_reader(reader)
+                        reader = None
+                        with shard.condition:
+                            shard.condition.wait(timeout=_SHARED_CDC_IDLE_POLL_SECONDS)
+                        continue
+                    captures = {identity: subscribers[identity]["capture"] for identity in schema_map}
+                    min_lsn = reader._bridge.minimum_lsn()
+                    current_lsn = reader._bridge.current_lsn()
+                    raw = reader._read_changes_with_reconnect(
+                        list(captures.values()),
+                        restart,
+                        shard.timeout_seconds,
+                        shard.max_records,
+                        table=subscribers[next(iter(schema_map))]["table"],
+                    )
+                    caught_up = shard.ingest(raw, schema_map, min_lsn, current_lsn, restart, captures)
+                except Exception:  # noqa: BLE001 - surfaced by degrading to direct reads
+                    # 155: Shared CDC shard read failed; consumers fall back to direct reads until it
+                    # recovers
+                    logger.warning(
+                        _m(155),
+                        exc_info=True,
+                    )
+                    shard.mark_unready()
+                    # Whatever failed, the next read starts from a fresh look at the catalog.
+                    shard.catalog.force_check()
+                    _close_shared_cdc_reader(reader)
+                    reader = None
+                    time.sleep(_SHARED_CDC_IDLE_POLL_SECONDS)
+                    continue
+                if caught_up:
+                    _close_shared_cdc_reader(reader)
+                    reader = None
+                    with shard.condition:
+                        shard.condition.wait(timeout=_SHARED_CDC_IDLE_POLL_SECONDS)
+        finally:
+            _close_shared_cdc_reader(reader)
+
+
+    def _shared_cdc_shard(
+        key, *, reader_factory, timeout_seconds, max_records, buffer_cap, subscriber_ttl
+    ) -> _SharedCdcShard:
+        with _shared_cdc_registry_lock():
+            shard = _SHARED_CDC_SHARDS.get(key)
+            if shard is None:
+                shard = _SHARED_CDC_SHARDS.setdefault(key, _SharedCdcShard())
+            shard.configure(
+                reader_factory=reader_factory,
+                timeout_seconds=timeout_seconds,
+                max_records=max_records,
+                buffer_cap=buffer_cap,
+                subscriber_ttl=subscriber_ttl,
+            )
+            thread = _SHARED_CDC_THREADS.get(key)
+            if thread is None or not thread.is_alive():
+                thread = threading.Thread(
+                    target=_run_shared_cdc_shard,
+                    args=(shard, key),
+                    daemon=True,
+                    name=f"informix-shared-cdc-{key[-2]}-{key[-1]}",
+                )
+                _SHARED_CDC_THREADS[key] = thread
+                thread.start()
+            return shard
+
+
+    # Host-shared shards (cdc.shared.session=host, the default). Serverless SDP runs each
+    # streaming flow's driver-side reader in its own Python process, all in one container on
+    # the driver host, so a process-local shard serves only its own flow's table and every
+    # flow opens its own CDC session. In host mode the first process to lock a shard's lock
+    # file leads it: it runs the shard and its reader thread exactly as process mode does,
+    # and serves the other flow processes' polls over a Unix socket in the local temp
+    # directory. A follower that can't reach the leader tries to take the lock, which the
+    # kernel releases when the leader's process exits, and otherwise reads directly for that
+    # poll, as any flow does while its shard isn't ready. A new leader starts an empty shard,
+    # which its subscribers cover again from their own checkpoints, as after a restart.
+    _SHARED_CDC_SESSION_HOST = "host"
+    _SHARED_CDC_SESSION_PROCESS = "process"
+    # How long a follower waits to connect to the leader, or for it to answer one poll,
+    # before reading directly.
+    _HOST_SHARD_REPLY_SECONDS = 60.0
+    # Consecutive accept failures after which a leader gives its shard up to another process.
+    _HOST_SHARD_ACCEPT_FAILURES = 8
+
+
+    def _shared_cdc_mode(options: dict[str, str]) -> str:
+        # Docstring: ``cdc.shared.session`` as host (the default) or process.
+        #
+        # ``host`` shares the shards between the flow processes on one host; ``process``
+        # keeps one shard registry per process.
+
+        value = options.get(_SHARED_CDC_SESSION_OPTION, _SHARED_CDC_SESSION_HOST).strip().lower()
+        if value in (_SHARED_CDC_SESSION_HOST, _SHARED_CDC_SESSION_PROCESS):
+            return value
+        # 142: Option '{}' must be 'host' or 'process'
+        raise ValueError(_m(142, _SHARED_CDC_SESSION_OPTION))
+
+
+    def _unwire_table(data: dict[str, Any]) -> Table:
+        fields = dict(data)
+        for name in _HOST_SHARD_TABLE_COLUMN_FIELDS:
+            fields[name] = tuple(Column(**column) for column in fields[name])
+        return Table(**fields)
+
+
+    def _unwire_json_table(data: dict[str, Any]) -> Table:
+        # Docstring: _unwire_table for a table that crossed JSON (a partition descriptor), which
+        # turned its tuples into lists.
+
+        def tuples(value: Any) -> Any:
+            return tuple(tuples(item) for item in value) if isinstance(value, list) else value
+
+        return _unwire_table(
+            {
+                name: value if name in _HOST_SHARD_TABLE_COLUMN_FIELDS else tuples(value)
+                for name, value in data.items()
+            }
+        )
+
+
+    def _wire_view(view: "_SharedCdcSnapshot") -> dict[str, Any]:
+        # Docstring: A shard view as plain data; its records already are (decoded CDC values).
+
+        return {
+            "table": _wire_table(view.table),
+            "fingerprint": view.fingerprint,
+            "min_lsn": view.min_lsn,
+            "current_lsn": view.current_lsn,
+            "committed": [
+                (
+                    tx.tx_id,
+                    tx.begin_lsn,
+                    tx.commit_lsn,
+                    tx.restart_lsn,
+                    tx.records,
+                    tx.commit_time,
+                    tx.spilled,
+                )
+                for tx in view.committed
+            ],
+            "caught_up": view.caught_up,
+            "open_begin": view.open_begin,
+            "reached_lsn": view.reached_lsn,
+            "read_start_lsn": view.read_start_lsn,
+        }
+
+
+    def _unwire_view(data: dict[str, Any]) -> "_SharedCdcSnapshot":
+        return _SharedCdcSnapshot(
+            table=_unwire_table(data["table"]),
+            fingerprint=data["fingerprint"],
+            min_lsn=data["min_lsn"],
+            current_lsn=data["current_lsn"],
+            committed=[CommittedTransaction(*tx) for tx in data["committed"]],
+            caught_up=data["caught_up"],
+            open_begin=data["open_begin"],
+            reached_lsn=data["reached_lsn"],
+            read_start_lsn=data.get("read_start_lsn"),
+        )
+
+
+    def _host_shard_local_poll(
+        key, reader_factory, config, identity, table, capture, commit, floor, owner=None
+    ):
+        # Docstring: Subscribe to and read this process's own shard, as process mode does;
+        # None for a flow the shard does not serve because another holds the table's place.
+
+        shard = _shared_cdc_shard(key, reader_factory=reader_factory, **config)
+        return shard.poll(identity, table, capture, commit, floor, owner)
+
+
+    def _host_shard_own_poll(endpoints, key, reader_factory, config, *poll):
+        # Docstring: _host_shard_local_poll of this process's own shard: within the process
+        # where the host can't share, else as its leader; None, to read directly, once this
+        # process leads it no more.
+        #
+        # The leader takes the shard under the endpoints lock, which an idle shard's retirement
+        # holds while it leaves the registry and gives the lead up (_retire_shared_cdc_shard).
+        # Taken after a check without it, a poll between the two made a new shard and reader
+        # thread in a process that then let its lock go, beside the leader another process
+        # became: two sessions reading one shard's tables.
+
+        if endpoints.unavailable:
+            return _host_shard_local_poll(key, reader_factory, config, *poll)
+        with endpoints.lock:
+            if key not in endpoints.leading:
+                return None
+            shard = _shared_cdc_shard(key, reader_factory=reader_factory, **config)
+        return shard.poll(*poll)
 
 
     ########################################################
@@ -17128,6 +17171,11 @@ def register_lakeflow_source(spark):
         # Docstring: The bridge's sessions: connecting, connection slots, transactions and the
         # catalog.
 
+        def _call_flag(self, name: str, default: Any = None) -> Any:
+            # Docstring: What the connector's call under way set for this thread: a capacity
+            # bypass, a slot-wait budget, a backlog rank (the connector's _call_context).
+            return getattr(getattr(self, "_call_context", None), name, default)
+
         def _apply_startup_jitter(self) -> None:
             # Docstring: Sleep a one-time jittered delay before this reader's first connection.
             #
@@ -17156,13 +17204,13 @@ def register_lakeflow_source(spark):
                     return
                 # Before acquiring a slot -- a jittering reader holds nothing while it waits.
                 self._apply_startup_jitter()
-                bypass_capacity = self.options.get("_informix.bypass.connection.capacity") == "true"
+                bypass_capacity = bool(self._call_flag("bypass_capacity", False))
                 # A reconnect after reset_transport still holds its slot and heartbeat; claiming
                 # another would strand the first, renewed until the process exits. Its connect
                 # failing keeps it too, for the retry: release_connection frees it in the end.
                 held = getattr(self, "_lakebase_slot", None) is not None
                 if not bypass_capacity and not held:
-                    budget = self.options.get(_CONNECTION_ATTEMPT_BUDGET_OPTION)
+                    budget = self._call_flag("attempt_budget")
                     budget = float(budget) if budget else None
                     # Lakebase can reap the state connection while this bridge sits idle
                     # between reads, or drop it during a long wait for a slot, which psycopg
@@ -17543,7 +17591,7 @@ def register_lakeflow_source(spark):
             # the gap is enough to bias that race, while an unbounded shrink would
             # reintroduce exactly the metadata storm the wide interval exists to prevent.
 
-            raw = self.options.get(_CONNECTION_ATTEMPT_RANK_OPTION)
+            raw = self._call_flag("attempt_rank", 0)
             if not raw:
                 return 1.0
             try:
@@ -23372,12 +23420,14 @@ def register_lakeflow_source(spark):
         ) -> None:
             if not redirected:
                 return
-            if (host, port) not in self.redirect_allowlist:
+            # Both sides as redirect_host_key has them: a name case-insensitively, an address
+            # in its canonical form (the allow-list's IPv6 entries are bracketed).
+            if (redirect_host_key(host), port) not in self.redirect_allowlist:
                 raise SqliUnsupportedAuthentication("redirect target is not explicitly allow-listed")
             resolved = addresses if addresses is not None else self._resolved_addresses(host, port)
             for value in resolved:
                 address = ipaddress.ip_address(value)
-                if not address.is_global and (str(address), port) not in self.redirect_allowlist:
+                if not address.is_global and (address.compressed, port) not in self.redirect_allowlist:
                     raise SqliUnsupportedAuthentication("redirect resolved to a non-public address")
 
         def _reset_connection_state(self) -> None:
@@ -24082,6 +24132,7 @@ def register_lakeflow_source(spark):
         "encode_simple_command",
         "informix_locale_encoding",
         "parse_redirect_detail",
+        "redirect_host_key",
         "read_session_packet",
     ]
 
@@ -26809,23 +26860,18 @@ def register_lakeflow_source(spark):
                 _backlog_rank_value(start_offset),
                 _backlog_rank(0, _backlog_streak(start_offset)),
             )
-            previous = self.options.get(_CONNECTION_ATTEMPT_BUDGET_OPTION)
-            previous_rank = self.options.get(_CONNECTION_ATTEMPT_RANK_OPTION)
+            # This thread's, for the bridge to read (_call_context).
+            context = self._call_state()
+            previous = getattr(context, "attempt_budget", None)
+            previous_rank = getattr(context, "attempt_rank", 0)
             if budget is not None:
-                self.options[_CONNECTION_ATTEMPT_BUDGET_OPTION] = repr(budget)
+                context.attempt_budget = budget
             if rank > 0:
-                self.options[_CONNECTION_ATTEMPT_RANK_OPTION] = str(rank)
+                context.attempt_rank = rank
             try:
                 yield
             finally:
-                if previous is None:
-                    self.options.pop(_CONNECTION_ATTEMPT_BUDGET_OPTION, None)
-                else:
-                    self.options[_CONNECTION_ATTEMPT_BUDGET_OPTION] = previous
-                if previous_rank is None:
-                    self.options.pop(_CONNECTION_ATTEMPT_RANK_OPTION, None)
-                else:
-                    self.options[_CONNECTION_ATTEMPT_RANK_OPTION] = previous_rank
+                context.attempt_budget, context.attempt_rank = previous, previous_rank
 
         def _capacity_retry_offset(self, start_offset: dict) -> dict:
             # Docstring: Yield an empty continuous batch when no connection slot is free.
@@ -27376,6 +27422,7 @@ def register_lakeflow_source(spark):
             state = self.__dict__.copy()
             state["_bridge_instance"] = None
             state["_metadata_session_lock"] = None
+            state["_call_context"] = None
             # Driver-only; never ship materialized embedded rows to a worker. The worker
             # gets its rows from the partition descriptor, not from this cache.
             state["_partition_embedded_rows"] = {}
@@ -27411,13 +27458,25 @@ def register_lakeflow_source(spark):
                 _install_registration(carried)
             self.__dict__.update(state)
             self._metadata_session_lock = threading.RLock()
+            self._call_context = threading.local()
 
         @property
         def _bridge(self) -> InformixBridge:
             if self._bridge_instance is None:
                 _refuse_code_loading_options(self.options)
                 self._bridge_instance = _BRIDGE_FACTORY["factory"](self.options)
-            return self._bridge_instance
+            bridge, context = self._bridge_instance, self._call_state()
+            if getattr(bridge, "_call_context", None) is not context:
+                bridge._call_context = context
+            return bridge
+
+        def _call_state(self) -> threading.local:
+            # Docstring: This connector's per-thread call context (see __init__), made on first
+            # use where the connector was built without __init__.
+            context = self.__dict__.get("_call_context")
+            if context is None:
+                context = self._call_context = threading.local()
+            return context
 
         @contextlib.contextmanager
         def _metadata_access(self) -> Iterator[None]:
@@ -27426,22 +27485,20 @@ def register_lakeflow_source(spark):
             # Registration and reader setup read only metadata. Queued for a slot behind running
             # reads they would stall startup, and a wait that gave up would fail it.
 
-            # Under the metadata lock, re-entrant: the flag is set on options the bridge shares,
-            # and two lookups at once let the first one's exit close the second one's session
-            # and the second one's put the flag back for good, every later read bypassing.
+            # The bypass is this thread's (_call_context), so a read on another thread claims
+            # its slot as ever. Under the metadata lock, re-entrant: two lookups at once let
+            # the first one's exit close the second one's session.
             with self._metadata_session_lock:
-                previous = self.options.get("_informix.bypass.connection.capacity")
-                self.options["_informix.bypass.connection.capacity"] = "true"
+                context = self._call_state()
+                previous = getattr(context, "bypass_capacity", False)
+                context.bypass_capacity = True
                 try:
                     yield
                 finally:
                     try:
                         self._release_worker_connection()
                     finally:
-                        if previous is None:
-                            self.options.pop("_informix.bypass.connection.capacity", None)
-                        else:
-                            self.options["_informix.bypass.connection.capacity"] = previous
+                        context.bypass_capacity = previous
 
         def list_tables(self) -> list[str]:
             with self._metadata_access():
@@ -31640,15 +31697,10 @@ def register_lakeflow_source(spark):
             # (see the slot-wait liveness in ``_acquire_connection_slot``), so it waits out a busy
             # backfill and only gives up when the pool is wedged. It is also the consumer's
             # per-progress idle window, so the single knob governs both. Drop any inherited
-            # per-read attempt budget so it cannot cap the slot wait below that window.
-            reader_options.pop(_CONNECTION_ATTEMPT_BUDGET_OPTION, None)
+            # replay wait budget so it cannot cap the slot wait below that window. The read's
+            # own attempt budget, backlog rank and a lookup's capacity bypass are its thread's
+            # (_call_context), which a new reader doesn't inherit.
             reader_options.pop(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION, None)
-            # And the backlog rank of the read that happened to start it: kept, the daemon
-            # swept for a slot at that read's pace for as long as it lived.
-            reader_options.pop(_CONNECTION_ATTEMPT_RANK_OPTION, None)
-            # And a metadata lookup's capacity bypass, if one is under way: a daemon made then
-            # claimed no slot for as long as it lived.
-            reader_options.pop("_informix.bypass.connection.capacity", None)
             cls = type(self)
             return lambda: cls(reader_options)
 
@@ -31747,15 +31799,10 @@ def register_lakeflow_source(spark):
             # per-turnover window rather than a hard cap, so it holds its queue ticket long
             # enough for the round-robin rotation to reach it. Drop any per-read attempt budget
             # inherited from the parent's options so a short consumer budget cannot cap that
-            # wait below the window and send the daemon back to the end of the queue.
-            reader_options.pop(_CONNECTION_ATTEMPT_BUDGET_OPTION, None)
+            # wait below the window and send the daemon back to the end of the queue. The
+            # read's attempt budget, backlog rank and a lookup's capacity bypass are its
+            # thread's (_call_context), which a new reader doesn't inherit.
             reader_options.pop(_REPLAY_CONNECTION_WAIT_BUDGET_OPTION, None)
-            # And the backlog rank of the read that happened to start it: kept, the daemon
-            # swept for a slot at that read's pace for as long as it lived.
-            reader_options.pop(_CONNECTION_ATTEMPT_RANK_OPTION, None)
-            # And a metadata lookup's capacity bypass, if one is under way: a daemon made then
-            # claimed no slot for as long as it lived.
-            reader_options.pop("_informix.bypass.connection.capacity", None)
             cls = type(self)
             # The shard is keyed by this reader's scope, and its reads spill under it.
             scope = self._registration_scope
@@ -32708,6 +32755,10 @@ def register_lakeflow_source(spark):
             # When the pipeline's targets were last reset (see _last_reset).
             self._update_reset_at: float | None = _INFORMIX_REGISTRATION_CONTEXT.get("reset_at")
             self._metadata_session_lock = threading.RLock()
+            # What the call under way tells the bridge -- a metadata lookup's capacity bypass,
+            # a read's slot-wait budget and backlog rank -- per thread: set on the options it
+            # shares with the bridge, a lookup on one thread reached a read on another.
+            self._call_context = threading.local()
             # Set by a snapshot-drain worker to a callback that reports a staged page to the
             # pool, resetting the consumer's liveness watchdog. None on a normal reader.
             self._drain_progress: Callable[[], None] | None = None

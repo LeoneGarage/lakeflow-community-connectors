@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import io
+import ipaddress
 import logging
 import os
 import re
@@ -290,6 +291,19 @@ def encode_pam_response(response: str, encoding: str = "utf-8") -> bytes:
     )
 
 
+def redirect_host_key(host: str) -> str:
+    # Docstring: A redirect host as allow-list entries and redirect targets are compared: a
+    # name case-folded without its trailing dot (DNS names are case-insensitive), an IP
+    # address in its canonical form, an IPv6 one without its brackets.
+    name = host.strip()
+    if name.startswith("[") and name.endswith("]"):
+        name = name[1:-1]
+    try:
+        return ipaddress.ip_address(name).compressed
+    except ValueError:
+        return name.rstrip(".").casefold()
+
+
 def parse_redirect_detail(detail: str, allowlist: set[tuple[str, int]]) -> tuple[str, str, int]:
     tokens = re.split(r"[:=|]", detail)
     if (
@@ -302,7 +316,12 @@ def parse_redirect_detail(detail: str, allowlist: set[tuple[str, int]]) -> tuple
     server, host, port = tokens[-3], tokens[-2], int(tokens[-1])
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", server) or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
         raise SqliUnsupportedAuthentication("redirect detail has unsafe identifiers")
-    if not server or not host or not 1 <= port <= 65535 or (host, port) not in allowlist:
+    if (
+        not server
+        or not host
+        or not 1 <= port <= 65535
+        or (redirect_host_key(host), port) not in allowlist
+    ):
         raise SqliUnsupportedAuthentication("redirect target is not explicitly allow-listed")
     return server, host, port
 
