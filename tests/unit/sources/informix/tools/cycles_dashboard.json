@@ -57,7 +57,7 @@
    "queryLines": [
     "WITH latest AS ( SELECT run_id FROM main.informix_cycles.events WHERE kind = 'start' AND message NOT ",
     "LIKE '%smoke=True%' ORDER BY run_id DESC LIMIT 1) , s AS (SELECT run_id, cycle, at AS started_at, ",
-    "regexp_extract(message, '^(run [0-9]+|extra run):', 1) AS run_label, regexp_extract(message, ",
+    "regexp_extract(message, '^(run [0-9]+|extra run|restart run):', 1) AS run_label, regexp_extract(message, ",
     "'started (.+) update ', 1) AS update_type, regexp_extract(message, ",
     "'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', 1) AS update_id FROM ",
     "main.informix_cycles.events WHERE kind = 'started'), x AS (SELECT run_id, at AS ended_at, ",

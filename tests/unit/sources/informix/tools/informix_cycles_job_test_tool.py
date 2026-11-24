@@ -44,9 +44,23 @@
 # and stays stopped. The notebook still exits normally, since a failed task is retried as a
 # fresh run that restarts the container. stop_on_mismatch=false runs every cycle regardless.
 #
+# Counts that still differ after the extra run are checked for a CDC stall. The demo
+# server's shared CDC log reader can stop, and then no session gets anything, however many
+# updates run, until the engine restarts. The extra run samples the server's CDC sessions
+# while its bronze update runs, twice CDC_SAMPLE_SECONDS apart. It is a stall when that
+# update wrote no rows although the counts differ, and in both samples every activated
+# session had returned nothing to its client and all reported the one same count of log
+# records examined: the reader read nothing in between. The notebook then restarts the
+# Informix engine inside the container (testdb stays and no workload starts), runs one more
+# triggered update of each pipeline and compares again. The verdict comes from that
+# compare: still differing, the cycle is a MISMATCH and cancels the cycles after it, as
+# above, and its result says the engine was restarted. A connector that lost changes or
+# stopped short shows no stall, as the sessions find nothing to read or read on, and ends
+# MISMATCH without a restart. restart_on_stall=false records a stall and does not restart.
+#
 # Parameters: cycles, triggered_minutes (default 35, counted from the workload's start; the
 # workload runs 30), pipeline_name (default informix-pipeline), silver_pipeline_name (default
-# informix-silver-pipeline), stop_on_mismatch (default true),
+# informix-silver-pipeline), stop_on_mismatch (default true), restart_on_stall (default true),
 # resume_test (default true), staging_location (the connection's snapshot.staging.location,
 # where the scan's progress is read from; without access to it the resume test is skipped),
 # and smoke=true, which checks AWS, SSM, the pipeline API, both compares and the event
@@ -55,6 +69,7 @@
 # or workspace needs no edit.
 
 # COMMAND ----------
+import base64
 import datetime as dt
 import json
 import os
@@ -70,6 +85,7 @@ dbutils.widgets.dropdown("smoke", "false", ["false", "true"])
 dbutils.widgets.text("pipeline_name", "informix-pipeline")
 dbutils.widgets.text("silver_pipeline_name", "informix-silver-pipeline")
 dbutils.widgets.dropdown("stop_on_mismatch", "true", ["true", "false"])
+dbutils.widgets.dropdown("restart_on_stall", "true", ["true", "false"])
 dbutils.widgets.dropdown("resume_test", "true", ["true", "false"])
 dbutils.widgets.text("staging_location", "/Volumes/members/connector_bronze/informix_cdc_state")
 CYCLES = int(dbutils.widgets.get("cycles"))
@@ -81,6 +97,7 @@ SMOKE = dbutils.widgets.get("smoke") == "true"
 PIPELINE_NAME = dbutils.widgets.get("pipeline_name")
 SILVER_PIPELINE_NAME = dbutils.widgets.get("silver_pipeline_name")
 STOP_ON_MISMATCH = dbutils.widgets.get("stop_on_mismatch") == "true"
+RESTART_ON_STALL = dbutils.widgets.get("restart_on_stall") == "true"
 RESUME_TEST = dbutils.widgets.get("resume_test") == "true"
 STAGING = dbutils.widgets.get("staging_location").rstrip("/")
 
@@ -131,7 +148,8 @@ event(
     "start",
     f"run {RUN_ID}: {CYCLES} cycles, triggered updates only, until "
     f"{TRIGGERED_SECONDS // 60} min after the workload starts, smoke={SMOKE}, "
-    f"stop_on_mismatch={STOP_ON_MISMATCH}, resume_test={RESUME_TEST}",
+    f"stop_on_mismatch={STOP_ON_MISMATCH}, resume_test={RESUME_TEST}, "
+    f"restart_on_stall={RESTART_ON_STALL}",
 )
 
 # COMMAND ----------
@@ -189,6 +207,18 @@ event(0, "aws", f"AWS identity {identity['Arn']}; Informix host {HOST.instance_i
 
 def ssm(command, timeout=600):
     return CMP.wait_ssm(HOST, CMP.send_ssm(HOST, command, timeout), timeout)
+
+
+def container_shell(script, timeout=600):
+    # A shell script run inside the container as its informix user, from a file, so nothing
+    # needs quoting through SSM, docker and sh.
+    encoded = base64.b64encode(script.encode()).decode()
+    return ssm(
+        f"printf %s {encoded} | base64 -d > /tmp/informix-cycles.sh; "
+        "docker cp /tmp/informix-cycles.sh informix-cdc:/tmp/informix-cycles.sh; "
+        "docker exec informix-cdc sh /tmp/informix-cycles.sh 2>&1; true",
+        timeout,
+    )
 
 
 # COMMAND ----------
@@ -474,6 +504,165 @@ def resume_check(cycle, stopped, update_id):
 
 
 # COMMAND ----------
+# The CDC stall check, and the engine restart that clears a stall (see the top).
+CDC_SAMPLE_SECONDS = 15
+# Every CDC session on the server, twice, then the current logical log's line.
+CDC_SESSIONS = r"""
+export APP_VENDOR_DIR=ibm
+. /opt/ibm/scripts/informix_inf.env
+for sample in 1 2; do
+  echo "__SAMPLE=$sample"
+  for id in $(onstat -g cdc | awk '/CDC session id:/ {print $4}' | head -12); do
+    echo "__SESSION=$id"
+    onstat -g cdc "$id" long | grep -e 'State:' -e 'Activate Sequence Number:' \
+      -e 'Last Sequence Number returned to client:' -e 'Total number records examined:'
+  done
+  [ "$sample" = 1 ] && sleep GAP
+done
+echo __LOG
+onstat -l | awk '$3 ~ /^U/ && $3 ~ /C/'
+""".replace("GAP", str(CDC_SAMPLE_SECONDS))
+# What informix_stop.sh and informix_online.sh run, waiting for On-Line (onstat - says so).
+ENGINE_RESTART = r"""
+export APP_VENDOR_DIR=ibm
+. /opt/ibm/scripts/informix_inf.env
+timeout 60 onmode -kuy; echo "__ONMODE=$?"
+oninit -w 300 </dev/null; echo "__ONINIT=$?"
+onstat - | sed -n 2p
+"""
+EXAMINED = "Total number records examined"
+RETURNED = "Last Sequence Number returned to client"
+ACTIVATE = "Activate Sequence Number"
+
+
+def cdc_sessions():
+    # The two samples of the server's CDC sessions, each {session id: {field: value}}, and
+    # the current logical log's line.
+    samples, session, log, in_log = [], None, [], False
+    for line in container_shell(CDC_SESSIONS, 300).splitlines():
+        line = line.strip()
+        if line.startswith("__SAMPLE="):
+            samples.append({})
+            session = None
+        elif line.startswith("__SESSION=") and samples:
+            session = samples[-1].setdefault(line[len("__SESSION=") :], {})
+        elif line == "__LOG":
+            session, in_log = None, True
+        elif in_log:
+            log.append(line)
+        elif session is not None and ":" in line:
+            name, _, value = line.partition(":")
+            session[name.strip()] = value.strip()
+    return samples, " ".join(log)
+
+
+def activated(sample):
+    return [s for s in sample.values() if s.get("State", "").startswith("ACTIVATED")]
+
+
+def reader_stopped(samples):
+    # True when the shared log reader has stopped: in both samples every activated session
+    # has returned nothing to its client and all report the one same count of records
+    # examined. None when a sample has no activated session to judge by.
+    if len(samples) != 2 or not all(activated(sample) for sample in samples):
+        return None
+    sessions = activated(samples[0]) + activated(samples[1])
+    examined = {s.get(EXAMINED) for s in sessions}
+    return (
+        all(s.get(RETURNED) == "0x0" for s in sessions)
+        and len(examined) == 1
+        and None not in examined
+    )
+
+
+def watch_cdc(cycle, label, update_id):
+    # Samples the server's CDC sessions while the update runs, until a sample finds
+    # activated sessions to judge by. What it found, or None when the update ended first
+    # or no sample found any.
+    deadline, taken = time.time() + 15 * 60, 0
+    while time.time() < deadline and taken < 6:
+        state = update_info(update_id)["state"]
+        if state in TERMINAL:
+            break
+        if state == "RUNNING":
+            taken += 1
+            try:
+                samples, log = cdc_sessions()
+            except Exception as error:  # noqa: BLE001 - the stall check goes without it
+                event(cycle, "stall", f"{label}: could not sample the CDC sessions: {error}"[:500])
+                return None
+            stopped = reader_stopped(samples)
+            if stopped is not None:
+                return {"stopped": stopped, "samples": samples, "log": log}
+        time.sleep(10)
+    return None
+
+
+def rows_written(update_id, p=None):
+    # The rows an update's flows wrote, from its event log.
+    row = spark.sql(
+        f"SELECT coalesce(sum(details:flow_progress:metrics:num_output_rows::bigint), 0) n "
+        f"FROM event_log('{(p or BRONZE)['id']}') "
+        f"WHERE origin.update_id = '{update_id}' AND event_type = 'flow_progress'"
+    ).first()
+    return int(row["n"])
+
+
+def stall_check(cycle, update_id, cdc):
+    # A CDC stall (see the top): the extra run's bronze update wrote no rows although the
+    # counts differ, and its sample of the server's CDC sessions found the reader stopped.
+    # What was found, for the cycle's result, or None.
+    written = rows_written(update_id)
+    if written:
+        event(cycle, "stall", f"no stall: the extra run wrote {written} rows")
+        return None
+    if cdc is None:
+        event(
+            cycle,
+            "stall",
+            "not established: the extra run wrote no rows, but no activated CDC session was "
+            "found to sample while it ran",
+        )
+        return None
+    sessions = activated(cdc["samples"][0]) + activated(cdc["samples"][1])
+    found = (
+        f"{len(activated(cdc['samples'][0]))} and {len(activated(cdc['samples'][1]))} "
+        f"activated sessions {CDC_SAMPLE_SECONDS} s apart; {ACTIVATE.lower()} "
+        f"{sorted({s.get(ACTIVATE) for s in sessions}, key=str)}, records examined "
+        f"{sorted({s.get(EXAMINED) for s in sessions}, key=str)}, last returned "
+        f"{sorted({s.get(RETURNED) for s in sessions}, key=str)}; current log: {cdc['log']}"
+    )[:1200]
+    if not cdc["stopped"]:
+        event(
+            cycle, "stall", f"no stall: the extra run wrote no rows, but the reader moved: {found}"
+        )
+        return None
+    event(
+        cycle,
+        "stall",
+        f"CDC stall: the extra run wrote no rows and the server's CDC reader has stopped: {found}",
+    )
+    return found
+
+
+def restart_engine(cycle):
+    # Every Informix connection drops, so both pipelines are stopped first (the main loop).
+    event(
+        cycle,
+        "restart",
+        "restarting the Informix engine inside the container; testdb stays and no workload "
+        "starts",
+    )
+    out = container_shell(ENGINE_RESTART, 600)
+    online = out.split("__ONINIT=")[-1].strip()
+    if "On-Line" not in online:
+        event(cycle, "restart", f"the Informix engine did not come back On-Line: {out[-800:]}")
+        event(0, "summary", f"run failed in cycle {cycle}: the engine restart failed")
+        raise RuntimeError(f"the Informix engine did not come back On-Line:\n{out[-2000:]}")
+    event(cycle, "restart", f"engine back: {online.splitlines()[-1][:200]}")
+
+
+# COMMAND ----------
 # The cycle's steps.
 def save_result(cycle, verdict, first="", extra=False, final="", line="", details=()):
     spark.createDataFrame(
@@ -602,13 +791,25 @@ def pipeline_runs(cycle, workload_started):
 
 
 def extra_run(cycle):
-    # One more triggered update of each pipeline, to its end. An update that fails fails
-    # the run.
+    # One more triggered update of each pipeline, to its end, sampling the server's CDC
+    # sessions while bronze's runs (the stall check's evidence). An update that fails fails
+    # the run. The bronze update and what the sample found.
     event(cycle, "starting", "extra run: starting triggered update")
     update_id = start_update(cycle, "extra run")
     event(cycle, "started", f"extra run: started triggered update {update_id}")
+    cdc = watch_cdc(cycle, "extra run", update_id)
     run_for(cycle, "extra run", update_id, UPDATE_CAP_SECONDS)
     silver_run(cycle, "extra run")
+    return update_id, cdc
+
+
+def restart_run(cycle):
+    # After an engine restart: one more triggered update of each pipeline, to its end.
+    event(cycle, "starting", "restart run: starting triggered update")
+    update_id = start_update(cycle, "restart run")
+    event(cycle, "started", f"restart run: started triggered update {update_id}")
+    run_for(cycle, "restart run", update_id, UPDATE_CAP_SECONDS)
+    silver_run(cycle, "restart run")
 
 
 def count_compare(cycle):
@@ -703,6 +904,13 @@ if SMOKE:
         f"staging location {STAGING}: "
         + ("readable" if os.path.isdir(STAGING) else "not readable, the resume test would skip"),
     )
+    samples, log = cdc_sessions()
+    event(
+        0,
+        "smoke",
+        f"CDC sessions: {[len(sample) for sample in samples]} in the two samples; "
+        f"current log: {log}",
+    )
     total, counts_ok, _ = count_compare(0)
     line, data_ok, _ = data_compare(0)
     event(
@@ -717,6 +925,7 @@ if SMOKE:
 
 # COMMAND ----------
 summary = []
+restarted = []
 for cycle in range(1, CYCLES + 1):
     event(cycle, "cycle", f"cycle {cycle} of {CYCLES} starting")
     stop_both()
@@ -725,16 +934,28 @@ for cycle in range(1, CYCLES + 1):
     stop_both()
     event(cycle, "counts", "comparing counts")
     first, counts_ok, _ = count_compare(cycle)
-    final, extra = first, False
+    final, extra, stall, restart = first, False, None, False
     if not counts_ok:
         event(cycle, "counts", f"counts differ: {first}; one more triggered run")
         extra = True
-        extra_run(cycle)
+        extra_id, cdc = extra_run(cycle)
         stop_both()
         event(cycle, "counts", "comparing counts after the extra run")
         final, counts_ok, _ = count_compare(cycle)
+        if not counts_ok:
+            stall = stall_check(cycle, extra_id, cdc)
+        if stall and RESTART_ON_STALL:
+            restart = True
+            restarted.append(cycle)
+            restart_engine(cycle)
+            restart_run(cycle)
+            stop_both()
+            event(cycle, "counts", "comparing counts after the engine restart")
+            final, counts_ok, _ = count_compare(cycle)
     event(cycle, "data", "comparing data")
     line, data_ok, details = data_compare(cycle)
+    if stall:
+        details = [*details, {"cdc_stall": stall, "engine_restarted": restart}]
     resume = RESUME_RESULTS.get(cycle)
     if not (counts_ok and data_ok):
         verdict = "MISMATCH"
@@ -746,6 +967,8 @@ for cycle in range(1, CYCLES + 1):
     message = (
         f"CYCLE {cycle} {verdict} | first count: {first}"
         + (" | extra triggered run, then" if extra else "")
+        + (" | CDC stall: engine restarted, one more triggered run, then" if restart else "")
+        + (" | CDC stall (engine not restarted)" if stall and not restart else "")
         + f" | count compare: {final} | {line}"
         + (f" | resume: {resume}" if resume else "")
     )
@@ -758,8 +981,13 @@ for cycle in range(1, CYCLES + 1):
             "cancel",
             f"cycle {cycle} {verdict}: cancelling cycles {cycle + 1}-{CYCLES} so it can be "
             f"diagnosed; the container is not restarted and pipelines {PIPELINE_NAME} and "
-            f"{SILVER_PIPELINE_NAME} stay stopped. The differing tables and key examples are "
-            f"in this cycle's row in "
+            f"{SILVER_PIPELINE_NAME} stay stopped"
+            + (
+                " (the engine was restarted for a CDC stall before the last compare)"
+                if restart
+                else ""
+            )
+            + f". The differing tables and key examples are in this cycle's row in "
             f"{RESULTS} (details); a NO RESUME cycle's resume event says what was found.",
         )
         break
@@ -779,7 +1007,8 @@ event(
         f"; cycles that did not end MATCH: {mismatched}"
         if mismatched
         else "; every cycle ended MATCH"
-    ),
+    )
+    + (f"; engine restarted for a CDC stall in cycles {restarted}" if restarted else ""),
 )
 dbutils.notebook.exit(
     json.dumps(
@@ -787,6 +1016,7 @@ dbutils.notebook.exit(
             "run_id": RUN_ID,
             "cycles": summary,
             "mismatched": mismatched,
+            "engine_restarts": restarted,
             "cancelled_after": summary[-1][0] if cancelled else None,
         }
     )
