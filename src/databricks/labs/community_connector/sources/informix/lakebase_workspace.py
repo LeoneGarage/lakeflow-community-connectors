@@ -1230,6 +1230,18 @@ _SCHEMA_STATEMENTS = (
     CREATE INDEX IF NOT EXISTS conn_slots_free_idx
         ON conn_slots (namespace, slot_id) WHERE owner IS NULL
     """,
+    # The work each slot's holder has done, counted in the pool's turnover token (see
+    # _POOL_PROGRESS_TOKEN): a snapshot drain holds its slot for its whole scan. A table
+    # of its own, so a deployment gains it without an ALTER of conn_slots, which every
+    # claim writes. A row per slot at most, kept as the slot rows are.
+    """
+    CREATE TABLE IF NOT EXISTS slot_progress (
+        namespace text    NOT NULL,
+        slot_id   integer NOT NULL,
+        progress  bigint  NOT NULL DEFAULT 0,
+        PRIMARY KEY (namespace, slot_id)
+    )
+    """,
     # Fair waiter queue: one row per reader currently blocked on a slot, carrying
     # its eligible band [floor, ceiling). ``ticket_id`` is a global monotonic
     # sequence, so a smaller ticket enqueued earlier -- acquisition consults it to

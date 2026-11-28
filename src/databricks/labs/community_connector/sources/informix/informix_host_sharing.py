@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import importlib
 import logging
 import math
@@ -595,6 +596,18 @@ def _retire_snapshot_drain_worker(key: tuple, pool: _SnapshotDrainPool) -> bool:
     return True
 
 
+def _drain_progressed(pool: _SnapshotDrainPool, job_key: tuple, reader: Any) -> None:
+    # Docstring: A drain did work: its consumer's watchdog is reset, and its slot counts the
+    # work as the pool's progress (note_progress), so readers waiting behind a long drain
+    # for a slot see a busy pool, not a wedged one. Before the drain holds a slot it is
+    # only the first.
+
+    pool.report_progress(job_key)
+    note = getattr(getattr(reader, "_bridge_instance", None), "note_progress", None)
+    if callable(note):
+        note()
+
+
 def _run_snapshot_drain_worker(pool: _SnapshotDrainPool, key: tuple | None = None) -> None:
     # Docstring: Daemon loop: pull one drain job, run the inline snapshot drain under a private
     # reader (staging pages and publishing the manifest durably), then close the reader to
@@ -640,7 +653,7 @@ def _run_snapshot_drain_worker(pool: _SnapshotDrainPool, key: tuple | None = Non
                 reader.set_registration_scope(job["registration_scope"])
                 # Each staged page resets the consumer's liveness watchdog, so a big table
                 # that keeps making progress never trips it while a wedged drain does.
-                reader._drain_progress = lambda: pool.report_progress(job_key)
+                reader._drain_progress = functools.partial(_drain_progressed, pool, job_key, reader)
                 # The reader is marked as a drain worker, so this drains inline and returns
                 # the staged page-0 result; the daemon ignores the rows -- it only needs the
                 # durable manifest the drain publishes as a side effect -- so page 0 is

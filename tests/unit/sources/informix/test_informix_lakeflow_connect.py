@@ -25081,6 +25081,65 @@ class ConnectionSlotLeaseLossTests(unittest.TestCase):
         self.assertTrue(bridge._connected)
         self.assertFalse(bridge._connection_lease_lost.is_set())
 
+    def test_a_holders_work_is_counted_once_at_its_next_renewal(self):
+        # A drain's staged pages are the pool's progress for the readers waiting for a slot
+        # behind it; work done during a renewal counts at the one after.
+        bridge = self._bridge()
+        bridge._lakebase_slot = object()
+        stop = threading.Event()
+        state = mock.Mock()
+        state.connect.return_value = mock.Mock(closed=False)
+        bridge._lakebase = lambda: state
+        renewals = []
+
+        def renew(_connection, _slot, progressed=False):
+            renewals.append(progressed)
+            if len(renewals) == 1:
+                bridge.note_progress()
+            if len(renewals) == 3:
+                stop.set()
+            return True
+
+        bridge.note_progress()
+        with (
+            mock.patch.object(informix_module, "heartbeat_slot", renew),
+            mock.patch.object(informix_module, "_CONNECTION_SLOT_HEARTBEAT_SECONDS", 0.01),
+        ):
+            bridge._heartbeat_connection_slot(object(), stop, None)
+
+        self.assertEqual(renewals, [True, True, False])
+
+    def test_work_is_counted_at_the_renewal_that_succeeds(self):
+        bridge = self._bridge()
+        bridge._lakebase_slot = object()
+        stop = threading.Event()
+        state = mock.Mock()
+        state.connect.return_value = mock.Mock(closed=False)
+        bridge._lakebase = lambda: state
+        renewals = []
+
+        def renew(_connection, _slot, progressed=False):
+            renewals.append(progressed)
+            if len(renewals) == 1:
+                raise OSError("Lakebase unreachable")
+            stop.set()
+            return True
+
+        bridge.note_progress()
+        with (
+            mock.patch.object(informix_module, "heartbeat_slot", renew),
+            mock.patch.object(informix_module, "_CONNECTION_SLOT_HEARTBEAT_SECONDS", 0.01),
+        ):
+            bridge._heartbeat_connection_slot(object(), stop, None)
+
+        self.assertEqual(renewals, [True, True])
+
+    def test_work_without_a_slot_counts_for_none(self):
+        # A drain still waiting for its slot reports progress to its consumer only.
+        bridge = self._bridge()
+        bridge.note_progress()
+        self.assertFalse(getattr(bridge, "_slot_progressed", False))
+
     def test_heartbeat_reports_lease_loss_when_renewal_is_rejected(self):
         bridge = self._bridge()
         reported = []
@@ -27586,6 +27645,39 @@ class SnapshotDrainPoolTests(unittest.TestCase):
         worker.start()
         pool.submit(("k",), table="T", options={}, pipeline_scope="scope", allow_keyless=False)
         self.assertTrue(pool.wait(("k",), 0.1))
+
+    def test_a_drains_work_is_counted_on_its_slot(self):
+        # Readers waiting behind a long drain for a slot see its work as the pool's progress,
+        # and its consumer's watchdog is reset as before.
+        pool = _SnapshotDrainPool()
+        noted = []
+
+        class _Bridge:
+            def note_progress(self):
+                noted.append(True)
+
+        class _Reader:
+            _drain_progress = None
+            _bridge_instance = _Bridge()
+
+            def set_registration_scope(self, scope):
+                pass
+
+            def _read_snapshot(self, *args, **kwargs):
+                self._drain_progress()
+                self._drain_progress()
+
+            def close(self):
+                pass
+
+        pool.configure(reader_factory=_Reader, thread_count=1)
+        worker = threading.Thread(
+            target=informix_module._run_snapshot_drain_worker, args=(pool,), daemon=True
+        )
+        worker.start()
+        pool.submit(("k",), table="T", options={}, pipeline_scope="scope", allow_keyless=False)
+        self.assertTrue(pool.wait(("k",), 5))
+        self.assertEqual(noted, [True, True])
 
     def test_worker_runs_job_and_closes_reader(self):
         pool = _SnapshotDrainPool()

@@ -612,9 +612,10 @@ class _BridgeSessionMixin:
         deadline = time.monotonic() + connection_wait_timeout
         # Slot-wait liveness (the two daemon roles). A daemon is not a consumer microbatch: it must
         # not fail merely because the pool is *full* -- only when it is *wedged*. So its deadline is
-        # a liveness watchdog keyed on pool turnover: as long as slots keep being claimed (the token
-        # advances -- other work is completing and recycling capacity), reset the deadline; give up
-        # only after a whole window with zero turnover. The snapshot drain additionally pings its
+        # a liveness watchdog keyed on the pool's progress token: as long as slots keep being
+        # claimed, or the snapshot drains holding them keep staging pages (the token advances --
+        # other work is going on and will recycle capacity), reset the deadline; give up only
+        # after a whole window with neither. The snapshot drain additionally pings its
         # waiting consumer each turnover. The CDC shard daemon uses the same watchdog so it holds
         # its queue ticket long enough for the round-robin rotation to reach it -- a round is paid
         # in turnover, not wall-clock -- rather than failing fast on a short budget and re-queuing
@@ -674,6 +675,8 @@ class _BridgeSessionMixin:
                 if slot is not None:
                     self._connection_slot = f"slot-{slot.slot_id:04d}"
                     self._lakebase_slot = slot
+                    # Work counts for the lease it was done under (note_progress).
+                    self._slot_progressed = False
                     stop = threading.Event()
                     # Told which lease it was: a later read's is not this heartbeat's to end.
                     lost = functools.partial(self._poison_connection_slot_lease, slot, stop)
@@ -688,10 +691,11 @@ class _BridgeSessionMixin:
                     heartbeat.start()
                     return
                 if liveness:
-                    # Poll the turnover token: if any slot was claimed since the last sweep
-                    # the pool is doing work and will free capacity, so extend the window and
-                    # tell the consumer's watchdog the drain is still live. If it is frozen,
-                    # fall through to the deadline check -- the pool is genuinely wedged.
+                    # Poll the turnover token: if any slot was claimed, or a drain holding one
+                    # did work, since the last sweep the pool is busy and will free capacity,
+                    # so extend the window and tell the consumer's watchdog the drain is still
+                    # live. If it is frozen, fall through to the deadline check -- the pool is
+                    # genuinely wedged.
                     token = pool_progress_token(connection, namespace)
                     if token != progress_token:
                         progress_token = token
@@ -701,9 +705,10 @@ class _BridgeSessionMixin:
                 if time.monotonic() >= deadline:
                     if liveness:
                         # 19: Timed out waiting for an Informix connection-capacity slot: the pool
-                        # made no progress (no slot was claimed or released) for {:g}s, so capacity
-                        # is wedged rather than merely busy. Raise max.concurrent.connections, or
-                        # reduce concurrent daemon/consumer load.
+                        # made no progress for {:g}s (no slot was claimed, and no snapshot drain
+                        # holding one staged a page or read its table's changes), so capacity is
+                        # wedged rather than merely busy. Raise connection.wait.timeout.seconds or
+                        # max.concurrent.connections, or reduce concurrent daemon/consumer load.
                         raise ConnectionCapacityUnavailable(_m(19, connection_wait_timeout))
                     # 20: Timed out waiting for an Informix connection-capacity slot after {:g}
                     # seconds
@@ -720,6 +725,14 @@ class _BridgeSessionMixin:
             except Exception:  # noqa: BLE001 - ticket ages out via the reaper anyway
                 # 21: snapshot slot waiter dequeue failed
                 logging.getLogger(__name__).debug(_m(21), exc_info=True)
+
+    def note_progress(self) -> None:
+        # Docstring: Count work done holding this bridge's slot as the pool's progress, at
+        # the lease's next renewal (see _POOL_PROGRESS_TOKEN): a reader waiting for a slot
+        # behind a long snapshot drain then sees a busy pool, not a wedged one.
+
+        if getattr(self, "_lakebase_slot", None) is not None:
+            self._slot_progressed = True
 
     def _heartbeat_connection_slot(
         self,
@@ -755,7 +768,20 @@ class _BridgeSessionMixin:
                         # own timeout outlived it.
                         left = _CONNECTION_SLOT_LEASE_SECONDS - (time.monotonic() - renewed)
                         connection = self._lakebase().connect(timeout=max(1.0, left))
-                    if not heartbeat_slot(connection, slot):
+                    # Taken before the renewal, so work done during it counts at the next.
+                    progressed = getattr(self, "_slot_progressed", False)
+                    self._slot_progressed = False
+                    try:
+                        held = (
+                            heartbeat_slot(connection, slot, progressed=True)
+                            if progressed
+                            else heartbeat_slot(connection, slot)
+                        )
+                    except BaseException:
+                        # Counted at the renewal that succeeds.
+                        self._slot_progressed = self._slot_progressed or progressed
+                        raise
+                    if not held:
                         # The guard rejected us: the lease was reclaimed and now
                         # belongs to someone else. Nothing to retry.
                         report_lease_lost()

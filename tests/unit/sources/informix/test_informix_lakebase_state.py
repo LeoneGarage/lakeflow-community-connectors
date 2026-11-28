@@ -92,14 +92,23 @@ class _FakeCursor:
         if "UPDATE conn_slots SET owner = NULL" in text:
             self._release(args, text)
             return
-        if "SELECT COALESCE(SUM(epoch), 0) FROM conn_slots" in text:
+        if "SUM(epoch) FROM conn_slots" in text and "SUM(progress) FROM slot_progress" in text:
             with self._database.lock:
                 total = sum(
                     row["epoch"]
                     for (namespace, _slot_id), row in self._database.slots.items()
                     if namespace == args["namespace"]
+                ) + sum(
+                    count
+                    for (namespace, _slot_id), count in self._database.progress.items()
+                    if namespace == args["namespace"]
                 )
             self._result = [(total,)]
+            return
+        if "INSERT INTO slot_progress" in text:
+            with self._database.lock:
+                key = (args["namespace"], args["slot_id"])
+                self._database.progress[key] = self._database.progress.get(key, 0) + 1
             return
         if "INSERT INTO slot_waiters" in text:
             self._enqueue_waiter(args)
@@ -678,6 +687,8 @@ class _FakeDatabase:
 
     def __init__(self) -> None:
         self.slots: dict[tuple[str, int], dict] = {}
+        # slot_progress: the work each slot's holders counted, keyed (namespace, slot_id).
+        self.progress: dict[tuple[str, int], int] = {}
         # Fair-queue tickets, keyed (namespace, ticket_id); waiter_seq is the
         # bigserial sequence behind ticket_id.
         self.waiters: dict[tuple[str, int], dict] = {}
@@ -779,6 +790,13 @@ class LakebaseSlotTests(unittest.TestCase):
         self.assertIn("(record->>'last_used_at')::double precision", schema)
         self.assertIn("WHERE record_type = 'table-activity'", schema)
 
+    def test_slot_progress_is_a_table_of_its_own(self):
+        # Added to a deployment with no ALTER of conn_slots, which every claim writes: an
+        # ALTER takes an ACCESS EXCLUSIVE lock and would queue every claim behind it.
+        schema = "\n".join(lakebase_state._SCHEMA_STATEMENTS)
+        self.assertIn("CREATE TABLE IF NOT EXISTS slot_progress", schema)
+        self.assertNotIn("ALTER TABLE conn_slots", schema)
+
     def test_waiter_class_migration_is_lock_guarded(self):
         # The waiter_class migration MUST NOT be a bare ALTER TABLE ... ADD COLUMN: that
         # takes an ACCESS EXCLUSIVE lock on slot_waiters every time ensure_schema runs (even
@@ -861,6 +879,34 @@ class LakebaseSlotTests(unittest.TestCase):
 
         self.assertGreater(lakebase_state.pool_progress_token(self.connection, "ns"), 0)
         self.assertEqual(lakebase_state.pool_progress_token(self.connection, "other"), 0)
+
+    def test_pool_progress_token_counts_a_holders_work_at_its_renewal(self):
+        # A snapshot drain holds its slot for its whole scan. Counting claims alone, a pool
+        # whose every slot such a drain held looked wedged to the readers waiting for one,
+        # which gave up (19) although every drain was staging pages.
+        lakebase_state.seed_slots(self.connection, "other", 4)
+        slot = self.acquire("drain")
+        start = lakebase_state.pool_progress_token(self.connection, "ns")
+
+        # A renewal with no work done: a slot merely held is no progress.
+        self.assertTrue(lakebase_state.heartbeat_slot(self.connection, slot))
+        self.assertEqual(lakebase_state.pool_progress_token(self.connection, "ns"), start)
+
+        self.assertTrue(lakebase_state.heartbeat_slot(self.connection, slot, progressed=True))
+        after = lakebase_state.pool_progress_token(self.connection, "ns")
+        self.assertGreater(after, start)
+        self.assertTrue(lakebase_state.heartbeat_slot(self.connection, slot, progressed=True))
+        self.assertGreater(lakebase_state.pool_progress_token(self.connection, "ns"), after)
+        self.assertEqual(lakebase_state.pool_progress_token(self.connection, "other"), 0)
+
+    def test_a_lease_lost_counts_no_work(self):
+        stale = self.acquire("zombie")
+        self.database.advance(200.0)
+        self.acquire("successor")
+        start = lakebase_state.pool_progress_token(self.connection, "ns")
+
+        self.assertFalse(lakebase_state.heartbeat_slot(self.connection, stale, progressed=True))
+        self.assertEqual(lakebase_state.pool_progress_token(self.connection, "ns"), start)
 
     def test_expired_lease_is_reclaimed_by_a_new_owner(self):
         original = self.acquire("first")

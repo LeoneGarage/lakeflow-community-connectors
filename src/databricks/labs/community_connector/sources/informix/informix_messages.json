@@ -18,7 +18,7 @@
 "Informix Lakebase backlog hint read failed",
 "Option '{}' must be >= 0 and < max.concurrent.connections ({})",
 "Informix connection-slot waiter ticket {} was reaped; re-enqueuing",
-"Timed out waiting for an Informix connection-capacity slot: the pool made no progress (no slot was claimed or released) for {:g}s, so capacity is wedged rather than merely busy. Raise max.concurrent.connections, or reduce concurrent daemon/consumer load.",
+"Timed out waiting for an Informix connection-capacity slot: the pool made no progress for {:g}s (no slot was claimed, and no snapshot drain holding one staged a page or read its table's changes), so capacity is wedged rather than merely busy. Raise connection.wait.timeout.seconds or max.concurrent.connections, or reduce concurrent daemon/consumer load.",
 "Timed out waiting for an Informix connection-capacity slot after {:g} seconds",
 "snapshot slot waiter dequeue failed",
 "Informix Lakebase slot not renewed for {:.0f}s, and its lease runs out before the next renewal; treating the lease as lost: {}",

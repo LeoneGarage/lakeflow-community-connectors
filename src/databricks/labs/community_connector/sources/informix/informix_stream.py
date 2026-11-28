@@ -620,9 +620,10 @@ class _StreamMixin:
         # pool (see _is_snapshot_drain_worker).
         reader_options[_SNAPSHOT_DAEMON_SLOT_MARKER_OPTION] = "true"
         # The worker waits for its slot using its own ``connection.wait.timeout.seconds`` as
-        # a *per-turnover* window, not a hard cap: it resets every time the pool claims a slot
-        # (see the slot-wait liveness in ``_acquire_connection_slot``), so it waits out a busy
-        # backfill and only gives up when the pool is wedged. It is also the consumer's
+        # a *per-progress* window, not a hard cap: it resets every time the pool claims a slot
+        # or a drain holding one does work (see the slot-wait liveness in
+        # ``_acquire_connection_slot``), so it waits out a busy backfill and long scans and only
+        # gives up when the pool is wedged. It is also the consumer's
         # per-progress idle window, so the single knob governs both. Drop any inherited
         # replay wait budget so it cannot cap the slot wait below that window. The read's
         # own attempt budget, backlog rank and a lookup's capacity bypass are its thread's

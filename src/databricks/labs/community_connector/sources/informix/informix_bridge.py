@@ -134,6 +134,8 @@ class PurePythonInformixBridge(
         # ``_acquire_connection_slot`` can report "still alive, pool is turning over" up to
         # the waiting consumer's liveness watchdog. None (the default) for every other read.
         self._slot_wait_liveness: Callable[[], None] | None = None
+        # Set when the slot's holder did work since the lease's last renewal (note_progress).
+        self._slot_progressed = False
         # Startup jitter is one-shot: set once the first connection has applied its delay so
         # steady-state polls and reconnects are never delayed.
         self._startup_jitter_applied = False

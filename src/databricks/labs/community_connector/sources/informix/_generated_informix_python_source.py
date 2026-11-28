@@ -3687,6 +3687,18 @@ def register_lakeflow_source(spark):
         CREATE INDEX IF NOT EXISTS conn_slots_free_idx
             ON conn_slots (namespace, slot_id) WHERE owner IS NULL
         """,
+        # The work each slot's holder has done, counted in the pool's turnover token (see
+        # _POOL_PROGRESS_TOKEN): a snapshot drain holds its slot for its whole scan. A table
+        # of its own, so a deployment gains it without an ALTER of conn_slots, which every
+        # claim writes. A row per slot at most, kept as the slot rows are.
+        """
+        CREATE TABLE IF NOT EXISTS slot_progress (
+            namespace text    NOT NULL,
+            slot_id   integer NOT NULL,
+            progress  bigint  NOT NULL DEFAULT 0,
+            PRIMARY KEY (namespace, slot_id)
+        )
+        """,
         # Fair waiter queue: one row per reader currently blocked on a slot, carrying
         # its eligible band [floor, ceiling). ``ticket_id`` is a global monotonic
         # sequence, so a smaller ticket enqueued earlier -- acquisition consults it to
@@ -8742,8 +8754,12 @@ def register_lakeflow_source(spark):
         connection.commit()
 
 
-    def heartbeat_slot(connection: Any, slot: ConnectionSlot) -> bool:
+    def heartbeat_slot(connection: Any, slot: ConnectionSlot, progressed: bool = False) -> bool:
         # Docstring: Renew a lease. ``False`` means the lease was lost and must not be reused.
+        #
+        # ``progressed``: the holder did work since its last renewal, counted as the pool's
+        # progress (see _POOL_PROGRESS_TOKEN) in the same transaction, only if the lease was
+        # still its own.
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -8756,6 +8772,8 @@ def register_lakeflow_source(spark):
                 },
             )
             renewed = cursor.fetchone() is not None
+            if renewed and progressed:
+                cursor.execute(_SLOT_PROGRESS, {"namespace": slot.namespace, "slot_id": slot.slot_id})
         connection.commit()
         return renewed
 
@@ -8778,18 +8796,29 @@ def register_lakeflow_source(spark):
         return released
 
 
-    # A monotonic "the pool is recycling slots" token. ``epoch`` increments on every claim
-    # (see ``_ACQUIRE_SLOT``: ``epoch = epoch + 1``), so the sum over a namespace strictly
-    # increases each time any slot is acquired -- and a freed slot is only re-acquired when
-    # a waiter wins it, so a rising sum means work is completing and capacity is turning
-    # over. A caller that cannot win a slot can poll this between sweeps to tell "the pool
-    # is busy (turning over) -- keep waiting" from "the pool is wedged (frozen) -- give up",
-    # without needing to see which slot moved. A slot merely held (a long read that neither
-    # releases nor re-claims) does not advance it: that is deliberate, the token measures
-    # forward progress of the pool, not liveness of an individual holder.
+    # A monotonic "the pool is doing work" token. ``epoch`` increments on every claim
+    # (see ``_ACQUIRE_SLOT``: ``epoch = epoch + 1``), and a holder that did work since its
+    # last lease renewal counts it in ``slot_progress`` at the next one. A caller that cannot
+    # win a slot polls this between sweeps to tell "the pool is busy -- keep waiting" from
+    # "the pool is wedged -- give up", without needing to see which slot moved. Counting
+    # claims alone, a pool whose every slot a long snapshot drain held looked wedged: a
+    # drain holds its slot for its whole scan, which can outlast the waiter's window. Only a
+    # drain counts its work (staged pages, change polls): a CDC shard daemon polls for as
+    # long as it runs, so its polls would make no pool ever look wedged, and a slot merely
+    # held, renewed with no work done, does not advance the token either.
     _POOL_PROGRESS_TOKEN = _sql(
         """
-    SELECT COALESCE(SUM(epoch), 0) FROM conn_slots WHERE namespace = %(namespace)s
+    SELECT COALESCE((SELECT SUM(epoch) FROM conn_slots WHERE namespace = %(namespace)s), 0)
+         + COALESCE((SELECT SUM(progress) FROM slot_progress WHERE namespace = %(namespace)s), 0)
+    """
+    )
+
+    # The work a slot's holder did since its last renewal, counted with that renewal.
+    _SLOT_PROGRESS = _sql(
+        """
+    INSERT INTO slot_progress (namespace, slot_id, progress)
+    VALUES (%(namespace)s, %(slot_id)s, 1)
+    ON CONFLICT (namespace, slot_id) DO UPDATE SET progress = slot_progress.progress + 1
     """
     )
 
@@ -14100,6 +14129,18 @@ def register_lakeflow_source(spark):
         return True
 
 
+    def _drain_progressed(pool: _SnapshotDrainPool, job_key: tuple, reader: Any) -> None:
+        # Docstring: A drain did work: its consumer's watchdog is reset, and its slot counts the
+        # work as the pool's progress (note_progress), so readers waiting behind a long drain
+        # for a slot see a busy pool, not a wedged one. Before the drain holds a slot it is
+        # only the first.
+
+        pool.report_progress(job_key)
+        note = getattr(getattr(reader, "_bridge_instance", None), "note_progress", None)
+        if callable(note):
+            note()
+
+
     def _run_snapshot_drain_worker(pool: _SnapshotDrainPool, key: tuple | None = None) -> None:
         # Docstring: Daemon loop: pull one drain job, run the inline snapshot drain under a private
         # reader (staging pages and publishing the manifest durably), then close the reader to
@@ -14145,7 +14186,7 @@ def register_lakeflow_source(spark):
                     reader.set_registration_scope(job["registration_scope"])
                     # Each staged page resets the consumer's liveness watchdog, so a big table
                     # that keeps making progress never trips it while a wedged drain does.
-                    reader._drain_progress = lambda: pool.report_progress(job_key)
+                    reader._drain_progress = functools.partial(_drain_progressed, pool, job_key, reader)
                     # The reader is marked as a drain worker, so this drains inline and returns
                     # the staged page-0 result; the daemon ignores the rows -- it only needs the
                     # durable manifest the drain publishes as a side effect -- so page 0 is
@@ -17677,9 +17718,10 @@ def register_lakeflow_source(spark):
             deadline = time.monotonic() + connection_wait_timeout
             # Slot-wait liveness (the two daemon roles). A daemon is not a consumer microbatch: it must
             # not fail merely because the pool is *full* -- only when it is *wedged*. So its deadline is
-            # a liveness watchdog keyed on pool turnover: as long as slots keep being claimed (the token
-            # advances -- other work is completing and recycling capacity), reset the deadline; give up
-            # only after a whole window with zero turnover. The snapshot drain additionally pings its
+            # a liveness watchdog keyed on the pool's progress token: as long as slots keep being
+            # claimed, or the snapshot drains holding them keep staging pages (the token advances --
+            # other work is going on and will recycle capacity), reset the deadline; give up only
+            # after a whole window with neither. The snapshot drain additionally pings its
             # waiting consumer each turnover. The CDC shard daemon uses the same watchdog so it holds
             # its queue ticket long enough for the round-robin rotation to reach it -- a round is paid
             # in turnover, not wall-clock -- rather than failing fast on a short budget and re-queuing
@@ -17739,6 +17781,8 @@ def register_lakeflow_source(spark):
                     if slot is not None:
                         self._connection_slot = f"slot-{slot.slot_id:04d}"
                         self._lakebase_slot = slot
+                        # Work counts for the lease it was done under (note_progress).
+                        self._slot_progressed = False
                         stop = threading.Event()
                         # Told which lease it was: a later read's is not this heartbeat's to end.
                         lost = functools.partial(self._poison_connection_slot_lease, slot, stop)
@@ -17753,10 +17797,11 @@ def register_lakeflow_source(spark):
                         heartbeat.start()
                         return
                     if liveness:
-                        # Poll the turnover token: if any slot was claimed since the last sweep
-                        # the pool is doing work and will free capacity, so extend the window and
-                        # tell the consumer's watchdog the drain is still live. If it is frozen,
-                        # fall through to the deadline check -- the pool is genuinely wedged.
+                        # Poll the turnover token: if any slot was claimed, or a drain holding one
+                        # did work, since the last sweep the pool is busy and will free capacity,
+                        # so extend the window and tell the consumer's watchdog the drain is still
+                        # live. If it is frozen, fall through to the deadline check -- the pool is
+                        # genuinely wedged.
                         token = pool_progress_token(connection, namespace)
                         if token != progress_token:
                             progress_token = token
@@ -17766,9 +17811,10 @@ def register_lakeflow_source(spark):
                     if time.monotonic() >= deadline:
                         if liveness:
                             # 19: Timed out waiting for an Informix connection-capacity slot: the pool
-                            # made no progress (no slot was claimed or released) for {:g}s, so capacity
-                            # is wedged rather than merely busy. Raise max.concurrent.connections, or
-                            # reduce concurrent daemon/consumer load.
+                            # made no progress for {:g}s (no slot was claimed, and no snapshot drain
+                            # holding one staged a page or read its table's changes), so capacity is
+                            # wedged rather than merely busy. Raise connection.wait.timeout.seconds or
+                            # max.concurrent.connections, or reduce concurrent daemon/consumer load.
                             raise ConnectionCapacityUnavailable(_m(19, connection_wait_timeout))
                         # 20: Timed out waiting for an Informix connection-capacity slot after {:g}
                         # seconds
@@ -17785,6 +17831,14 @@ def register_lakeflow_source(spark):
                 except Exception:  # noqa: BLE001 - ticket ages out via the reaper anyway
                     # 21: snapshot slot waiter dequeue failed
                     logging.getLogger(__name__).debug(_m(21), exc_info=True)
+
+        def note_progress(self) -> None:
+            # Docstring: Count work done holding this bridge's slot as the pool's progress, at
+            # the lease's next renewal (see _POOL_PROGRESS_TOKEN): a reader waiting for a slot
+            # behind a long snapshot drain then sees a busy pool, not a wedged one.
+
+            if getattr(self, "_lakebase_slot", None) is not None:
+                self._slot_progressed = True
 
         def _heartbeat_connection_slot(
             self,
@@ -17820,7 +17874,20 @@ def register_lakeflow_source(spark):
                             # own timeout outlived it.
                             left = _CONNECTION_SLOT_LEASE_SECONDS - (time.monotonic() - renewed)
                             connection = self._lakebase().connect(timeout=max(1.0, left))
-                        if not heartbeat_slot(connection, slot):
+                        # Taken before the renewal, so work done during it counts at the next.
+                        progressed = getattr(self, "_slot_progressed", False)
+                        self._slot_progressed = False
+                        try:
+                            held = (
+                                heartbeat_slot(connection, slot, progressed=True)
+                                if progressed
+                                else heartbeat_slot(connection, slot)
+                            )
+                        except BaseException:
+                            # Counted at the renewal that succeeds.
+                            self._slot_progressed = self._slot_progressed or progressed
+                            raise
+                        if not held:
                             # The guard rejected us: the lease was reclaimed and now
                             # belongs to someone else. Nothing to retry.
                             report_lease_lost()
@@ -24210,6 +24277,8 @@ def register_lakeflow_source(spark):
             # ``_acquire_connection_slot`` can report "still alive, pool is turning over" up to
             # the waiting consumer's liveness watchdog. None (the default) for every other read.
             self._slot_wait_liveness: Callable[[], None] | None = None
+            # Set when the slot's holder did work since the lease's last renewal (note_progress).
+            self._slot_progressed = False
             # Startup jitter is one-shot: set once the first connection has applied its delay so
             # steady-state polls and reconnects are never delayed.
             self._startup_jitter_applied = False
@@ -31697,9 +31766,10 @@ def register_lakeflow_source(spark):
             # pool (see _is_snapshot_drain_worker).
             reader_options[_SNAPSHOT_DAEMON_SLOT_MARKER_OPTION] = "true"
             # The worker waits for its slot using its own ``connection.wait.timeout.seconds`` as
-            # a *per-turnover* window, not a hard cap: it resets every time the pool claims a slot
-            # (see the slot-wait liveness in ``_acquire_connection_slot``), so it waits out a busy
-            # backfill and only gives up when the pool is wedged. It is also the consumer's
+            # a *per-progress* window, not a hard cap: it resets every time the pool claims a slot
+            # or a drain holding one does work (see the slot-wait liveness in
+            # ``_acquire_connection_slot``), so it waits out a busy backfill and long scans and only
+            # gives up when the pool is wedged. It is also the consumer's
             # per-progress idle window, so the single knob governs both. Drop any inherited
             # replay wait budget so it cannot cap the slot wait below that window. The read's
             # own attempt budget, backlog rank and a lookup's capacity bypass are its thread's

@@ -1005,8 +1005,12 @@ def delete_cdc_handoff(connection: Any, namespace: str, table_key: str, channel:
     connection.commit()
 
 
-def heartbeat_slot(connection: Any, slot: ConnectionSlot) -> bool:
+def heartbeat_slot(connection: Any, slot: ConnectionSlot, progressed: bool = False) -> bool:
     # Docstring: Renew a lease. ``False`` means the lease was lost and must not be reused.
+    #
+    # ``progressed``: the holder did work since its last renewal, counted as the pool's
+    # progress (see _POOL_PROGRESS_TOKEN) in the same transaction, only if the lease was
+    # still its own.
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -1019,6 +1023,8 @@ def heartbeat_slot(connection: Any, slot: ConnectionSlot) -> bool:
             },
         )
         renewed = cursor.fetchone() is not None
+        if renewed and progressed:
+            cursor.execute(_SLOT_PROGRESS, {"namespace": slot.namespace, "slot_id": slot.slot_id})
     connection.commit()
     return renewed
 
@@ -1041,18 +1047,29 @@ def release_slot(connection: Any, slot: ConnectionSlot) -> bool:
     return released
 
 
-# A monotonic "the pool is recycling slots" token. ``epoch`` increments on every claim
-# (see ``_ACQUIRE_SLOT``: ``epoch = epoch + 1``), so the sum over a namespace strictly
-# increases each time any slot is acquired -- and a freed slot is only re-acquired when
-# a waiter wins it, so a rising sum means work is completing and capacity is turning
-# over. A caller that cannot win a slot can poll this between sweeps to tell "the pool
-# is busy (turning over) -- keep waiting" from "the pool is wedged (frozen) -- give up",
-# without needing to see which slot moved. A slot merely held (a long read that neither
-# releases nor re-claims) does not advance it: that is deliberate, the token measures
-# forward progress of the pool, not liveness of an individual holder.
+# A monotonic "the pool is doing work" token. ``epoch`` increments on every claim
+# (see ``_ACQUIRE_SLOT``: ``epoch = epoch + 1``), and a holder that did work since its
+# last lease renewal counts it in ``slot_progress`` at the next one. A caller that cannot
+# win a slot polls this between sweeps to tell "the pool is busy -- keep waiting" from
+# "the pool is wedged -- give up", without needing to see which slot moved. Counting
+# claims alone, a pool whose every slot a long snapshot drain held looked wedged: a
+# drain holds its slot for its whole scan, which can outlast the waiter's window. Only a
+# drain counts its work (staged pages, change polls): a CDC shard daemon polls for as
+# long as it runs, so its polls would make no pool ever look wedged, and a slot merely
+# held, renewed with no work done, does not advance the token either.
 _POOL_PROGRESS_TOKEN = _sql(
     """
-SELECT COALESCE(SUM(epoch), 0) FROM conn_slots WHERE namespace = %(namespace)s
+SELECT COALESCE((SELECT SUM(epoch) FROM conn_slots WHERE namespace = %(namespace)s), 0)
+     + COALESCE((SELECT SUM(progress) FROM slot_progress WHERE namespace = %(namespace)s), 0)
+"""
+)
+
+# The work a slot's holder did since its last renewal, counted with that renewal.
+_SLOT_PROGRESS = _sql(
+    """
+INSERT INTO slot_progress (namespace, slot_id, progress)
+VALUES (%(namespace)s, %(slot_id)s, 1)
+ON CONFLICT (namespace, slot_id) DO UPDATE SET progress = slot_progress.progress + 1
 """
 )
 

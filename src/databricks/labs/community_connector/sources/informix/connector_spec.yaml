@@ -968,9 +968,10 @@ connection:
         uses the bounded budget described by capacity.retry.max.delay.seconds. For
         the shared snapshot drain it is a per-progress liveness window, not a hard
         cap: the drain worker resets it on each staged page and, while still waiting
-        for its slot, on each pool slot claim (turnover), so a drain queued behind a
-        busy backfill waits it out and fails only when the pool is wedged (no
-        turnover for a whole window). The CDC shard daemon waits for its slot on the
+        for its slot, on each pool slot claim and on the work of the drains holding
+        slots (pages staged, changes read), so a drain queued behind a busy backfill
+        or behind long scans waits it out and fails only when the pool is wedged
+        (neither for a whole window). The CDC shard daemon waits for its slot on the
         same turnover-based window, keeping its queue ticket so the round-robin
         rotation has time to reach it -- a round is paid in slot turnover, not
         wall-clock -- and degrades its consumers to direct reads only when the pool
